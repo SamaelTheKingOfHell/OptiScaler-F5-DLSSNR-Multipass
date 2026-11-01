@@ -1,3 +1,9 @@
+## 2026-11-01 — Physical GPU and isolated NGX probes (WIP)
+
+- Added optional synthetic model evaluation and a two-process feature-lifetime probe. The existing game files are read-only inputs; no game was started or modified.
+- OpenAI Codex, GPT-6 (exact model and effort unavailable). The RTX 5070 Ti/RTX 3060 shared-buffer and color/depth/motion transport fixture passed with the D3D12 debug layer. With the existing 310.9 runtime, synthetic neural features evaluated on both adapters. Releasing the second feature in one process crashed in either release order, including with separate model paths. Two isolated processes held both features simultaneously, reevaluated and exited cleanly. An initial core-init probe also crashed once; subsequent core and single-device repeat probes passed.
+- These are isolated fixtures, not cross-process frame transport or game integration. Secondary worker IPC, model-pass integration, in-game output, frame pacing, failure recovery and deployment remain pending.
+
 ## 2026-11-01 — Isolated secondary NGX core probe (WIP)
 
 - Added a separate-process probe for secondary-adapter NGX core initialization and capability allocation. It does not open a game or load a neural model and refuses to run under low system commit headroom.
