@@ -1,3 +1,9 @@
+## 2026-11-01 — Isolated cross-process neural frame prototype (WIP)
+
+- Added duplicated cross-adapter heap and fence handles and isolated worker fixtures. Two persistent model features run two sequential synthetic frames with primary-pass output, depth and motion transferred once to the worker and the worker result returned to a primary-device texture. The model, core and forwarder paths are provided locally; no model DLL is distributed.
+- OpenAI Codex, GPT-6 (exact model and effort unavailable). On RTX 5070 Ti and RTX 3060, the actual 310.9 runtime completed both frames with finite, nonzero and distinct RGB results, clean process shutdown and no D3D12 debug errors. A separate fault fixture verified that an exited worker did not leave the primary queue waiting on its fence. A first neural prototype crashed during cleanup; unloading the forwarder immediately after releasing its feature matched the successful independent probe and passed subsequent runs.
+- These are controlled tests, not an application feature: integration into owned submission boundaries, persistent production worker lifecycle, user configuration, GPU-loss handling, game validation and deployment remain pending.
+
 ## 2026-11-01 — Physical GPU and isolated NGX probes (WIP)
 
 - Added optional synthetic model evaluation and a two-process feature-lifetime probe. The existing game files are read-only inputs; no game was started or modified.

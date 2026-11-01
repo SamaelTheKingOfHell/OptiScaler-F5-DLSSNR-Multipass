@@ -95,6 +95,7 @@ class CrossAdapterBuffer
     }
 
     uint64_t Size() const { return size_; }
+    ID3D12Heap* PrimaryHeap() const { return primaryHeap_.Get(); }
     ID3D12Resource* PrimaryBuffer() const { return primaryBuffer_.Get(); }
     ID3D12Resource* SecondaryBuffer() const { return secondaryBuffer_.Get(); }
     ID3D12Fence* PrimaryReady() const { return primaryReady_.Get(); }

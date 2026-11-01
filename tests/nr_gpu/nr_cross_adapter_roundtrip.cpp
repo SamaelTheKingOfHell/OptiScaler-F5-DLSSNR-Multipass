@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "../../OptiScaler/dlssnr/DlssNr_CrossAdapterFrame.h"
+#include "../../OptiScaler/dlssnr/DlssNr_CrossAdapterIpc.h"
 #include "../../OptiScaler/dlssnr/DlssNr_CrossAdapterSelect.h"
 #include "../../OptiScaler/dlssnr/DlssNr_CrossAdapterSubmit.h"
 #include <d3d12sdklayers.h>
@@ -7,76 +8,9 @@
 #include <optional>
 #include <sstream>
 
-using Microsoft::WRL::ComPtr;
-
-static void Check(HRESULT hr, const char* operation)
-{
-    if (FAILED(hr))
-    {
-        std::ostringstream message;
-        message << operation << " failed: 0x" << std::hex << static_cast<unsigned long>(hr);
-        throw std::runtime_error(message.str());
-    }
-}
+#include "nr_cross_adapter_test_helpers.h"
 
 static HRESULT WINAPI RefuseDevice(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**) { return E_OUTOFMEMORY; }
-
-struct Queue
-{
-    ComPtr<ID3D12CommandQueue> queue;
-    ComPtr<ID3D12CommandAllocator> allocator;
-    explicit Queue(ID3D12Device* device)
-    {
-        D3D12_COMMAND_QUEUE_DESC desc {};
-        desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-        Check(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)), "CreateCommandQueue");
-        Check(device->CreateCommandAllocator(desc.Type, IID_PPV_ARGS(&allocator)), "CreateCommandAllocator");
-    }
-    ComPtr<ID3D12GraphicsCommandList> List(ID3D12Device* device)
-    {
-        ComPtr<ID3D12GraphicsCommandList> list;
-        Check(
-            device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)),
-            "CreateCommandList");
-        return list;
-    }
-    void Submit(ID3D12GraphicsCommandList* list)
-    {
-        Check(list->Close(), "Close command list");
-        ID3D12CommandList* lists[] = { list };
-        queue->ExecuteCommandLists(1, lists);
-    }
-};
-
-static ComPtr<ID3D12Resource> Buffer(ID3D12Device* device, D3D12_HEAP_TYPE heapType, D3D12_RESOURCE_STATES state,
-                                     uint64_t bytes)
-{
-    D3D12_HEAP_PROPERTIES heap {};
-    heap.Type = heapType;
-    heap.CreationNodeMask = heap.VisibleNodeMask = 1;
-    D3D12_RESOURCE_DESC desc {};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = bytes;
-    desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
-    desc.SampleDesc.Count = 1;
-    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    ComPtr<ID3D12Resource> resource;
-    Check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&resource)),
-          "CreateCommittedResource");
-    return resource;
-}
-
-static void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
-                       D3D12_RESOURCE_STATES after)
-{
-    D3D12_RESOURCE_BARRIER barrier {};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = resource;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barrier.Transition.StateBefore = before;
-    barrier.Transition.StateAfter = after;
-    list->ResourceBarrier(1, &barrier);
-}
 
 static ComPtr<ID3D12Resource> Texture(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc)
 {
@@ -535,6 +469,17 @@ int main(int argc, char** argv)
               "Create cross-adapter buffer");
         if (transfer.Size() != bytes)
             throw std::runtime_error("Wrong buffer size");
+        DlssNr::MultiGpu::CrossAdapterHandles exported;
+        Check(DlssNr::MultiGpu::CrossAdapterHandles::Create(transfer, exported), "Export shared handles");
+        DlssNr::MultiGpu::CrossAdapterPeer peer;
+        const auto primaryId = primary->GetAdapterLuid();
+        const auto secondaryId = secondary->GetAdapterLuid();
+        if (DlssNr::MultiGpu::CrossAdapterPeer::Open(primary, primaryId, secondaryId, bytes, exported.Heap(),
+                                                     exported.Ready(), exported.Done(), peer) != E_INVALIDARG)
+            throw std::runtime_error("Primary adapter accepted as the secondary peer");
+        Check(DlssNr::MultiGpu::CrossAdapterPeer::Open(secondary, primaryId, secondaryId, bytes, exported.Heap(),
+                                                       exported.Ready(), exported.Done(), peer),
+              "Open shared handles on secondary");
         Queue primaryQueue(primary), secondaryQueue(secondary);
         auto upload = Buffer(primary, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, bytes);
         auto primaryPatch = Buffer(primary, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, 4);
@@ -568,18 +513,15 @@ int main(int argc, char** argv)
                    D3D12_RESOURCE_STATE_COMMON);
         Check(outbound->Close(), "Close primary outbound");
         auto process = secondaryQueue.List(secondary);
-        Transition(process.Get(), transfer.SecondaryBuffer(), D3D12_RESOURCE_STATE_COMMON,
-                   D3D12_RESOURCE_STATE_COPY_SOURCE);
-        process->CopyBufferRegion(local.Get(), 0, transfer.SecondaryBuffer(), 0, bytes);
+        Transition(process.Get(), peer.Buffer(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        process->CopyBufferRegion(local.Get(), 0, peer.Buffer(), 0, bytes);
         Transition(process.Get(), local.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
         Transition(process.Get(), local.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
         process->CopyBufferRegion(local.Get(), sizeof(primaryReplacement), patch.Get(), 0, sizeof(replacement));
         Transition(process.Get(), local.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        Transition(process.Get(), transfer.SecondaryBuffer(), D3D12_RESOURCE_STATE_COPY_SOURCE,
-                   D3D12_RESOURCE_STATE_COPY_DEST);
-        process->CopyBufferRegion(transfer.SecondaryBuffer(), 0, local.Get(), 0, bytes);
-        Transition(process.Get(), transfer.SecondaryBuffer(), D3D12_RESOURCE_STATE_COPY_DEST,
-                   D3D12_RESOURCE_STATE_COMMON);
+        Transition(process.Get(), peer.Buffer(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        process->CopyBufferRegion(peer.Buffer(), 0, local.Get(), 0, bytes);
+        Transition(process.Get(), peer.Buffer(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
         Transition(process.Get(), local.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
         Check(process->Close(), "Close secondary work");
         auto inbound = primaryQueue.List(primary);
@@ -657,6 +599,9 @@ int main(int argc, char** argv)
             }
         }
         readback->Unmap(0, &noRead);
+        if (peer.Ready()->GetCompletedValue() < 2 || peer.Done()->GetCompletedValue() < 2)
+            throw std::runtime_error("Opened peer fences did not observe both submissions");
+        std::cout << "Exported heap and fence handles opened correctly on the secondary adapter.\n";
 
         TextureRoundTrip(primary, secondary, primaryQueue, secondaryQueue, DXGI_FORMAT_R8G8B8A8_UNORM);
         TextureRoundTrip(primary, secondary, primaryQueue, secondaryQueue, DXGI_FORMAT_R16G16B16A16_FLOAT);
