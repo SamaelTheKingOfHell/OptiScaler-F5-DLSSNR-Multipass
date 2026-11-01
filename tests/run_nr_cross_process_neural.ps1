@@ -1,6 +1,6 @@
 # Real neural passes in isolated processes, followed by a cross-adapter return to the primary GPU.
 param([string]$VcVars, [string]$CoreDll, [Parameter(Mandatory=$true)][string]$ForwarderDll,
-      [Parameter(Mandatory=$true)][string]$ModelDll, [switch]$BuildOnly)
+      [Parameter(Mandatory=$true)][string]$ModelDll, [switch]$NoPrimaryPass, [switch]$BuildOnly)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 if (!$CoreDll) {
@@ -30,7 +30,9 @@ try {
     & cmd /d /c "`"$VcVars`" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX tests/nr_gpu/nr_cross_process_neural.cpp /Fe:`"$exe`" /Fo:`"$obj`" /link d3d12.lib dxgi.lib user32.lib"
     if ($LASTEXITCODE -ne 0) { throw 'Neural cross-process probe compilation failed.' }
     if ($BuildOnly) { return }
-    & $exe $CoreDll $ForwarderDll $ModelDll $primaryData $workerData $log
+    $probeArgs = @($CoreDll, $ForwarderDll, $ModelDll, $primaryData, $workerData, $log)
+    if ($NoPrimaryPass) { $probeArgs += '--no-primary' }
+    & $exe @probeArgs
     if ($LASTEXITCODE -ne 0) {
         if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log }
         throw "Neural cross-process probe did not pass (exit code $LASTEXITCODE)."

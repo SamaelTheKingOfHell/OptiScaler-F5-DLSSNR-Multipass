@@ -24,7 +24,7 @@ class ModelSession
     ComPtr<ID3D12Device> device_;
     ComPtr<ID3D12CommandQueue> queue_;
     NVSDK_NGX_Parameter* params_ = nullptr;
-    void* feature_ = nullptr;
+    std::vector<void*> features_;
     DestroyParameters destroy_ = nullptr;
     Shutdown shutdown_ = nullptr;
     ReleaseFeature release_ = nullptr;
@@ -39,8 +39,10 @@ class ModelSession
     ~ModelSession()
     {
         std::cerr << "Session releasing model feature\n" << std::flush;
-        if (feature_ && release_)
-            release_(feature_);
+        if (release_)
+            for (auto it = features_.rbegin(); it != features_.rend(); ++it)
+                if (*it)
+                    release_(*it);
         std::cerr << "Session unloading forwarder\n" << std::flush;
         if (forwarder_)
             FreeLibrary(forwarder_);
@@ -54,8 +56,10 @@ class ModelSession
             FreeLibrary(core_);
     }
     void Initialize(ID3D12Device* device, const wchar_t* corePath, const wchar_t* forwarderPath,
-                    const wchar_t* modelPath, const wchar_t* dataPath)
+                    const wchar_t* modelPath, const wchar_t* dataPath, unsigned featureCount = 1)
     {
+        if (featureCount == 0 || featureCount > 8)
+            throw std::runtime_error("Invalid feature count");
         device_ = device;
         core_ = LoadLibraryExW(corePath, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
         if (!core_)
@@ -100,44 +104,51 @@ class ModelSession
         D3D12_COMMAND_QUEUE_DESC queueDesc {};
         queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         Check(device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue_)), "Create model queue");
-        ComPtr<ID3D12CommandAllocator> allocator;
-        ComPtr<ID3D12GraphicsCommandList> commands;
-        ComPtr<ID3D12Fence> fence;
-        Check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)),
-              "Create model allocator");
-        Check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
-                                        IID_PPV_ARGS(&commands)),
-              "Create model list");
-        Check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "Create model fence");
-        feature_ =
-            create(modelPath, dataPath, device, commands.Get(), params_, 256, 144, 0, 1.0f, 0, 0.0f, 0.0f, 0.0f, 1, 1);
-        if (!feature_)
-            throw std::runtime_error(error_ && error_() ? error_() : "Create model feature failed");
-        Check(commands->Close(), "Close model initialization");
-        ID3D12CommandList* lists[] = { commands.Get() };
-        queue_->ExecuteCommandLists(1, lists);
-        HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (!event || FAILED(queue_->Signal(fence.Get(), 1)) || FAILED(fence->SetEventOnCompletion(1, event)))
+        features_.reserve(featureCount);
+        for (unsigned i = 0; i < featureCount; ++i)
         {
-            if (event)
-                CloseHandle(event);
-            std::cerr << "Submitted model initialization cannot be tracked.\n" << std::flush;
-            ExitProcess(3);
-        }
-        const DWORD waited = WaitForSingleObject(event, 30000);
-        CloseHandle(event);
-        if (waited != WAIT_OBJECT_0 || FAILED(device->GetDeviceRemovedReason()))
-        {
-            std::cerr << "Model initialization did not retire.\n" << std::flush;
-            ExitProcess(3);
+            ComPtr<ID3D12CommandAllocator> allocator;
+            ComPtr<ID3D12GraphicsCommandList> commands;
+            ComPtr<ID3D12Fence> fence;
+            Check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)),
+                  "Create model allocator");
+            Check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                            IID_PPV_ARGS(&commands)),
+                  "Create model list");
+            Check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "Create model fence");
+            void* feature = create(modelPath, dataPath, device, commands.Get(), params_, 256, 144, 0, 1.0f, 0, 0.0f,
+                                   0.0f, 0.0f, 1, 1);
+            if (!feature)
+                throw std::runtime_error(error_ && error_() ? error_() : "Create model feature failed");
+            features_.push_back(feature);
+            Check(commands->Close(), "Close model initialization");
+            ID3D12CommandList* lists[] = { commands.Get() };
+            queue_->ExecuteCommandLists(1, lists);
+            HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (!event || FAILED(queue_->Signal(fence.Get(), 1)) || FAILED(fence->SetEventOnCompletion(1, event)))
+            {
+                if (event)
+                    CloseHandle(event);
+                std::cerr << "Submitted model initialization cannot be tracked.\n" << std::flush;
+                ExitProcess(3);
+            }
+            const DWORD waited = WaitForSingleObject(event, 30000);
+            CloseHandle(event);
+            if (waited != WAIT_OBJECT_0 || FAILED(device->GetDeviceRemovedReason()))
+            {
+                std::cerr << "Model initialization did not retire.\n" << std::flush;
+                ExitProcess(3);
+            }
         }
     }
     ID3D12CommandQueue* Queue() const { return queue_.Get(); }
     int Record(ID3D12GraphicsCommandList* commands, ID3D12Resource* color, ID3D12Resource* depth,
-               ID3D12Resource* motion, ID3D12Resource* output, bool reset)
+               ID3D12Resource* motion, ID3D12Resource* output, bool reset, unsigned featureIndex = 0)
     {
-        return evaluate_(commands, feature_, params_, color, depth, motion, output, 256, 144, 256, 144, 256, 144, 0, 0,
-                         0, 0, 0, reset ? 1 : 0, 1.0f, 0, 0.0f, 0.0f, 0.0f, 1, 1.0f, 1.0f);
+        if (featureIndex >= features_.size())
+            throw std::runtime_error("Invalid feature index");
+        return evaluate_(commands, features_[featureIndex], params_, color, depth, motion, output, 256, 144, 256, 144,
+                         256, 144, 0, 0, 0, 0, 0, reset ? 1 : 0, 1.0f, 0, 0.0f, 0.0f, 0.0f, 1, 1.0f, 1.0f);
     }
     const char* LastError() const { return error_ ? error_() : "no detail"; }
 };

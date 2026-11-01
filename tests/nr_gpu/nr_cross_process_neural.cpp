@@ -2,6 +2,7 @@
 #include "../../OptiScaler/dlssnr/DlssNr_CrossAdapterIpc.h"
 #include "../../OptiScaler/dlssnr/DlssNr_CrossAdapterSelect.h"
 #include "nr_ngx_session_fixture.h"
+#include "nr_interpass_clamp_fixture.h"
 #include <d3d12sdklayers.h>
 #include <cwchar>
 #include <limits>
@@ -185,8 +186,17 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
         frame.motion.footprint.Footprint.RowPitch != wire.motionPitch)
         throw std::runtime_error("Worker footprint mismatch");
     Fill(frame.output, 3);
+    NrFixture::Surface extraOutput;
+    if (!NrFixture::MakeSurface(device.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, true, extraOutput))
+        throw std::runtime_error("Create additional secondary output failed");
+    Fill(extraOutput, 3);
+    NrFixture::Surface clamped;
+    if (!NrFixture::MakeSurface(device.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, true, clamped))
+        throw std::runtime_error("Create intermediate clamp texture failed");
+    Fill(clamped, 3);
+    InterpassClamp clamp(device.Get());
     NrFixture::ModelSession session;
-    session.Initialize(device.Get(), core, forwarder, model, data);
+    session.Initialize(device.Get(), core, forwarder, model, data, 2);
     for (uint64_t frameNumber = 1; frameNumber <= 2; ++frameNumber)
     {
         ComPtr<ID3D12CommandAllocator> allocator;
@@ -196,7 +206,11 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
             for (auto* input : { &frame.color, &frame.depth, &frame.motion })
                 NrFixture::Barrier(commands.Get(), input->texture.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                    D3D12_RESOURCE_STATE_COPY_DEST);
-            NrFixture::Barrier(commands.Get(), frame.output.texture.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+            NrFixture::Barrier(commands.Get(), frame.output.texture.Get(),
+                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            NrFixture::Barrier(commands.Get(), extraOutput.texture.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                               D3D12_RESOURCE_STATE_COPY_DEST);
+            NrFixture::Barrier(commands.Get(), clamped.texture.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                D3D12_RESOURCE_STATE_COPY_DEST);
         }
         Transition(commands.Get(), peer.Buffer(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -204,11 +218,23 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
         CopyFromShared(commands.Get(), peer.Buffer(), frame.depth, frame.color.bytes);
         CopyFromShared(commands.Get(), peer.Buffer(), frame.motion, frame.color.bytes + frame.depth.bytes);
         CopyUpload(commands.Get(), frame.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        CopyUpload(commands.Get(), extraOutput, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        CopyUpload(commands.Get(), clamped, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         Evaluate(session, commands.Get(), frame, frameNumber == 1);
         NrFixture::Barrier(commands.Get(), frame.output.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        clamp.Record(commands.Get(), frame.output.texture.Get(), frame.color.texture.Get(), clamped.texture.Get());
+        NrFixture::Barrier(commands.Get(), clamped.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        const int secondResult =
+            session.Record(commands.Get(), clamped.texture.Get(), frame.depth.texture.Get(), frame.motion.texture.Get(),
+                           extraOutput.texture.Get(), frameNumber == 1, 1);
+        if (secondResult != 1)
+            throw std::runtime_error("Second secondary neural pass failed");
+        NrFixture::Barrier(commands.Get(), extraOutput.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                            D3D12_RESOURCE_STATE_COPY_SOURCE);
         Transition(commands.Get(), peer.Buffer(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-        CopyToShared(commands.Get(), peer.Buffer(), frame.output, 0);
+        CopyToShared(commands.Get(), peer.Buffer(), extraOutput, 0);
         Transition(commands.Get(), peer.Buffer(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
         Check(session.Queue()->Wait(peer.Ready(), frameNumber), "Worker wait for primary frame");
         Submit(session.Queue(), commands.Get());
@@ -225,7 +251,7 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
 }
 
 static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* model, const wchar_t* parentData,
-                  const wchar_t* workerData, const wchar_t* log)
+                  const wchar_t* workerData, const wchar_t* log, bool primaryPass)
 {
     MEMORYSTATUSEX memory { sizeof(memory) };
     if (!GlobalMemoryStatusEx(&memory) || memory.ullAvailPageFile < 8ull * 1024 * 1024 * 1024)
@@ -281,6 +307,11 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
     Fill(frame.depth, 1);
     Fill(frame.motion, 2);
     Fill(frame.output, 3);
+    NrFixture::Surface primaryClamped;
+    if (!NrFixture::MakeSurface(primary.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, true, primaryClamped))
+        throw std::runtime_error("Create primary clamp texture failed");
+    Fill(primaryClamped, 3);
+    InterpassClamp primaryClamp(primary.Get());
     DlssNr::MultiGpu::CrossAdapterBuffer transfer;
     Check(DlssNr::MultiGpu::CrossAdapterBuffer::Create(primary.Get(), secondary.device.Get(), frame.Bytes(), transfer),
           "Create frame transfer");
@@ -369,25 +400,46 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
             if (frameNumber > 1)
             {
                 NrFixture::Barrier(commands.Get(), frame.color.texture.Get(),
-                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-                for (auto* input : { &frame.depth, &frame.motion, &frame.output })
+                                   primaryPass ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                               : D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                   D3D12_RESOURCE_STATE_COPY_DEST);
+                for (auto* input : { &frame.depth, &frame.motion })
                     NrFixture::Barrier(commands.Get(), input->texture.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
                                        D3D12_RESOURCE_STATE_COPY_DEST);
+                NrFixture::Barrier(commands.Get(), frame.output.texture.Get(),
+                                   primaryPass ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                               : D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                   D3D12_RESOURCE_STATE_COPY_DEST);
+                if (primaryPass)
+                    NrFixture::Barrier(commands.Get(), primaryClamped.texture.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                       D3D12_RESOURCE_STATE_COPY_DEST);
             }
-            CopyUpload(commands.Get(), frame.color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            CopyUpload(commands.Get(), frame.color,
+                       primaryPass ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_SOURCE);
             CopyUpload(commands.Get(), frame.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             CopyUpload(commands.Get(), frame.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             CopyUpload(commands.Get(), frame.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            Evaluate(session, commands.Get(), frame, frameNumber == 1);
-            NrFixture::Barrier(commands.Get(), frame.output.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                               D3D12_RESOURCE_STATE_COPY_SOURCE);
+            if (primaryPass)
+            {
+                CopyUpload(commands.Get(), primaryClamped, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                Evaluate(session, commands.Get(), frame, frameNumber == 1);
+                NrFixture::Barrier(commands.Get(), frame.output.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                primaryClamp.Record(commands.Get(), frame.output.texture.Get(), frame.color.texture.Get(),
+                                    primaryClamped.texture.Get());
+                NrFixture::Barrier(commands.Get(), primaryClamped.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+            }
+            else
+                NrFixture::Barrier(commands.Get(), frame.output.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                   D3D12_RESOURCE_STATE_COPY_SOURCE);
             NrFixture::Barrier(commands.Get(), frame.depth.texture.Get(),
                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
             NrFixture::Barrier(commands.Get(), frame.motion.texture.Get(),
                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
             Transition(commands.Get(), transfer.PrimaryBuffer(), D3D12_RESOURCE_STATE_COMMON,
                        D3D12_RESOURCE_STATE_COPY_DEST);
-            CopyToShared(commands.Get(), transfer.PrimaryBuffer(), frame.output, 0);
+            CopyToShared(commands.Get(), transfer.PrimaryBuffer(), primaryPass ? primaryClamped : frame.color, 0);
             CopyToShared(commands.Get(), transfer.PrimaryBuffer(), frame.depth, frame.color.bytes);
             CopyToShared(commands.Get(), transfer.PrimaryBuffer(), frame.motion, frame.color.bytes + frame.depth.bytes);
             Transition(commands.Get(), transfer.PrimaryBuffer(), D3D12_RESOURCE_STATE_COPY_DEST,
@@ -398,7 +450,9 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
                 ExitProcess(3);
             Retire(primary.Get(), session.Queue());
             submitted = false;
-            std::cout << "Primary neural pass retired and frame sent to secondary.\n" << std::flush;
+            std::cout << (primaryPass ? "Primary neural pass retired and frame sent to secondary.\n"
+                                      : "Original primary frame sent to secondary.\n")
+                      << std::flush;
             OwnedHandle doneEvent { CreateEventW(nullptr, FALSE, FALSE, nullptr) };
             if (!doneEvent.value)
                 throw std::runtime_error("Create return event failed");
@@ -466,7 +520,8 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
         if (!GetExitCodeProcess(process.value, &exitCode) || exitCode != 0)
             throw std::runtime_error("Worker failed; see worker log");
         completed = true;
-        std::cout << "Both persistent neural features evaluated two sequential frames; worker exited cleanly.\n"
+        std::cout << (primaryPass ? "One primary and two secondary features" : "Two secondary features")
+                  << " evaluated two sequential frames; worker exited cleanly.\n"
                   << std::flush;
     }
     catch (...)
@@ -489,8 +544,8 @@ int wmain(int argc, wchar_t** argv)
         if (argc == 8 && std::wcscmp(argv[1], L"--worker") == 0)
             return Worker(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(_wcstoui64(argv[2], nullptr, 10))), argv[3],
                           argv[4], argv[5], argv[6], argv[7]);
-        if (argc == 7)
-            return Parent(argv[1], argv[2], argv[3], argv[4], argv[5], argv[6]);
+        if (argc == 7 || (argc == 8 && std::wcscmp(argv[7], L"--no-primary") == 0))
+            return Parent(argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], argc == 7);
         std::cerr << "Expected core, forwarder, model, primary data, worker data, worker log.\n";
         return 2;
     }

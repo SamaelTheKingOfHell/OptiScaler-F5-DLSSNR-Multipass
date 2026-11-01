@@ -1,3 +1,8 @@
+## 2026-11-01 — Contiguous neural pass fixtures (WIP)
+
+- Extended the isolated frame test to use a separate persistent feature for each of two secondary passes, with the existing precompiled clamp shader between passes. It exercises either one primary pass followed by two secondary passes, or two secondary passes without a primary evaluation. The existing application pass settings and worker lifecycle remain unimplemented.
+- OpenAI Codex, GPT-6 (exact model and effort unavailable). Both placements processed two distinct frames on the RTX 5070 Ti and RTX 3060, checked D3D12 debug errors, returned the result to a primary texture and exited cleanly. The zero-primary-evaluation fixture still initializes an unused primary feature. This does not validate in-game appearance, performance or all production inter-pass modes.
+
 ## 2026-11-01 — Isolated cross-process neural frame prototype (WIP)
 
 - Added duplicated cross-adapter heap and fence handles and isolated worker fixtures. Two persistent model features run two sequential synthetic frames with primary-pass output, depth and motion transferred once to the worker and the worker result returned to a primary-device texture. The model, core and forwarder paths are provided locally; no model DLL is distributed.
