@@ -16,6 +16,12 @@ The adjacent DLSS Bridge project documents a secondary-GPU transport for some ca
 
 A D3D12 shared-buffer and single-plane texture transport prototype exists, with separate outbound and return fences. It has no integration into the model pass loop or game submission path. The caller must transition resources, order queues and keep each allocation alive until all work retires. Unsupported texture descriptions or mismatched adapter footprints are rejected.
 
-Run `./tests/run_nr_cross_adapter_tests.ps1` for the required two-NVIDIA-adapter round trip. `-Warp` instead exercises an NVIDIA adapter plus Microsoft's software adapter; it is a controlled fixture, not a two-GPU or game test. `-ArgumentsOnly` checks fail-closed validation without a second device. The fixture verifies raw bytes and padded RGBA8, RGBA16F, R32F and RG16F textures, but does not run a neural model or present a game.
+Run `./tests/run_nr_cross_adapter_tests.ps1` for a two-NVIDIA-adapter round trip, with the primary display adapter first. This test convention does not prove which adapter a particular game uses; runtime integration must use that game device’s LUID. `-Warp` instead exercises an NVIDIA adapter plus Microsoft's software adapter; it is a controlled fixture, not a two-GPU or game test. `-ArgumentsOnly` checks fail-closed validation without a second device. The fixture verifies raw bytes and padded RGBA8, RGBA16F, R32F and RG16F textures, but does not run a neural model or present a game.
 
 On 2026-11-01 the NVIDIA RTX 3060 plus WARP fixture passed with the D3D12 debug layer enabled. The RTX 5070 Ti enumerated but `D3D12CreateDevice` returned `0x8007000e`, so no two-physical-GPU result was obtained. Retry the default test once both adapters can create D3D12 devices.
+
+## Ordered submission prototype
+
+`CrossAdapterSubmit` validates command-list and queue ownership by adapter LUID and enqueues three already-closed, caller-owned lists in primary, secondary, primary order. A pure sequencing test injects failures into each fence signal or wait and checks that the protocol refuses further use after a partial submission. The coordinator has no way to split a game command list that is still being recorded; it is not integrated into the neural path. The caller remains responsible for resource states, feature lifetime, submission retirement and handling device loss.
+
+A separate diagnostic on 2026-11-01 confirmed that the RTX 5070 Ti owns the primary display and that both D3D11 and D3D12 device creation on it returned `0x8007000e`; the RTX 3060 successfully initialized both APIs. Windows commit headroom was low, but the cause of the allocation failure is not yet confirmed.

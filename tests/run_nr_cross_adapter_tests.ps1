@@ -17,7 +17,13 @@ $exe = Join-Path $out 'nr_cross_adapter_roundtrip.exe'
 $obj = Join-Path $out 'nr_cross_adapter_roundtrip.obj'
 Push-Location $repo
 try {
-    & cmd /d /c "`"$VcVars`" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX tests/nr_gpu/nr_cross_adapter_roundtrip.cpp /Fe:`"$exe`" /Fo:`"$obj`" /link d3d12.lib dxgi.lib"
+    $protocolExe = Join-Path $out 'nr_cross_adapter_protocol_smoke.exe'
+    $protocolObj = Join-Path $out 'nr_cross_adapter_protocol_smoke.obj'
+    & cmd /d /c "`"$VcVars`" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX tests/nr_cross_adapter_protocol_smoke.cpp /Fe:`"$protocolExe`" /Fo:`"$protocolObj`""
+    if ($LASTEXITCODE -ne 0) { throw 'Cross-adapter protocol test compilation failed.' }
+    & $protocolExe
+    if ($LASTEXITCODE -ne 0) { throw 'Cross-adapter protocol test failed.' }
+    & cmd /d /c "`"$VcVars`" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX tests/nr_gpu/nr_cross_adapter_roundtrip.cpp /Fe:`"$exe`" /Fo:`"$obj`" /link d3d12.lib dxgi.lib user32.lib"
     if ($LASTEXITCODE -ne 0) { throw 'Cross-adapter probe compilation failed.' }
     $testArgs = @()
     if ($Warp) { $testArgs = @('--warp') }

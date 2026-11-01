@@ -1,7 +1,9 @@
 #include "pch.h"
 #include "../../OptiScaler/dlssnr/DlssNr_CrossAdapterTexture.h"
+#include "../../OptiScaler/dlssnr/DlssNr_CrossAdapterSubmit.h"
 #include <d3d12sdklayers.h>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 
 using Microsoft::WRL::ComPtr;
@@ -104,6 +106,18 @@ static D3D12_TEXTURE_COPY_LOCATION BufferLocation(ID3D12Resource* buffer,
     return location;
 }
 
+static void SubmitSplit(DlssNr::MultiGpu::CrossAdapterSubmit& submission, ID3D12GraphicsCommandList* before,
+                        ID3D12GraphicsCommandList* work, ID3D12GraphicsCommandList* after, uint64_t expectedTicket)
+{
+    const auto bad = submission.Submit(work, before, after);
+    if (bad.result != E_INVALIDARG || bad.phase != DlssNr::MultiGpu::SubmissionPhase::Validate || bad.ticket != 0)
+        throw std::runtime_error("Misassigned command-list devices were not rejected before submission");
+    const auto result = submission.Submit(before, work, after);
+    Check(result.result, "Submit cross-adapter lists");
+    if (result.phase != DlssNr::MultiGpu::SubmissionPhase::Complete || result.ticket != expectedTicket)
+        throw std::runtime_error("Unexpected cross-adapter submission status");
+}
+
 static void TextureRoundTrip(ID3D12Device* primary, ID3D12Device* secondary, Queue& primaryQueue, Queue& secondaryQueue,
                              DXGI_FORMAT format)
 {
@@ -152,9 +166,7 @@ static void TextureRoundTrip(ID3D12Device* primary, ID3D12Device* secondary, Que
     imageOutbound->CopyTextureRegion(&primaryTransferLocation, 0, 0, 0, &primaryLocation, nullptr);
     Transition(imageOutbound.Get(), imageTransfer.Buffer().PrimaryBuffer(), D3D12_RESOURCE_STATE_COPY_DEST,
                D3D12_RESOURCE_STATE_COMMON);
-    primaryQueue.Submit(imageOutbound.Get());
-    Check(primaryQueue.queue->Signal(imageTransfer.Buffer().PrimaryReady(), 1), "Signal image outbound");
-    Check(secondaryQueue.queue->Wait(imageTransfer.Buffer().SecondaryReady(), 1), "Wait image outbound");
+    Check(imageOutbound->Close(), "Close primary image outbound");
     auto imageProcess = secondaryQueue.List(secondary);
     Transition(imageProcess.Get(), imageTransfer.Buffer().SecondaryBuffer(), D3D12_RESOURCE_STATE_COMMON,
                D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -166,9 +178,7 @@ static void TextureRoundTrip(ID3D12Device* primary, ID3D12Device* secondary, Que
     imageProcess->CopyTextureRegion(&secondaryTransferLocation, 0, 0, 0, &secondaryLocation, nullptr);
     Transition(imageProcess.Get(), imageTransfer.Buffer().SecondaryBuffer(), D3D12_RESOURCE_STATE_COPY_DEST,
                D3D12_RESOURCE_STATE_COMMON);
-    secondaryQueue.Submit(imageProcess.Get());
-    Check(secondaryQueue.queue->Signal(imageTransfer.Buffer().SecondaryDone(), 1), "Signal image return");
-    Check(primaryQueue.queue->Wait(imageTransfer.Buffer().PrimaryDone(), 1), "Wait image return");
+    Check(imageProcess->Close(), "Close secondary image work");
     auto imageInbound = primaryQueue.List(primary);
     Transition(imageInbound.Get(), imageTransfer.Buffer().PrimaryBuffer(), D3D12_RESOURCE_STATE_COMMON,
                D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -177,7 +187,10 @@ static void TextureRoundTrip(ID3D12Device* primary, ID3D12Device* secondary, Que
                D3D12_RESOURCE_STATE_COMMON);
     Transition(imageInbound.Get(), resultImage.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
     imageInbound->CopyTextureRegion(&resultBufferLocation, 0, 0, 0, &resultLocation, nullptr);
-    primaryQueue.Submit(imageInbound.Get());
+    Check(imageInbound->Close(), "Close primary image return");
+    DlssNr::MultiGpu::CrossAdapterSubmit imageSubmission(primaryQueue.queue.Get(), secondaryQueue.queue.Get(),
+                                                         imageTransfer.Buffer());
+    SubmitSplit(imageSubmission, imageOutbound.Get(), imageProcess.Get(), imageInbound.Get(), 1);
     ComPtr<ID3D12Fence> finished;
     Check(primary->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&finished)), "Create image completion fence");
     Check(primaryQueue.queue->Signal(finished.Get(), 1), "Signal image completion");
@@ -212,6 +225,13 @@ int main(int argc, char** argv)
 {
     try
     {
+        const bool argumentsOnly = argc == 2 && std::strcmp(argv[1], "--arguments") == 0;
+        const bool useWarp = argc == 2 && std::strcmp(argv[1], "--warp") == 0;
+        if (argc != 1 && !argumentsOnly && !useWarp)
+        {
+            std::cerr << "Usage: nr_cross_adapter_roundtrip [--arguments|--warp]\n";
+            return 2;
+        }
         ComPtr<ID3D12Debug> debug;
         const bool debugEnabled = SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)));
         if (debugEnabled)
@@ -220,7 +240,10 @@ int main(int argc, char** argv)
         ComPtr<IDXGIFactory4> factory;
         Check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "CreateDXGIFactory1");
         std::vector<ComPtr<ID3D12Device>> devices;
-        for (UINT i = 0; devices.size() < 2; ++i)
+        std::optional<LUID> displayLuid;
+        const POINT origin { 0, 0 };
+        const HMONITOR primaryMonitor = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+        for (UINT i = 0;; ++i)
         {
             ComPtr<IDXGIAdapter1> adapter;
             HRESULT hr = factory->EnumAdapters1(i, &adapter);
@@ -234,6 +257,18 @@ int main(int argc, char** argv)
                        << std::flush;
             if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) || desc.VendorId != 0x10de)
                 continue;
+            for (UINT outputIndex = 0;; ++outputIndex)
+            {
+                ComPtr<IDXGIOutput> output;
+                const HRESULT outputResult = adapter->EnumOutputs(outputIndex, &output);
+                if (outputResult == DXGI_ERROR_NOT_FOUND)
+                    break;
+                Check(outputResult, "EnumOutputs");
+                DXGI_OUTPUT_DESC outputDesc {};
+                Check(output->GetDesc(&outputDesc), "Get output description");
+                if (outputDesc.AttachedToDesktop && outputDesc.Monitor == primaryMonitor)
+                    displayLuid = desc.AdapterLuid;
+            }
             ComPtr<ID3D12Device> device;
             const HRESULT createResult =
                 D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device));
@@ -268,14 +303,26 @@ int main(int argc, char** argv)
             invalidTexture.Buffer().PrimaryBuffer() || invalidTexture.Buffer().Size() != 0)
             throw std::runtime_error("Invalid texture request did not fail cleanly");
         std::cout << "Invalid transport requests rejected without publishing resources.\n";
-        if (argc == 2 && std::strcmp(argv[1], "--arguments") == 0)
+        if (argumentsOnly)
             return 0;
-        const bool useWarp = argc == 2 && std::strcmp(argv[1], "--warp") == 0;
-        if (argc != 1 && !useWarp)
+        auto primaryMatch = devices.end();
+        if (displayLuid)
+            primaryMatch =
+                std::find_if(devices.begin(), devices.end(),
+                             [&](const ComPtr<ID3D12Device>& device)
+                             {
+                                 const LUID luid = device->GetAdapterLuid();
+                                 return luid.HighPart == displayLuid->HighPart && luid.LowPart == displayLuid->LowPart;
+                             });
+        if (primaryMatch != devices.end())
+            std::iter_swap(devices.begin(), primaryMatch);
+        else if (!useWarp)
         {
-            std::cerr << "Usage: nr_cross_adapter_roundtrip [--arguments|--warp]\n";
+            std::cerr << "The primary display adapter was not available as a D3D12 device; hardware test not run.\n";
             return 2;
         }
+        else
+            std::cout << "Primary display device unavailable; WARP fixture uses another available GPU.\n";
         if (useWarp)
         {
             ComPtr<IDXGIAdapter> warp;
@@ -302,7 +349,7 @@ int main(int argc, char** argv)
         Queue primaryQueue(primary), secondaryQueue(secondary);
         auto upload = Buffer(primary, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, bytes);
         auto patch = Buffer(secondary, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, 4);
-        auto local = Buffer(secondary, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, bytes);
+        auto local = Buffer(secondary, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, bytes);
         auto readback = Buffer(primary, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, bytes);
         uint8_t* data = nullptr;
         D3D12_RANGE noRead { 0, 0 };
@@ -320,9 +367,7 @@ int main(int argc, char** argv)
         outbound->CopyBufferRegion(transfer.PrimaryBuffer(), 0, upload.Get(), 0, bytes);
         Transition(outbound.Get(), transfer.PrimaryBuffer(), D3D12_RESOURCE_STATE_COPY_DEST,
                    D3D12_RESOURCE_STATE_COMMON);
-        primaryQueue.Submit(outbound.Get());
-        Check(primaryQueue.queue->Signal(transfer.PrimaryReady(), 1), "Signal outbound");
-        Check(secondaryQueue.queue->Wait(transfer.SecondaryReady(), 1), "Wait outbound");
+        Check(outbound->Close(), "Close primary outbound");
         auto process = secondaryQueue.List(secondary);
         Transition(process.Get(), transfer.SecondaryBuffer(), D3D12_RESOURCE_STATE_COMMON,
                    D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -334,16 +379,17 @@ int main(int argc, char** argv)
         process->CopyBufferRegion(transfer.SecondaryBuffer(), 0, local.Get(), 0, bytes);
         Transition(process.Get(), transfer.SecondaryBuffer(), D3D12_RESOURCE_STATE_COPY_DEST,
                    D3D12_RESOURCE_STATE_COMMON);
-        secondaryQueue.Submit(process.Get());
-        Check(secondaryQueue.queue->Signal(transfer.SecondaryDone(), 1), "Signal return");
-        Check(primaryQueue.queue->Wait(transfer.PrimaryDone(), 1), "Wait return");
+        Transition(process.Get(), local.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        Check(process->Close(), "Close secondary work");
         auto inbound = primaryQueue.List(primary);
         Transition(inbound.Get(), transfer.PrimaryBuffer(), D3D12_RESOURCE_STATE_COMMON,
                    D3D12_RESOURCE_STATE_COPY_SOURCE);
         inbound->CopyBufferRegion(readback.Get(), 0, transfer.PrimaryBuffer(), 0, bytes);
         Transition(inbound.Get(), transfer.PrimaryBuffer(), D3D12_RESOURCE_STATE_COPY_SOURCE,
                    D3D12_RESOURCE_STATE_COMMON);
-        primaryQueue.Submit(inbound.Get());
+        Check(inbound->Close(), "Close primary return");
+        DlssNr::MultiGpu::CrossAdapterSubmit submission(primaryQueue.queue.Get(), secondaryQueue.queue.Get(), transfer);
+        SubmitSplit(submission, outbound.Get(), process.Get(), inbound.Get(), 1);
         ComPtr<ID3D12Fence> finished;
         Check(primary->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&finished)), "Create completion fence");
         Check(primaryQueue.queue->Signal(finished.Get(), 1), "Signal completion");
@@ -374,6 +420,38 @@ int main(int argc, char** argv)
         }
         readback->Unmap(0, &noRead);
 
+        // Reuse the same closed command lists and transport only after the first frame retires.
+        Check(upload->Map(0, &noRead, reinterpret_cast<void**>(&data)), "Map second input");
+        for (uint64_t i = 0; i < bytes; ++i)
+            data[i] = static_cast<uint8_t>((i * 9u + 3u) & 255u);
+        upload->Unmap(0, nullptr);
+        SubmitSplit(submission, outbound.Get(), process.Get(), inbound.Get(), 2);
+        Check(primaryQueue.queue->Signal(finished.Get(), 2), "Signal second completion");
+        event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!event)
+            throw std::runtime_error("CreateEvent failed");
+        hr = finished->SetEventOnCompletion(2, event);
+        if (FAILED(hr))
+        {
+            CloseHandle(event);
+            Check(hr, "Set second completion event");
+        }
+        waited = WaitForSingleObject(event, 10000);
+        CloseHandle(event);
+        if (waited != WAIT_OBJECT_0)
+            throw std::runtime_error("Second GPU round trip timed out");
+        Check(readback->Map(0, &range, reinterpret_cast<void**>(&data)), "Map second result");
+        for (uint64_t i = 0; i < bytes; ++i)
+        {
+            const auto expected = i < sizeof(replacement) ? replacement[i] : static_cast<uint8_t>((i * 9u + 3u) & 255u);
+            if (data[i] != expected)
+            {
+                readback->Unmap(0, &noRead);
+                throw std::runtime_error("Second round trip differs");
+            }
+        }
+        readback->Unmap(0, &noRead);
+
         TextureRoundTrip(primary, secondary, primaryQueue, secondaryQueue, DXGI_FORMAT_R8G8B8A8_UNORM);
         TextureRoundTrip(primary, secondary, primaryQueue, secondaryQueue, DXGI_FORMAT_R16G16B16A16_FLOAT);
         TextureRoundTrip(primary, secondary, primaryQueue, secondaryQueue, DXGI_FORMAT_R32_FLOAT);
@@ -394,6 +472,8 @@ int main(int argc, char** argv)
                 if (message->Severity == D3D12_MESSAGE_SEVERITY_ERROR ||
                     message->Severity == D3D12_MESSAGE_SEVERITY_CORRUPTION)
                     throw std::runtime_error(std::string("D3D12 debug layer: ") + message->pDescription);
+                if (message->Severity == D3D12_MESSAGE_SEVERITY_WARNING)
+                    std::cerr << "D3D12 debug warning: " << message->pDescription << "\n";
             }
         }
         std::cout << "Cross-adapter GPU round trip passed: 4096 bytes, one outbound and one return.\n";

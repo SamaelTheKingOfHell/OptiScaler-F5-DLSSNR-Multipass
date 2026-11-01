@@ -1,3 +1,9 @@
+## 2026-11-01 — Ordered cross-adapter submission prototype (WIP)
+
+- Added a GPU queue coordinator that validates adapter ownership by LUID, schedules primary/secondary/primary lists, and refuses reuse after a partial submission failure. Added deterministic failure-injection coverage and Windows CI. This operates on closed owned lists and is not integrated into the neural rendering path.
+- OpenAI Codex, GPT-6 (exact model and effort unavailable). MSVC protocol tests and RTX 3060/WARP round trips passed for two successive buffers and four padded texture formats with the D3D12 debug layer. Wrong-device lists were rejected before submission. Hardware testing remains blocked: the RTX 5070 Ti owns the primary display but D3D11 and D3D12 device creation both returned `0x8007000e`; no causal diagnosis is confirmed.
+- Full build, secondary neural feature instances, game integration, deployment and in-game verification remain pending. Retry `./tests/run_nr_cross_adapter_tests.ps1` after primary-device initialization succeeds.
+
 ## 2026-11-01 — D3D12 cross-adapter transport prototype (WIP)
 
 - Added shared-buffer transport, directional fences, footprint-checked single-plane texture transport, and a standalone GPU probe. No rendering path calls the prototype yet.
