@@ -8,6 +8,8 @@
 #include "nr_cross_adapter_test_helpers.h"
 #include "../../OptiScaler/dlssnr/worker/InterpassClamp.h"
 #include "../../OptiScaler/dlssnr/worker/WorkerProtocol.h"
+#include "../../OptiScaler/dlssnr/worker/WorkerClient.h"
+#include "../../OptiScaler/dlssnr/worker/WorkerFrameTransfer.h"
 #include <d3d12sdklayers.h>
 #include <cwchar>
 #include <limits>
@@ -77,20 +79,6 @@ static void CopyUpload(ID3D12GraphicsCommandList* commands, NrFixture::Surface& 
     commands->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     NrFixture::Barrier(commands, surface.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, next);
 }
-static D3D12_TEXTURE_COPY_LOCATION SharedLocation(ID3D12Resource* shared, const NrFixture::Surface& surface,
-                                                  UINT64 offset)
-{
-    auto location = NrFixture::Buffer(shared, surface.footprint);
-    location.PlacedFootprint.Offset = offset;
-    return location;
-}
-static void CopyToShared(ID3D12GraphicsCommandList* commands, ID3D12Resource* shared, NrFixture::Surface& surface,
-                         UINT64 offset)
-{
-    auto src = NrFixture::Texture(surface.texture.Get());
-    auto dst = SharedLocation(shared, surface, offset);
-    commands->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-}
 static void CheckDebug(ID3D12Device* device)
 {
     ComPtr<ID3D12InfoQueue> messages;
@@ -110,7 +98,7 @@ static void CheckDebug(ID3D12Device* device)
             std::cerr << "D3D12 debug warning: " << message->pDescription << "\n";
     }
 }
-static void Retire(ID3D12Device* device, ID3D12CommandQueue* queue)
+static ComPtr<ID3D12Fence> Retire(ID3D12Device* device, ID3D12CommandQueue* queue)
 {
     ComPtr<ID3D12Fence> fence;
     OwnedHandle event { CreateEventW(nullptr, FALSE, FALSE, nullptr) };
@@ -121,6 +109,7 @@ static void Retire(ID3D12Device* device, ID3D12CommandQueue* queue)
         std::cerr << "Could not retire submitted neural work; terminating probe.\n" << std::flush;
         ExitProcess(3);
     }
+    return fence;
 }
 static DlssNr::Worker::Evaluation MakeEvaluation(Frame& frame, bool reset)
 {
@@ -163,7 +152,7 @@ static ComPtr<ID3D12GraphicsCommandList> Commands(ID3D12Device* device, ComPtr<I
 }
 static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* model, const wchar_t* parentData,
                   const wchar_t* workerData, const wchar_t* log, const wchar_t* workerExe, bool primaryPass,
-                  unsigned secondaryPasses, unsigned width, unsigned height)
+                  unsigned secondaryPasses, unsigned width, unsigned height, bool failureTest, bool resetSecondFrame)
 {
     MEMORYSTATUSEX memory { sizeof(memory) };
     if (!GlobalMemoryStatusEx(&memory) || memory.ullAvailPageFile < 8ull * 1024 * 1024 * 1024)
@@ -224,11 +213,11 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
         throw std::runtime_error("Create primary clamp texture failed");
     Fill(primaryClamped, 3);
     InterpassClamp primaryClamp(primary.Get(), width, height);
-    DlssNr::MultiGpu::CrossAdapterBuffer transfer;
-    Check(DlssNr::MultiGpu::CrossAdapterBuffer::Create(primary.Get(), secondary.device.Get(), frame.Bytes(), transfer),
+    DlssNr::Worker::FrameTransfer frameTransfer;
+    Check(DlssNr::Worker::FrameTransfer::Create(primary.Get(), secondary.device.Get(), frame.color.texture.Get(),
+                                                frame.depth.texture.Get(), frame.motion.texture.Get(), frameTransfer),
           "Create frame transfer");
-    DlssNr::MultiGpu::CrossAdapterHandles handles;
-    Check(DlssNr::MultiGpu::CrossAdapterHandles::Create(transfer, handles), "Export frame handles");
+    const auto& transfer = frameTransfer.Buffer();
     DlssNr::Worker::ModelSession session;
     session.Initialize(primary.Get(), core, forwarder, model, parentData, width, height,
                        std::vector<DlssNr::Worker::FeatureTuning>(1), 0x24480451ull);
@@ -241,92 +230,55 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
             throw std::runtime_error("Owned command chain accepted a foreign-device list");
     }
     std::cout << "Primary model initialized; starting isolated secondary.\n" << std::flush;
-    SECURITY_ATTRIBUTES security { sizeof(security), nullptr, TRUE };
-    OwnedHandle readPipe, writePipe;
-    if (!CreatePipe(&readPipe.value, &writePipe.value, &security, 0) ||
-        !SetHandleInformation(writePipe.value, HANDLE_FLAG_INHERIT, 0))
-        throw std::runtime_error("Create pipe failed");
-    SIZE_T attributeBytes = 0;
-    InitializeProcThreadAttributeList(nullptr, 1, 0, &attributeBytes);
-    std::vector<uint8_t> storage(attributeBytes);
-    auto* attributes = reinterpret_cast<PPROC_THREAD_ATTRIBUTE_LIST>(storage.data());
-    if (!InitializeProcThreadAttributeList(attributes, 1, 0, &attributeBytes))
-        throw std::runtime_error("Initialize attributes failed");
-    HANDLE inherited[] = { readPipe.value };
-    if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited, sizeof(inherited),
-                                   nullptr, nullptr))
+    DlssNr::Worker::WorkerClient worker;
+    Wire wire = frameTransfer.MakeWire(secondaryPasses);
+    wire.enableDebug = 1;
     {
-        DeleteProcThreadAttributeList(attributes);
-        throw std::runtime_error("Restrict inherited handles failed");
+        auto invalid = wire;
+        invalid.secondary = invalid.primary;
+        DlssNr::Worker::WorkerClient rejected;
+        if (rejected.Start(primary.Get(), workerExe, core, forwarder, model, workerData, log, transfer, invalid) !=
+            E_INVALIDARG)
+            throw std::runtime_error("Accepted invalid worker adapter");
     }
-    auto quote = [](const wchar_t* value) { return L"\"" + std::wstring(value) + L"\""; };
-    std::wstring command = quote(workerExe) + L" --worker " +
-                           std::to_wstring(reinterpret_cast<uintptr_t>(readPipe.value)) + L" " + quote(core) + L" " +
-                           quote(forwarder) + L" " + quote(model) + L" " + quote(workerData) + L" " + quote(log);
-    STARTUPINFOEXW startup {};
-    startup.StartupInfo.cb = sizeof(startup);
-    startup.lpAttributeList = attributes;
-    PROCESS_INFORMATION child {};
-    const BOOL created = CreateProcessW(workerExe, command.data(), nullptr, nullptr, TRUE,
-                                        EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW, nullptr,
-                                        nullptr, &startup.StartupInfo, &child);
-    DeleteProcThreadAttributeList(attributes);
-    if (!created)
-        throw std::runtime_error("Create worker failed");
-    OwnedHandle process { child.hProcess }, thread { child.hThread };
-    bool completed = false;
+    {
+        auto invalid = wire;
+        ++invalid.bytes;
+        DlssNr::Worker::WorkerClient rejected;
+        if (rejected.Start(primary.Get(), workerExe, core, forwarder, model, workerData, log, transfer, invalid) !=
+            E_INVALIDARG)
+            throw std::runtime_error("Accepted mismatched transfer size");
+    }
+    Check(worker.Start(primary.Get(), workerExe, core, forwarder, model, workerData, log, transfer, wire),
+          "Start worker");
+    const HRESULT immediate = worker.WaitForReady(0);
+    if (immediate != S_OK && immediate != E_PENDING)
+        throw std::runtime_error("Worker initialization failed");
+    if (immediate == E_PENDING)
+        Check(worker.WaitForReady(60000), "Wait for worker initialization");
     bool submitted = false;
     try
     {
-        Wire wire {};
-        wire.passCount = secondaryPasses;
-        wire.frameCount = 0; // Exercise a persistent worker followed by an explicit shutdown command.
-        wire.width = width;
-        wire.height = height;
-        wire.depthOffset = frame.DepthOffset();
-        wire.motionOffset = frame.MotionOffset();
-        wire.bytes = frame.Bytes();
-        wire.colorBytes = frame.color.bytes;
-        wire.depthBytes = frame.depth.bytes;
-        wire.motionBytes = frame.motion.bytes;
-        wire.colorPitch = frame.color.footprint.Footprint.RowPitch;
-        wire.depthPitch = frame.depth.footprint.Footprint.RowPitch;
-        wire.motionPitch = frame.motion.footprint.Footprint.RowPitch;
-        wire.primary = primaryLuid;
-        wire.secondary = secondary.device->GetAdapterLuid();
-        HANDLE remoteHeap = nullptr, remoteReady = nullptr, remoteDone = nullptr, remoteParent = nullptr;
-        if (!DuplicateHandle(GetCurrentProcess(), handles.Heap(), process.value, &remoteHeap, 0, FALSE,
-                             DUPLICATE_SAME_ACCESS) ||
-            !DuplicateHandle(GetCurrentProcess(), handles.Ready(), process.value, &remoteReady, 0, FALSE,
-                             DUPLICATE_SAME_ACCESS) ||
-            !DuplicateHandle(GetCurrentProcess(), handles.Done(), process.value, &remoteDone, 0, FALSE,
-                             DUPLICATE_SAME_ACCESS) ||
-            !DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), process.value, &remoteParent, SYNCHRONIZE, FALSE,
-                             0))
-            throw std::runtime_error("Duplicate handles failed");
-        wire.heap = reinterpret_cast<uintptr_t>(remoteHeap);
-        wire.ready = reinterpret_cast<uintptr_t>(remoteReady);
-        wire.done = reinterpret_cast<uintptr_t>(remoteDone);
-        wire.parent = reinterpret_cast<uintptr_t>(remoteParent);
-        DWORD written = 0;
-        if (!WriteFile(writePipe.value, &wire, sizeof(wire), &written, nullptr) || written != sizeof(wire))
-            throw std::runtime_error("Write handshake failed");
-        if (ResumeThread(thread.value) == static_cast<DWORD>(-1))
-            throw std::runtime_error("Resume worker failed");
         uint64_t previousChecksum = 0;
         for (uint64_t frameNumber = 1; frameNumber <= 2; ++frameNumber)
         {
             DlssNr::Worker::FrameCommand frameCommand {};
             frameCommand.frameNumber = frameNumber;
-            frameCommand.resetMask = frameNumber == 1 ? ((1u << secondaryPasses) - 1u) : 0u;
-            DWORD controlWritten = 0;
-            if (!WriteFile(writePipe.value, &frameCommand, sizeof(frameCommand), &controlWritten, nullptr) ||
-                controlWritten != sizeof(frameCommand))
-                throw std::runtime_error("Write frame control failed");
+            frameCommand.resetMask = frameNumber == 1 || resetSecondFrame ? ((1u << secondaryPasses) - 1u) : 0u;
+            auto wrongFrame = frameCommand;
+            wrongFrame.frameNumber++;
+            if (worker.SendFrame(wrongFrame) != E_INVALIDARG)
+                throw std::runtime_error("Accepted out-of-order frame");
+            Check(worker.SendFrame(frameCommand), "Send worker frame");
+            if (worker.SendFrame(frameCommand) != E_INVALIDARG)
+                throw std::runtime_error("Accepted overlapping frame");
             if (frameNumber > 1)
                 Fill(frame.color, 4);
             ComPtr<ID3D12CommandAllocator> allocator;
             auto commands = Commands(primary.Get(), allocator);
+            if (frameTransfer.RecordOutbound(commands.Get(), frame.motion.texture.Get(), frame.depth.texture.Get(),
+                                             frame.motion.texture.Get()) != E_INVALIDARG)
+                throw std::runtime_error("Accepted mismatched color format");
             DlssNr::MultiGpu::OwnedCommandChain chain;
             Check(chain.Initialize(primary.Get(), session.Queue(), commands.Get()), "Initialize owned command chain");
             if (frameNumber > 1)
@@ -375,13 +327,10 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
             if (FAILED(chain.Split()))
                 ExitProcess(3);
             auto* continuation = chain.Current();
-            Transition(continuation, transfer.PrimaryBuffer(), D3D12_RESOURCE_STATE_COMMON,
-                       D3D12_RESOURCE_STATE_COPY_DEST);
-            CopyToShared(continuation, transfer.PrimaryBuffer(), primaryPass ? primaryClamped : frame.color, 0);
-            CopyToShared(continuation, transfer.PrimaryBuffer(), frame.depth, frame.DepthOffset());
-            CopyToShared(continuation, transfer.PrimaryBuffer(), frame.motion, frame.MotionOffset());
-            Transition(continuation, transfer.PrimaryBuffer(), D3D12_RESOURCE_STATE_COPY_DEST,
-                       D3D12_RESOURCE_STATE_COMMON);
+            Check(frameTransfer.RecordOutbound(continuation,
+                                               primaryPass ? primaryClamped.texture.Get() : frame.color.texture.Get(),
+                                               frame.depth.texture.Get(), frame.motion.texture.Get()),
+                  "Record frame transfer outbound");
             if (FAILED(chain.SubmitFinal()) || chain.SubmittedCount() != 2 || chain.Current() ||
                 chain.Split() != E_ABORT || chain.SubmitFinal() != E_ABORT)
                 ExitProcess(3);
@@ -392,15 +341,28 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
             std::cout << (primaryPass ? "Primary neural pass retired and frame sent to secondary.\n"
                                       : "Original primary frame sent to secondary.\n")
                       << std::flush;
-            const auto result =
-                DlssNr::MultiGpu::WaitForFenceOrPeer(transfer.PrimaryDone(), frameNumber, process.value, 60000);
-            const uint64_t returned = transfer.PrimaryDone()->GetCompletedValue();
-            // A worker may exit cleanly immediately after signaling. Accept that race only when
-            // the result fence really completed; its process exit code is checked below.
-            if ((result != DlssNr::MultiGpu::WorkerFenceWaitResult::Ready &&
-                 result != DlssNr::MultiGpu::WorkerFenceWaitResult::PeerExited) ||
-                returned == (std::numeric_limits<uint64_t>::max)() || returned < frameNumber)
+            if (failureTest)
+            {
+                // Only this test's own child is terminated. No primary GPU wait is enqueued on its fence.
+                if (!TerminateProcess(worker.ProcessHandle(), 42) ||
+                    WaitForSingleObject(worker.ProcessHandle(), 30000) != WAIT_OBJECT_0)
+                    throw std::runtime_error("Could not stop test worker");
+                if (worker.WaitForReturn(frameNumber, 1000) != DlssNr::MultiGpu::WorkerFenceWaitResult::PeerExited)
+                    throw std::runtime_error("Did not detect test worker exit");
+                Retire(primary.Get(), session.Queue());
+                Check(primary->GetDeviceRemovedReason(), "Primary device after worker exit");
+                std::cout << "Worker exit detected after primary submission; primary queue remains usable.\n"
+                          << std::flush;
+                return 0;
+            }
+            const auto result = worker.WaitForReturn(frameNumber, 60000);
+            if (result != DlssNr::MultiGpu::WorkerFenceWaitResult::Ready)
                 throw std::runtime_error("Worker exited or timed out before returning its frame; see worker log");
+            ComPtr<ID3D12Fence> pendingRetirement;
+            Check(primary->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pendingRetirement)),
+                  "Create pending fence");
+            if (worker.AcknowledgeReturn(frameNumber, pendingRetirement.Get(), 1) != E_PENDING)
+                throw std::runtime_error("Reused a frame before the primary GPU retired it");
             auto readback =
                 Buffer(primary.Get(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, frame.color.bytes);
             NrFixture::Surface returnedColor;
@@ -409,22 +371,18 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
                 throw std::runtime_error("Create returned primary texture failed");
             ComPtr<ID3D12CommandAllocator> inboundAllocator;
             auto inbound = Commands(primary.Get(), inboundAllocator);
-            Transition(inbound.Get(), transfer.PrimaryBuffer(), D3D12_RESOURCE_STATE_COMMON,
+            Check(frameTransfer.RecordInbound(inbound.Get(), returnedColor.texture.Get()),
+                  "Record frame transfer inbound");
+            Transition(inbound.Get(), returnedColor.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                        D3D12_RESOURCE_STATE_COPY_SOURCE);
-            auto fromShared = SharedLocation(transfer.PrimaryBuffer(), returnedColor, 0);
-            auto toTexture = NrFixture::Texture(returnedColor.texture.Get());
-            inbound->CopyTextureRegion(&toTexture, 0, 0, 0, &fromShared, nullptr);
-            NrFixture::Barrier(inbound.Get(), returnedColor.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
-                               D3D12_RESOURCE_STATE_COPY_SOURCE);
             auto fromTexture = NrFixture::Texture(returnedColor.texture.Get());
             auto toReadback = NrFixture::Buffer(readback.Get(), returnedColor.footprint);
             inbound->CopyTextureRegion(&toReadback, 0, 0, 0, &fromTexture, nullptr);
-            Transition(inbound.Get(), transfer.PrimaryBuffer(), D3D12_RESOURCE_STATE_COPY_SOURCE,
-                       D3D12_RESOURCE_STATE_COMMON);
             Submit(session.Queue(), inbound.Get());
             submitted = true;
-            Retire(primary.Get(), session.Queue());
+            auto retired = Retire(primary.Get(), session.Queue());
             submitted = false;
+            Check(worker.AcknowledgeReturn(frameNumber, retired.Get(), 1), "Acknowledge returned frame");
             CheckDebug(primary.Get());
             D3D12_RANGE range { 0, static_cast<SIZE_T>(frame.color.bytes) }, noWrite { 0, 0 };
             uint8_t* mapped = nullptr;
@@ -453,18 +411,7 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
                       << checksum << std::dec << "\n"
                       << std::flush;
         }
-        DlssNr::Worker::FrameCommand shutdown {};
-        shutdown.kind = DlssNr::Worker::CommandKind::Shutdown;
-        DWORD shutdownWritten = 0;
-        if (!WriteFile(writePipe.value, &shutdown, sizeof(shutdown), &shutdownWritten, nullptr) ||
-            shutdownWritten != sizeof(shutdown))
-            throw std::runtime_error("Write worker shutdown failed");
-        if (WaitForSingleObject(process.value, 30000) != WAIT_OBJECT_0)
-            throw std::runtime_error("Worker did not exit");
-        DWORD exitCode = 1;
-        if (!GetExitCodeProcess(process.value, &exitCode) || exitCode != 0)
-            throw std::runtime_error("Worker failed; see worker log");
-        completed = true;
+        Check(worker.Stop(30000), "Stop worker");
         std::cout << (primaryPass ? "One primary pass and " : "") << secondaryPasses
                   << " secondary passes evaluated two sequential frames; worker exited cleanly.\n"
                   << std::flush;
@@ -473,11 +420,6 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
     {
         if (submitted)
             Retire(primary.Get(), session.Queue());
-        if (!completed && WaitForSingleObject(process.value, 0) != WAIT_OBJECT_0)
-        {
-            TerminateProcess(process.value, 1);
-            WaitForSingleObject(process.value, 30000);
-        }
         throw;
     }
     return 0;
@@ -486,8 +428,20 @@ int wmain(int argc, wchar_t** argv)
 {
     try
     {
-        if (argc == 11 || (argc == 12 && std::wcscmp(argv[11], L"--no-primary") == 0))
+        if (argc >= 11 && argc <= 14)
         {
+            bool primaryPass = true, failureTest = false, resetSecondFrame = false;
+            for (int i = 11; i < argc; ++i)
+            {
+                if (std::wcscmp(argv[i], L"--no-primary") == 0 && primaryPass)
+                    primaryPass = false;
+                else if (std::wcscmp(argv[i], L"--failure-test") == 0 && !failureTest)
+                    failureTest = true;
+                else if (std::wcscmp(argv[i], L"--reset-second-frame") == 0 && !resetSecondFrame)
+                    resetSecondFrame = true;
+                else
+                    return 2;
+            }
             wchar_t* ends[3] {};
             const unsigned long passes = std::wcstoul(argv[8], &ends[0], 10);
             const unsigned long width = std::wcstoul(argv[9], &ends[1], 10);
@@ -496,8 +450,9 @@ int wmain(int argc, wchar_t** argv)
                 passes > DlssNr::Worker::MaxWorkerPasses || width == 0 || height == 0 || width > 16384 ||
                 height > 16384)
                 return 2;
-            return Parent(argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argc == 11,
-                          static_cast<unsigned>(passes), static_cast<unsigned>(width), static_cast<unsigned>(height));
+            return Parent(argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], primaryPass,
+                          static_cast<unsigned>(passes), static_cast<unsigned>(width), static_cast<unsigned>(height),
+                          failureTest, resetSecondFrame);
         }
         std::cerr << "Expected core, forwarder, model, primary data, worker data, worker log, executable, pass count "
                      "and dimensions.\n";

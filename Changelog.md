@@ -1,3 +1,8 @@
+## 2026-11-01 — Worker client and frame transfer (WIP)
+
+- Added a host worker client with an asynchronous initialization handshake, one in-flight frame, peer-exit detection and an explicit primary-GPU retirement acknowledgement. Added a validated, shared-buffer color/depth/motion transfer generation. These components are not yet called from the application.
+- OpenAI Codex, GPT-6 (exact model and effort unavailable). On the RTX 5070 Ti and RTX 3060, the client ran the Release worker with one primary plus four secondary passes at 320x181, rejected overlapping and out-of-order frames and a premature buffer reuse, and preserved a usable primary queue after its own worker was forcibly stopped. A reset-on-second-frame run produced a different checksum from the non-reset run. Unsupported formats and guide layouts still fail closed; game integration and performance remain untested.
+
 ## 2026-11-01 — Standalone neural worker (WIP)
 
 - Added a separately built worker executable, a versioned private-pipe protocol, persistent per-pass model features, per-frame controls and the existing inter-pass clamp. The worker supports a contiguous secondary pass group and returns its image through a shared buffer; the main application does not yet start it.

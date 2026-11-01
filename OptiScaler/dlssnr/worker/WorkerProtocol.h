@@ -6,7 +6,7 @@ namespace DlssNr::Worker
 {
 // Private inherited pipe only. Handles below are duplicated directly into the intended child process.
 inline constexpr uint32_t ProtocolMagic = 0x4E524D47; // NRMG
-inline constexpr uint32_t ProtocolVersion = 4;
+inline constexpr uint32_t ProtocolVersion = 6;
 inline constexpr uint32_t MaxWorkerPasses = 30;
 struct PassSettings
 {
@@ -16,11 +16,12 @@ struct PassSettings
 struct InitialFrameWire
 {
     uint32_t magic = ProtocolMagic, version = ProtocolVersion, size = sizeof(InitialFrameWire);
-    uint32_t width = 256, height = 144, frameCount = 2, passCount = 2;
+    uint32_t width = 256, height = 144, frameCount = 2, passCount = 2, enableDebug = 0;
     float passFeedback = 1.0f;
     uint64_t applicationId = 0x24480451ull;
     PassSettings passes[MaxWorkerPasses] {};
-    uint64_t heap = 0, ready = 0, done = 0, parent = 0, bytes = 0, colorBytes = 0, depthBytes = 0, motionBytes = 0;
+    uint64_t heap = 0, ready = 0, done = 0, parent = 0, initialized = 0;
+    uint64_t bytes = 0, colorBytes = 0, depthBytes = 0, motionBytes = 0;
     uint64_t depthOffset = 0, motionOffset = 0;
     uint32_t colorPitch = 0, depthPitch = 0, motionPitch = 0;
     LUID primary {}, secondary {};

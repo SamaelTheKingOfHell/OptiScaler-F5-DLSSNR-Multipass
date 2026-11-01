@@ -1,0 +1,195 @@
+#pragma once
+
+#include "../DlssNr_CrossAdapterBuffer.h"
+#include "WorkerProtocol.h"
+#include <d3d12.h>
+#include <wrl/client.h>
+#include <cstdint>
+#include <limits>
+#include <utility>
+
+namespace DlssNr::Worker
+{
+// One shared-buffer generation. The caller owns texture state transitions and keeps every
+// referenced resource and command list alive until the relevant GPU fence retires. Access must be
+// serialized; do not record another outbound frame until the previous inbound copy has retired.
+class FrameTransfer
+{
+    struct Layout
+    {
+        D3D12_RESOURCE_DESC desc {};
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint {};
+        UINT rows = 0;
+        UINT64 rowBytes = 0, bytes = 0, offset = 0;
+    };
+    Microsoft::WRL::ComPtr<ID3D12Device> primary_;
+    MultiGpu::CrossAdapterBuffer buffer_;
+    Layout color_, depth_, motion_;
+    LUID secondary_ {};
+
+    static bool SameIdentity(ID3D12DeviceChild* child, ID3D12Device* expected)
+    {
+        Microsoft::WRL::ComPtr<ID3D12Device> owner;
+        Microsoft::WRL::ComPtr<IUnknown> a, b;
+        return child && expected && SUCCEEDED(child->GetDevice(IID_PPV_ARGS(&owner))) && owner &&
+               SUCCEEDED(owner.As(&a)) && SUCCEEDED(expected->QueryInterface(IID_PPV_ARGS(&b))) && a.Get() == b.Get();
+    }
+    static bool Compatible(ID3D12Resource* texture, const D3D12_RESOURCE_DESC& expected)
+    {
+        if (!texture)
+            return false;
+        const auto actual = texture->GetDesc();
+        return actual.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && actual.Width == expected.Width &&
+               actual.Height == expected.Height && actual.DepthOrArraySize == 1 && actual.MipLevels == 1 &&
+               actual.SampleDesc.Count == 1 && actual.SampleDesc.Quality == 0 && actual.Format == expected.Format;
+    }
+    static HRESULT GetLayout(ID3D12Device* primary, ID3D12Device* secondary, ID3D12Resource* texture,
+                             DXGI_FORMAT format, Layout& result)
+    {
+        if (!SameIdentity(texture, primary))
+            return E_INVALIDARG;
+        const auto desc = texture->GetDesc();
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !desc.Width || !desc.Height || desc.Width > 16384 ||
+            desc.Height > 16384 || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 || desc.SampleDesc.Count != 1 ||
+            desc.SampleDesc.Quality != 0 || desc.Format != format)
+            return E_NOTIMPL;
+        Layout other;
+        result.desc = desc;
+        primary->GetCopyableFootprints(&desc, 0, 1, 0, &result.footprint, &result.rows, &result.rowBytes,
+                                       &result.bytes);
+        secondary->GetCopyableFootprints(&desc, 0, 1, 0, &other.footprint, &other.rows, &other.rowBytes, &other.bytes);
+        const auto& a = result.footprint.Footprint;
+        const auto& b = other.footprint.Footprint;
+        if (!result.bytes || result.bytes == (std::numeric_limits<uint64_t>::max)() || result.bytes != other.bytes ||
+            result.rows != other.rows || result.rowBytes != other.rowBytes ||
+            result.footprint.Offset != other.footprint.Offset || a.Format != b.Format || a.Width != b.Width ||
+            a.Height != b.Height || a.Depth != b.Depth || a.RowPitch != b.RowPitch)
+            return E_NOTIMPL;
+        return S_OK;
+    }
+    static void Barrier(ID3D12GraphicsCommandList* commands, ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
+                        D3D12_RESOURCE_STATES after)
+    {
+        D3D12_RESOURCE_BARRIER barrier {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = resource;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = before;
+        barrier.Transition.StateAfter = after;
+        commands->ResourceBarrier(1, &barrier);
+    }
+    D3D12_TEXTURE_COPY_LOCATION Shared(const Layout& layout) const
+    {
+        D3D12_TEXTURE_COPY_LOCATION result {};
+        result.pResource = buffer_.PrimaryBuffer();
+        result.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        result.PlacedFootprint = layout.footprint;
+        result.PlacedFootprint.Offset = layout.offset;
+        return result;
+    }
+    static D3D12_TEXTURE_COPY_LOCATION Texture(ID3D12Resource* resource)
+    {
+        D3D12_TEXTURE_COPY_LOCATION result {};
+        result.pResource = resource;
+        result.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        return result;
+    }
+
+  public:
+    static HRESULT Create(ID3D12Device* primary, ID3D12Device* secondary, ID3D12Resource* color, ID3D12Resource* depth,
+                          ID3D12Resource* motion, FrameTransfer& out)
+    {
+        if (!primary || !secondary)
+            return E_INVALIDARG;
+        FrameTransfer result;
+        HRESULT hr = GetLayout(primary, secondary, color, DXGI_FORMAT_R16G16B16A16_FLOAT, result.color_);
+        if (FAILED(hr))
+            return hr;
+        hr = GetLayout(primary, secondary, depth, DXGI_FORMAT_R32_FLOAT, result.depth_);
+        if (FAILED(hr))
+            return hr;
+        hr = GetLayout(primary, secondary, motion, DXGI_FORMAT_R16G16_FLOAT, result.motion_);
+        if (FAILED(hr))
+            return hr;
+        if (result.color_.desc.Width != result.depth_.desc.Width ||
+            result.color_.desc.Height != result.depth_.desc.Height ||
+            result.color_.desc.Width != result.motion_.desc.Width ||
+            result.color_.desc.Height != result.motion_.desc.Height)
+            return E_NOTIMPL;
+        constexpr uint64_t align = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+        constexpr uint64_t max = (std::numeric_limits<uint64_t>::max)();
+        if (result.color_.bytes > max - (align - 1))
+            return E_INVALIDARG;
+        result.depth_.offset = (result.color_.bytes + align - 1) & ~(align - 1);
+        if (result.depth_.bytes > max - result.depth_.offset ||
+            result.depth_.offset + result.depth_.bytes > max - (align - 1))
+            return E_INVALIDARG;
+        result.motion_.offset = (result.depth_.offset + result.depth_.bytes + align - 1) & ~(align - 1);
+        if (result.motion_.bytes > max - result.motion_.offset)
+            return E_INVALIDARG;
+        hr = MultiGpu::CrossAdapterBuffer::Create(primary, secondary, result.motion_.offset + result.motion_.bytes,
+                                                  result.buffer_);
+        if (FAILED(hr))
+            return hr;
+        result.primary_ = primary;
+        result.secondary_ = secondary->GetAdapterLuid();
+        out = std::move(result);
+        return S_OK;
+    }
+    const MultiGpu::CrossAdapterBuffer& Buffer() const { return buffer_; }
+    InitialFrameWire MakeWire(unsigned passes) const
+    {
+        InitialFrameWire wire {};
+        wire.width = static_cast<uint32_t>(color_.desc.Width);
+        wire.height = color_.desc.Height;
+        wire.frameCount = 0;
+        wire.passCount = passes;
+        wire.bytes = buffer_.Size();
+        wire.colorBytes = color_.bytes;
+        wire.depthBytes = depth_.bytes;
+        wire.motionBytes = motion_.bytes;
+        wire.depthOffset = depth_.offset;
+        wire.motionOffset = motion_.offset;
+        wire.colorPitch = color_.footprint.Footprint.RowPitch;
+        wire.depthPitch = depth_.footprint.Footprint.RowPitch;
+        wire.motionPitch = motion_.footprint.Footprint.RowPitch;
+        if (primary_)
+            wire.primary = primary_->GetAdapterLuid();
+        wire.secondary = secondary_;
+        return wire;
+    }
+    // All three textures must be in COPY_SOURCE and the shared buffer must be in COMMON.
+    HRESULT RecordOutbound(ID3D12GraphicsCommandList* commands, ID3D12Resource* color, ID3D12Resource* depth,
+                           ID3D12Resource* motion) const
+    {
+        if (!buffer_.PrimaryBuffer() || !SameIdentity(commands, primary_.Get()) ||
+            !SameIdentity(color, primary_.Get()) || !SameIdentity(depth, primary_.Get()) ||
+            !SameIdentity(motion, primary_.Get()) || !Compatible(color, color_.desc) ||
+            !Compatible(depth, depth_.desc) || !Compatible(motion, motion_.desc))
+            return E_INVALIDARG;
+        Barrier(commands, buffer_.PrimaryBuffer(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        for (const auto& item :
+             { std::pair<ID3D12Resource*, const Layout*> { color, &color_ }, { depth, &depth_ }, { motion, &motion_ } })
+        {
+            auto src = Texture(item.first);
+            auto dst = Shared(*item.second);
+            commands->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+        Barrier(commands, buffer_.PrimaryBuffer(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        return S_OK;
+    }
+    // The destination texture must be in COPY_DEST and the shared buffer must be in COMMON.
+    HRESULT RecordInbound(ID3D12GraphicsCommandList* commands, ID3D12Resource* output) const
+    {
+        if (!buffer_.PrimaryBuffer() || !SameIdentity(commands, primary_.Get()) ||
+            !SameIdentity(output, primary_.Get()) || !Compatible(output, color_.desc))
+            return E_INVALIDARG;
+        Barrier(commands, buffer_.PrimaryBuffer(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        auto src = Shared(color_);
+        auto dst = Texture(output);
+        commands->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        Barrier(commands, buffer_.PrimaryBuffer(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        return S_OK;
+    }
+};
+} // namespace DlssNr::Worker

@@ -2,7 +2,7 @@
 param([string]$VcVars, [string]$CoreDll, [string]$WorkerExe, [Parameter(Mandatory=$true)][string]$ForwarderDll,
       [Parameter(Mandatory=$true)][string]$ModelDll, [ValidateRange(1,30)][int]$SecondaryPasses = 2,
       [ValidateRange(1,16384)][int]$Width = 256, [ValidateRange(1,16384)][int]$Height = 144,
-      [switch]$NoPrimaryPass, [switch]$BuildOnly)
+      [switch]$NoPrimaryPass, [switch]$FailureTest, [switch]$ResetSecondFrame, [switch]$BuildOnly)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 if (!$CoreDll) {
@@ -40,6 +40,9 @@ try {
     if ($BuildOnly) { return }
     $probeArgs = @($CoreDll, $ForwarderDll, $ModelDll, $primaryData, $workerData, $log, $workerExe, $SecondaryPasses.ToString(), $Width.ToString(), $Height.ToString())
     if ($NoPrimaryPass) { $probeArgs += '--no-primary' }
+    if ($FailureTest) { $probeArgs += '--failure-test' }
+    if ($ResetSecondFrame) { $probeArgs += '--reset-second-frame' }
+    if (Test-Path -LiteralPath $log) { Set-Content -LiteralPath $log -Value '' }
     & $exe @probeArgs
     if ($LASTEXITCODE -ne 0) {
         if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log }

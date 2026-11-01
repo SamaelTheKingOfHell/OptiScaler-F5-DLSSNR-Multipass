@@ -126,16 +126,21 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
         return 10;
     if (wire.magic != ProtocolMagic || wire.version != ProtocolVersion || wire.size != sizeof(wire) || !wire.width ||
         !wire.height || wire.width > 16384 || wire.height > 16384 || !wire.passCount ||
-        wire.passCount > MaxWorkerPasses || !std::isfinite(wire.passFeedback) || wire.passFeedback < 0.0f ||
-        wire.passFeedback > 1.0f || !wire.heap || !wire.ready || !wire.done || !wire.parent || !wire.bytes)
+        wire.passCount > MaxWorkerPasses || wire.enableDebug > 1 || !std::isfinite(wire.passFeedback) ||
+        wire.passFeedback < 0.0f || wire.passFeedback > 1.0f || !wire.heap || !wire.ready || !wire.done ||
+        !wire.parent || !wire.initialized || !wire.bytes)
         throw std::runtime_error("Invalid worker handshake");
     OwnedHandle heap { reinterpret_cast<HANDLE>(static_cast<uintptr_t>(wire.heap)) };
     OwnedHandle ready { reinterpret_cast<HANDLE>(static_cast<uintptr_t>(wire.ready)) };
     OwnedHandle done { reinterpret_cast<HANDLE>(static_cast<uintptr_t>(wire.done)) };
     OwnedHandle parent { reinterpret_cast<HANDLE>(static_cast<uintptr_t>(wire.parent)) };
+    OwnedHandle initialized { reinterpret_cast<HANDLE>(static_cast<uintptr_t>(wire.initialized)) };
     ComPtr<ID3D12Debug> debug;
-    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))
+    if (wire.enableDebug)
+    {
+        Check(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)), "Worker D3D12 debug interface");
         debug->EnableDebugLayer();
+    }
     ComPtr<IDXGIFactory4> factory;
     Check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "Worker factory");
     ComPtr<IDXGIAdapter1> adapter;
@@ -184,6 +189,8 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
     }
     ModelSession session;
     session.Initialize(device.Get(), core, forwarder, model, data, wire.width, wire.height, tuning, wire.applicationId);
+    if (!SetEvent(initialized.value))
+        throw std::runtime_error("Could not signal worker initialization");
     for (uint64_t frameNumber = 1; !wire.frameCount || frameNumber <= wire.frameCount; ++frameNumber)
     {
         FrameCommand frameCommand {};
@@ -294,7 +301,8 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
         Retire(device.Get(), session.Queue());
     }
     CloseHandle(pipe);
-    CheckDebug(device.Get());
+    if (wire.enableDebug)
+        CheckDebug(device.Get());
     std::cerr << "Worker neural pass retired successfully.\n" << std::flush;
     return 0;
 }
