@@ -1,3 +1,8 @@
+## 2026-11-01 — Texture transport format guard (WIP)
+
+- Require both adapters to advertise 2D texture support before creating a shared transport; retain the single-plane and matching-footprint checks. The probe rejects a multi-plane format before publishing resources.
+- OpenAI Codex, GPT-6 (exact model and effort unavailable). RTX 3060/WARP focused checks; real two-GPU, neural model, full application and game verification remain pending.
+
 ## 2026-11-01 — Grouped neural input transport (WIP)
 
 - Added transactional color, motion and optional depth transport allocation. A single synchronized submission can transfer all inputs outward and return color to the primary adapter. This remains disconnected from neural model execution and the game.

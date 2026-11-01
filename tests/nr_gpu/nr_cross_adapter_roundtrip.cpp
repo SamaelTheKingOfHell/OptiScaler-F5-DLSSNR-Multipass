@@ -239,6 +239,11 @@ static void FrameRoundTrip(ID3D12Device* primary, ID3D12Device* secondary, Queue
                                           ImageDescription(19, 11, DXGI_FORMAT_R32_FLOAT),
                                           ImageDescription(23, 13, DXGI_FORMAT_R16G16_FLOAT) };
     DlssNr::MultiGpu::CrossAdapterFrame frame;
+    DlssNr::MultiGpu::CrossAdapterTexture multiPlane;
+    const auto nv12 = ImageDescription(32, 18, DXGI_FORMAT_NV12);
+    if (DlssNr::MultiGpu::CrossAdapterTexture::Create(primary, secondary, nv12, multiPlane) != E_NOTIMPL ||
+        multiPlane.Buffer().Size() != 0)
+        throw std::runtime_error("Unsupported multi-plane texture was not rejected");
     auto invalid = descs[2];
     invalid.Width = 0;
     if (DlssNr::MultiGpu::CrossAdapterFrame::Create(primary, secondary, descs[0], &descs[1], invalid, frame) !=

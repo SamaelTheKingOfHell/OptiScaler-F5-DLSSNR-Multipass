@@ -33,6 +33,15 @@ class CrossAdapterTexture
                 secondary->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &secondaryFormat, sizeof(secondaryFormat))) ||
             secondaryFormat.PlaneCount != 1)
             return E_NOTIMPL;
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT primarySupport { image.Format };
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT secondarySupport { image.Format };
+        if (FAILED(
+                primary->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &primarySupport, sizeof(primarySupport))) ||
+            FAILED(secondary->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &secondarySupport,
+                                                  sizeof(secondarySupport))) ||
+            !(primarySupport.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D) ||
+            !(secondarySupport.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D))
+            return E_NOTIMPL;
         CrossAdapterTexture result;
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT other {};
         UINT otherRows = 0;
