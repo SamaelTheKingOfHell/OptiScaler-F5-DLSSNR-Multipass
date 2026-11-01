@@ -1,3 +1,9 @@
+## 2026-11-01 — D3D12 cross-adapter transport prototype (WIP)
+
+- Added shared-buffer transport, directional fences, footprint-checked single-plane texture transport, and a standalone GPU probe. No rendering path calls the prototype yet.
+- OpenAI Codex, GPT-6 (exact model and effort unavailable). MSVC C++17 and standalone-header builds passed. A 4 KiB buffer and padded RGBA8, RGBA16F, R32F and RG16F textures round-tripped between RTX 3060 and WARP with D3D12 debug layer enabled; this is not a two-physical-GPU or neural-model test. RTX 5070 Ti enumerated but D3D12 device creation returned `0x8007000e`; retry `./tests/run_nr_cross_adapter_tests.ps1`.
+- Model execution, open-command-list submission handoff, deployment, frame timing and game validation remain pending.
+
 ## 2026-11-01 — Ordered multi-GPU pass split (WIP)
 
 - Specified a game-GPU pass prefix followed by a secondary-GPU suffix, with at most one outbound handoff and one return. Added a placement-policy prototype and exhaustive split smoke test; the policy is not yet connected to GPU execution.
