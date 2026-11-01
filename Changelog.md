@@ -1,3 +1,8 @@
+## 2026-11-01 — Isolated secondary NGX core probe (WIP)
+
+- Added a separate-process probe for secondary-adapter NGX core initialization and capability allocation. It does not open a game or load a neural model and refuses to run under low system commit headroom.
+- OpenAI Codex, GPT-6 (exact model and effort unavailable). The probe compiled with MSVC; the runtime was not invoked because available commit headroom was below its conservative 8 GiB threshold. Neural-feature creation, multi-device initialization and game testing remain pending.
+
 ## 2026-11-01 — Secondary NGX ownership analysis (WIP)
 
 - Added a secondary-adapter selector keyed by the game device LUID; explicit selections never silently fall back. Recorded the process-wide NGX initialization flag and cached capability block that prevent assuming the existing primary-device session is valid for a secondary adapter. No NGX runtime behavior was modified.
