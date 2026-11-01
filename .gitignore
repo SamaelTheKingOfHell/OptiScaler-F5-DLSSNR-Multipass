@@ -455,3 +455,13 @@ dlssg_for_sm86/
 # Superior shader disassembly and local validation runs.
 /artifacts/
 /OptiScaler/shaders/dlssnr/superior/precompile/*.asm
+
+# Local operational material
+/.agents/
+/.cluster/
+/WINDEX.md
+/INDEX.md
+/OBJECTIVE.md
+/ROADMAP.md
+/ARCHITECTURE.md
+**/INDEX.md

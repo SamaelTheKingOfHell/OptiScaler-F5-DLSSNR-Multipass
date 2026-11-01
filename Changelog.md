@@ -1,3 +1,8 @@
+## 2026-11-01 — GPU distribution preparation (WIP)
+
+- Added contributor guidance, local-file exclusions and a proposed multi-GPU implementation plan.
+- Implementation: OpenAI Codex, GPT-6 (exact model and effort unavailable). GPU distribution is not implemented or deployed. Git content and ignore checks only; no build or game validation.
+
 ## Release and Build Change Log (Newest to Oldest)
 
 ## v0.7.8
