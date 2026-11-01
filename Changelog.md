@@ -1,3 +1,8 @@
+## 2026-11-01 — Mixed-generation runtime requirements (WIP)
+
+- Documented per-device model probing and feature ownership for configurations with different NVIDIA GPU generations. Extended the GPU fixture to verify ordered synthetic writes on both adapters. No runtime selection or model integration has been implemented.
+- OpenAI Codex, GPT-6 (exact model and effort unavailable). The RTX 3060/WARP test passed two ordered-write round trips; the installation guide and forwarder were reviewed. Live model compatibility and game behavior are not tested.
+
 ## 2026-11-01 — Texture transport format guard (WIP)
 
 - Require both adapters to advertise 2D texture support before creating a shared transport; retain the single-plane and matching-footprint checks. The probe rejects a multi-plane format before publishing resources.

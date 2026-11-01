@@ -29,3 +29,7 @@ A separate diagnostic on 2026-11-01 confirmed that the RTX 5070 Ti owns the prim
 ## Frame transport prototype
 
 `CrossAdapterFrame` allocates color and motion transports together with optional depth. Their copies can share a single outbound fence; only edited color needs to return. A controlled RTX 3060/WARP fixture transferred three differently sized, padded textures in one submission sequence and verified all three inputs on the secondary plus the returned color on the primary. It also checked that an unsupported third channel leaves no partially published frame and that depth may be absent. No neural evaluation was performed.
+
+## Mixed-generation model handling
+
+The current installation guide distinguishes the RTX 50 runtime from a cross-generation runtime for RTX 20/30/40. A multi-GPU session must probe the selected model separately on each device and preserve each pass feature and its capability parameters with its own device. Do not infer that a DLL working on the game GPU also works on the co-processor, or substitute a runtime without an explicit user choice. Where a compatible runtime supports both devices, verify that actual pair before reusing it. A failure on either adapter must leave the existing single-device path available before any cross-device work is submitted.

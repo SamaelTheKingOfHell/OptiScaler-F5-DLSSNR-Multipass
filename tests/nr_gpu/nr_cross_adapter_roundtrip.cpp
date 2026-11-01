@@ -505,6 +505,7 @@ int main(int argc, char** argv)
             throw std::runtime_error("Wrong buffer size");
         Queue primaryQueue(primary), secondaryQueue(secondary);
         auto upload = Buffer(primary, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, bytes);
+        auto primaryPatch = Buffer(primary, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, 4);
         auto patch = Buffer(secondary, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, 4);
         auto local = Buffer(secondary, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, bytes);
         auto readback = Buffer(primary, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, bytes);
@@ -514,6 +515,10 @@ int main(int argc, char** argv)
         for (uint64_t i = 0; i < bytes; ++i)
             data[i] = static_cast<uint8_t>((i * 13u + 7u) & 255u);
         upload->Unmap(0, nullptr);
+        Check(primaryPatch->Map(0, &noRead, reinterpret_cast<void**>(&data)), "Map primary patch");
+        const uint8_t primaryReplacement[] = { 0x12, 0x34, 0x56, 0x78 };
+        std::memcpy(data, primaryReplacement, sizeof(primaryReplacement));
+        primaryPatch->Unmap(0, nullptr);
         Check(patch->Map(0, &noRead, reinterpret_cast<void**>(&data)), "Map secondary patch");
         const uint8_t replacement[] = { 0xde, 0xad, 0xbe, 0xef };
         std::memcpy(data, replacement, sizeof(replacement));
@@ -524,12 +529,19 @@ int main(int argc, char** argv)
         outbound->CopyBufferRegion(transfer.PrimaryBuffer(), 0, upload.Get(), 0, bytes);
         Transition(outbound.Get(), transfer.PrimaryBuffer(), D3D12_RESOURCE_STATE_COPY_DEST,
                    D3D12_RESOURCE_STATE_COMMON);
+        Transition(outbound.Get(), transfer.PrimaryBuffer(), D3D12_RESOURCE_STATE_COMMON,
+                   D3D12_RESOURCE_STATE_COPY_DEST);
+        outbound->CopyBufferRegion(transfer.PrimaryBuffer(), 0, primaryPatch.Get(), 0, sizeof(primaryReplacement));
+        Transition(outbound.Get(), transfer.PrimaryBuffer(), D3D12_RESOURCE_STATE_COPY_DEST,
+                   D3D12_RESOURCE_STATE_COMMON);
         Check(outbound->Close(), "Close primary outbound");
         auto process = secondaryQueue.List(secondary);
         Transition(process.Get(), transfer.SecondaryBuffer(), D3D12_RESOURCE_STATE_COMMON,
                    D3D12_RESOURCE_STATE_COPY_SOURCE);
         process->CopyBufferRegion(local.Get(), 0, transfer.SecondaryBuffer(), 0, bytes);
-        process->CopyBufferRegion(local.Get(), 0, patch.Get(), 0, sizeof(replacement));
+        Transition(process.Get(), local.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        Transition(process.Get(), local.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        process->CopyBufferRegion(local.Get(), sizeof(primaryReplacement), patch.Get(), 0, sizeof(replacement));
         Transition(process.Get(), local.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
         Transition(process.Get(), transfer.SecondaryBuffer(), D3D12_RESOURCE_STATE_COPY_SOURCE,
                    D3D12_RESOURCE_STATE_COPY_DEST);
@@ -567,8 +579,10 @@ int main(int argc, char** argv)
         Check(readback->Map(0, &range, reinterpret_cast<void**>(&data)), "Map result");
         for (uint64_t i = 0; i < bytes; ++i)
         {
-            const auto expected =
-                i < sizeof(replacement) ? replacement[i] : static_cast<uint8_t>((i * 13u + 7u) & 255u);
+            const auto expected = i < sizeof(primaryReplacement) ? primaryReplacement[i]
+                                  : i < sizeof(primaryReplacement) + sizeof(replacement)
+                                      ? replacement[i - sizeof(primaryReplacement)]
+                                      : static_cast<uint8_t>((i * 13u + 7u) & 255u);
             if (data[i] != expected)
             {
                 readback->Unmap(0, &noRead);
@@ -600,7 +614,10 @@ int main(int argc, char** argv)
         Check(readback->Map(0, &range, reinterpret_cast<void**>(&data)), "Map second result");
         for (uint64_t i = 0; i < bytes; ++i)
         {
-            const auto expected = i < sizeof(replacement) ? replacement[i] : static_cast<uint8_t>((i * 9u + 3u) & 255u);
+            const auto expected = i < sizeof(primaryReplacement) ? primaryReplacement[i]
+                                  : i < sizeof(primaryReplacement) + sizeof(replacement)
+                                      ? replacement[i - sizeof(primaryReplacement)]
+                                      : static_cast<uint8_t>((i * 9u + 3u) & 255u);
             if (data[i] != expected)
             {
                 readback->Unmap(0, &noRead);
