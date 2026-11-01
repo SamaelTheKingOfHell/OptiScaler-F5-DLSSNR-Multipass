@@ -1,3 +1,8 @@
+## 2026-11-01 — Secondary NGX ownership analysis (WIP)
+
+- Added a secondary-adapter selector keyed by the game device LUID; explicit selections never silently fall back. Recorded the process-wide NGX initialization flag and cached capability block that prevent assuming the existing primary-device session is valid for a secondary adapter. No NGX runtime behavior was modified.
+- OpenAI Codex, GPT-6 (exact model and effort unavailable). Adapter selection and explicit failure behavior passed against the RTX 5070 Ti display identity and RTX 3060 device; source inspection only for NGX. GitHub built the application at `0a70c8c8`; the standalone prototypes were not integrated into that application build. Per-device neural initialization, runtime compatibility and game behavior remain unverified.
+
 ## 2026-11-01 — Mixed-generation runtime requirements (WIP)
 
 - Documented per-device model probing and feature ownership for configurations with different NVIDIA GPU generations. Extended the GPU fixture to verify ordered synthetic writes on both adapters. No runtime selection or model integration has been implemented.

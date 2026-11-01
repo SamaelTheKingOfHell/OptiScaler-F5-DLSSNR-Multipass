@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "../../OptiScaler/dlssnr/DlssNr_CrossAdapterFrame.h"
+#include "../../OptiScaler/dlssnr/DlssNr_CrossAdapterSelect.h"
 #include "../../OptiScaler/dlssnr/DlssNr_CrossAdapterSubmit.h"
 #include <d3d12sdklayers.h>
 #include <iomanip>
@@ -17,6 +18,8 @@ static void Check(HRESULT hr, const char* operation)
         throw std::runtime_error(message.str());
     }
 }
+
+static HRESULT WINAPI RefuseDevice(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**) { return E_OUTOFMEMORY; }
 
 struct Queue
 {
@@ -460,6 +463,35 @@ int main(int argc, char** argv)
             invalidTexture.Buffer().PrimaryBuffer() || invalidTexture.Buffer().Size() != 0)
             throw std::runtime_error("Invalid texture request did not fail cleanly");
         std::cout << "Invalid transport requests rejected without publishing resources.\n";
+        if (displayLuid)
+        {
+            DlssNr::MultiGpu::SelectedAdapter selected;
+            Check(DlssNr::MultiGpu::SelectSecondary(factory.Get(), *displayLuid, nullptr, 0x10de, &D3D12CreateDevice,
+                                                    selected),
+                  "Select secondary adapter");
+            if (DlssNr::MultiGpu::SameAdapterLuid(selected.description.AdapterLuid, *displayLuid) ||
+                !DlssNr::MultiGpu::SameAdapterLuid(selected.device->GetAdapterLuid(), selected.description.AdapterLuid))
+                throw std::runtime_error("Selected the primary display adapter or an inconsistent device");
+            auto* original = selected.device.Get();
+            const LUID missing { 0xffffffffu, 0x7fffffff };
+            if (DlssNr::MultiGpu::SelectSecondary(factory.Get(), *displayLuid, &missing, 0x10de, &D3D12CreateDevice,
+                                                  selected) != DXGI_ERROR_NOT_FOUND ||
+                selected.device.Get() != original ||
+                DlssNr::MultiGpu::SelectSecondary(factory.Get(), *displayLuid, &*displayLuid, 0x10de,
+                                                  &D3D12CreateDevice, selected) != E_INVALIDARG)
+                throw std::runtime_error("Invalid explicit adapter selection did not fail closed");
+            const auto wanted = selected.description.AdapterLuid;
+            if (DlssNr::MultiGpu::SelectSecondary(factory.Get(), *displayLuid, &wanted, 0x10de, &RefuseDevice,
+                                                  selected) != E_OUTOFMEMORY ||
+                selected.device.Get() != original)
+                throw std::runtime_error("Explicit device failure did not preserve the existing selection");
+            Check(DlssNr::MultiGpu::SelectSecondary(factory.Get(), *displayLuid, &wanted, 0x10de, &D3D12CreateDevice,
+                                                    selected),
+                  "Select explicit secondary");
+            if (!DlssNr::MultiGpu::SameAdapterLuid(selected.description.AdapterLuid, wanted))
+                throw std::runtime_error("Explicit adapter selection returned a different LUID");
+            std::cout << "Secondary selection respected primary and requested adapter LUIDs.\n";
+        }
         if (argumentsOnly)
             return 0;
         auto primaryMatch = devices.end();
