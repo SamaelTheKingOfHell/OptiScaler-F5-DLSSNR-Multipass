@@ -1,5 +1,5 @@
 #include "pch.h"
-#include "../../OptiScaler/dlssnr/DlssNr_CrossAdapterTexture.h"
+#include "../../OptiScaler/dlssnr/DlssNr_CrossAdapterFrame.h"
 #include "../../OptiScaler/dlssnr/DlssNr_CrossAdapterSubmit.h"
 #include <d3d12sdklayers.h>
 #include <iomanip>
@@ -219,6 +219,158 @@ static void TextureRoundTrip(ID3D12Device* primary, ID3D12Device* secondary, Que
     imageResult->Unmap(0, &noRead);
     std::cout << "Padded texture round trip passed: " << image.Width << "x" << image.Height
               << " format=" << static_cast<unsigned>(format) << ".\n";
+}
+
+static D3D12_RESOURCE_DESC ImageDescription(UINT width, UINT height, DXGI_FORMAT format)
+{
+    D3D12_RESOURCE_DESC image {};
+    image.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    image.Width = width;
+    image.Height = height;
+    image.DepthOrArraySize = image.MipLevels = 1;
+    image.Format = format;
+    image.SampleDesc.Count = 1;
+    return image;
+}
+
+static void FrameRoundTrip(ID3D12Device* primary, ID3D12Device* secondary, Queue& primaryQueue, Queue& secondaryQueue)
+{
+    const D3D12_RESOURCE_DESC descs[] = { ImageDescription(31, 17, DXGI_FORMAT_R16G16B16A16_FLOAT),
+                                          ImageDescription(19, 11, DXGI_FORMAT_R32_FLOAT),
+                                          ImageDescription(23, 13, DXGI_FORMAT_R16G16_FLOAT) };
+    DlssNr::MultiGpu::CrossAdapterFrame frame;
+    auto invalid = descs[2];
+    invalid.Width = 0;
+    if (DlssNr::MultiGpu::CrossAdapterFrame::Create(primary, secondary, descs[0], &descs[1], invalid, frame) !=
+            E_INVALIDARG ||
+        frame.Color().Buffer().Size() != 0 || frame.Depth().Buffer().Size() != 0)
+        throw std::runtime_error("Partial frame allocation was published");
+    Check(DlssNr::MultiGpu::CrossAdapterFrame::Create(primary, secondary, descs[0], &descs[1], descs[2], frame),
+          "Create frame transport");
+    if (!frame.HasDepth())
+        throw std::runtime_error("Depth transport missing");
+    DlssNr::MultiGpu::CrossAdapterFrame noDepth;
+    Check(DlssNr::MultiGpu::CrossAdapterFrame::Create(primary, secondary, descs[0], nullptr, descs[2], noDepth),
+          "Create frame transport without depth");
+    if (noDepth.HasDepth() || noDepth.Depth().Buffer().Size() != 0)
+        throw std::runtime_error("Unexpected depth transport");
+    DlssNr::MultiGpu::CrossAdapterTexture* transfers[] = { &frame.Color(), &frame.Depth(), &frame.Motion() };
+    struct Channel
+    {
+        ComPtr<ID3D12Resource> upload, primaryImage, secondaryImage, secondaryReadback;
+    } channels[3];
+    D3D12_RANGE noRead { 0, 0 };
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        auto& t = *transfers[i];
+        const auto size = t.Buffer().Size();
+        channels[i].upload = Buffer(primary, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, size);
+        channels[i].primaryImage = Texture(primary, descs[i]);
+        channels[i].secondaryImage = Texture(secondary, descs[i]);
+        channels[i].secondaryReadback =
+            Buffer(secondary, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, size);
+        uint8_t* data = nullptr;
+        Check(channels[i].upload->Map(0, &noRead, reinterpret_cast<void**>(&data)), "Map frame upload");
+        std::memset(data, 0, static_cast<size_t>(size));
+        for (UINT y = 0; y < t.Rows(); ++y)
+            for (UINT64 x = 0; x < t.RowBytes(); ++x)
+                data[y * t.Footprint().Footprint.RowPitch + x] =
+                    static_cast<uint8_t>((x * 5u + y * 7u + i * 29u) & 255u);
+        channels[i].upload->Unmap(0, nullptr);
+    }
+    auto returned = Texture(primary, descs[0]);
+    auto returnedReadback =
+        Buffer(primary, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, frame.Color().Buffer().Size());
+    auto before = primaryQueue.List(primary);
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        auto& t = *transfers[i];
+        const auto upload = BufferLocation(channels[i].upload.Get(), t.Footprint());
+        const auto image = TextureLocation(channels[i].primaryImage.Get());
+        const auto shared = t.PrimaryLocation();
+        before->CopyTextureRegion(&image, 0, 0, 0, &upload, nullptr);
+        Transition(before.Get(), channels[i].primaryImage.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Transition(before.Get(), t.Buffer().PrimaryBuffer(), D3D12_RESOURCE_STATE_COMMON,
+                   D3D12_RESOURCE_STATE_COPY_DEST);
+        before->CopyTextureRegion(&shared, 0, 0, 0, &image, nullptr);
+        Transition(before.Get(), t.Buffer().PrimaryBuffer(), D3D12_RESOURCE_STATE_COPY_DEST,
+                   D3D12_RESOURCE_STATE_COMMON);
+    }
+    Check(before->Close(), "Close frame outbound");
+    auto work = secondaryQueue.List(secondary);
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        auto& t = *transfers[i];
+        const auto shared = t.SecondaryLocation();
+        const auto image = TextureLocation(channels[i].secondaryImage.Get());
+        const auto readback = BufferLocation(channels[i].secondaryReadback.Get(), t.Footprint());
+        Transition(work.Get(), t.Buffer().SecondaryBuffer(), D3D12_RESOURCE_STATE_COMMON,
+                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+        work->CopyTextureRegion(&image, 0, 0, 0, &shared, nullptr);
+        Transition(work.Get(), channels[i].secondaryImage.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+        work->CopyTextureRegion(&readback, 0, 0, 0, &image, nullptr);
+        Transition(work.Get(), t.Buffer().SecondaryBuffer(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                   i == 0 ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COMMON);
+        if (i == 0)
+        {
+            work->CopyTextureRegion(&shared, 0, 0, 0, &image, nullptr);
+            Transition(work.Get(), t.Buffer().SecondaryBuffer(), D3D12_RESOURCE_STATE_COPY_DEST,
+                       D3D12_RESOURCE_STATE_COMMON);
+        }
+    }
+    Check(work->Close(), "Close frame secondary work");
+    auto after = primaryQueue.List(primary);
+    const auto colorShared = frame.Color().PrimaryLocation();
+    const auto result = TextureLocation(returned.Get());
+    const auto resultBuffer = BufferLocation(returnedReadback.Get(), frame.Color().Footprint());
+    Transition(after.Get(), frame.Color().Buffer().PrimaryBuffer(), D3D12_RESOURCE_STATE_COMMON,
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    after->CopyTextureRegion(&result, 0, 0, 0, &colorShared, nullptr);
+    Transition(after.Get(), frame.Color().Buffer().PrimaryBuffer(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+               D3D12_RESOURCE_STATE_COMMON);
+    Transition(after.Get(), returned.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    after->CopyTextureRegion(&resultBuffer, 0, 0, 0, &result, nullptr);
+    Check(after->Close(), "Close frame return");
+    DlssNr::MultiGpu::CrossAdapterSubmit submission(primaryQueue.queue.Get(), secondaryQueue.queue.Get(),
+                                                    frame.Color().Buffer());
+    SubmitSplit(submission, before.Get(), work.Get(), after.Get(), 1);
+    ComPtr<ID3D12Fence> done;
+    Check(primary->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done)), "Create frame completion fence");
+    Check(primaryQueue.queue->Signal(done.Get(), 1), "Signal frame completion");
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!event)
+        throw std::runtime_error("Create frame event failed");
+    const HRESULT hr = done->SetEventOnCompletion(1, event);
+    if (FAILED(hr))
+    {
+        CloseHandle(event);
+        Check(hr, "Set frame event");
+    }
+    const DWORD waited = WaitForSingleObject(event, 10000);
+    CloseHandle(event);
+    if (waited != WAIT_OBJECT_0)
+        throw std::runtime_error("Frame round trip timed out");
+    for (unsigned i = 0; i < 4; ++i)
+    {
+        const unsigned channel = i < 3 ? i : 0;
+        auto& t = *transfers[channel];
+        auto* resultBufferResource = i < 3 ? channels[i].secondaryReadback.Get() : returnedReadback.Get();
+        D3D12_RANGE range { 0, static_cast<SIZE_T>(t.Buffer().Size()) };
+        uint8_t* data = nullptr;
+        Check(resultBufferResource->Map(0, &range, reinterpret_cast<void**>(&data)), "Map frame result");
+        for (UINT y = 0; y < t.Rows(); ++y)
+            for (UINT64 x = 0; x < t.RowBytes(); ++x)
+                if (data[y * t.Footprint().Footprint.RowPitch + x] !=
+                    static_cast<uint8_t>((x * 5u + y * 7u + channel * 29u) & 255u))
+                {
+                    resultBufferResource->Unmap(0, &noRead);
+                    throw std::runtime_error("Frame channel data differ");
+                }
+        resultBufferResource->Unmap(0, &noRead);
+    }
+    std::cout << "Color, depth and motion shared one outbound handoff; color returned to the primary.\n";
 }
 
 int main(int argc, char** argv)
@@ -456,6 +608,7 @@ int main(int argc, char** argv)
         TextureRoundTrip(primary, secondary, primaryQueue, secondaryQueue, DXGI_FORMAT_R16G16B16A16_FLOAT);
         TextureRoundTrip(primary, secondary, primaryQueue, secondaryQueue, DXGI_FORMAT_R32_FLOAT);
         TextureRoundTrip(primary, secondary, primaryQueue, secondaryQueue, DXGI_FORMAT_R16G16_FLOAT);
+        FrameRoundTrip(primary, secondary, primaryQueue, secondaryQueue);
         for (const auto& device : devices)
         {
             ComPtr<ID3D12InfoQueue> messages;

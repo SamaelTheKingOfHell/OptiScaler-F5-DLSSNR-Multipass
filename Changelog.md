@@ -1,3 +1,8 @@
+## 2026-11-01 — Grouped neural input transport (WIP)
+
+- Added transactional color, motion and optional depth transport allocation. A single synchronized submission can transfer all inputs outward and return color to the primary adapter. This remains disconnected from neural model execution and the game.
+- OpenAI Codex, GPT-6 (exact model and effort unavailable). The RTX 3060/WARP fixture passed data checks for three different padded texture sizes under one outbound fence, verified the returned color, checked absent depth and rejected partial allocation. The D3D12 debug layer reported no errors or warnings. Two-NVIDIA hardware, live neural rendering, full build and deployment are not yet verified.
+
 ## 2026-11-01 — Ordered cross-adapter submission prototype (WIP)
 
 - Added a GPU queue coordinator that validates adapter ownership by LUID, schedules primary/secondary/primary lists, and refuses reuse after a partial submission failure. Added deterministic failure-injection coverage and Windows CI. This operates on closed owned lists and is not integrated into the neural rendering path.

@@ -25,3 +25,7 @@ On 2026-11-01 the NVIDIA RTX 3060 plus WARP fixture passed with the D3D12 debug 
 `CrossAdapterSubmit` validates command-list and queue ownership by adapter LUID and enqueues three already-closed, caller-owned lists in primary, secondary, primary order. A pure sequencing test injects failures into each fence signal or wait and checks that the protocol refuses further use after a partial submission. The coordinator has no way to split a game command list that is still being recorded; it is not integrated into the neural path. The caller remains responsible for resource states, feature lifetime, submission retirement and handling device loss.
 
 A separate diagnostic on 2026-11-01 confirmed that the RTX 5070 Ti owns the primary display and that both D3D11 and D3D12 device creation on it returned `0x8007000e`; the RTX 3060 successfully initialized both APIs. Windows commit headroom was low, but the cause of the allocation failure is not yet confirmed.
+
+## Frame transport prototype
+
+`CrossAdapterFrame` allocates color and motion transports together with optional depth. Their copies can share a single outbound fence; only edited color needs to return. A controlled RTX 3060/WARP fixture transferred three differently sized, padded textures in one submission sequence and verified all three inputs on the secondary plus the returned color on the primary. It also checked that an unsupported third channel leaves no partially published frame and that depth may be absent. No neural evaluation was performed.
