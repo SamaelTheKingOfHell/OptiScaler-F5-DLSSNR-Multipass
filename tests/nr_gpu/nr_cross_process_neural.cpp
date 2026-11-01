@@ -1,6 +1,8 @@
 #include "pch.h"
 #include "../../OptiScaler/dlssnr/DlssNr_CrossAdapterIpc.h"
 #include "../../OptiScaler/dlssnr/DlssNr_CrossAdapterSelect.h"
+#include "../../OptiScaler/dlssnr/DlssNr_OwnedCommandChain.h"
+#include "../../OptiScaler/dlssnr/DlssNr_WorkerFenceWait.h"
 #include "nr_ngx_session_fixture.h"
 #include "nr_interpass_clamp_fixture.h"
 #include <d3d12sdklayers.h>
@@ -18,7 +20,7 @@ struct OwnedHandle
 };
 struct Wire
 {
-    uint64_t heap = 0, ready = 0, done = 0, bytes = 0, colorBytes = 0, depthBytes = 0, motionBytes = 0;
+    uint64_t heap = 0, ready = 0, done = 0, parent = 0, bytes = 0, colorBytes = 0, depthBytes = 0, motionBytes = 0;
     UINT colorPitch = 0, depthPitch = 0, motionPitch = 0;
     LUID primary {}, secondary {};
 };
@@ -166,6 +168,7 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
     OwnedHandle heap { reinterpret_cast<HANDLE>(static_cast<uintptr_t>(wire.heap)) };
     OwnedHandle ready { reinterpret_cast<HANDLE>(static_cast<uintptr_t>(wire.ready)) };
     OwnedHandle done { reinterpret_cast<HANDLE>(static_cast<uintptr_t>(wire.done)) };
+    OwnedHandle parent { reinterpret_cast<HANDLE>(static_cast<uintptr_t>(wire.parent)) };
     ComPtr<ID3D12Debug> debug;
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))
         debug->EnableDebugLayer();
@@ -236,7 +239,9 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
         Transition(commands.Get(), peer.Buffer(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
         CopyToShared(commands.Get(), peer.Buffer(), extraOutput, 0);
         Transition(commands.Get(), peer.Buffer(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-        Check(session.Queue()->Wait(peer.Ready(), frameNumber), "Worker wait for primary frame");
+        if (DlssNr::MultiGpu::WaitForFenceOrPeer(peer.Ready(), frameNumber, parent.value, 30000) !=
+            DlssNr::MultiGpu::WorkerFenceWaitResult::Ready)
+            throw std::runtime_error("Parent exited or failed before sending the frame");
         Submit(session.Queue(), commands.Get());
         if (FAILED(session.Queue()->Signal(peer.Done(), frameNumber)))
         {
@@ -319,6 +324,14 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
     Check(DlssNr::MultiGpu::CrossAdapterHandles::Create(transfer, handles), "Export frame handles");
     NrFixture::ModelSession session;
     session.Initialize(primary.Get(), core, forwarder, model, parentData);
+    {
+        ComPtr<ID3D12CommandAllocator> wrongAllocator;
+        auto wrongList = Commands(secondary.device.Get(), wrongAllocator);
+        DlssNr::MultiGpu::OwnedCommandChain wrongChain;
+        if (wrongChain.Initialize(primary.Get(), session.Queue(), wrongList.Get()) != E_INVALIDARG ||
+            wrongChain.Current() || wrongChain.SubmittedCount())
+            throw std::runtime_error("Owned command chain accepted a foreign-device list");
+    }
     std::cout << "Primary model initialized; starting isolated secondary.\n" << std::flush;
     SECURITY_ATTRIBUTES security { sizeof(security), nullptr, TRUE };
     OwnedHandle readPipe, writePipe;
@@ -374,17 +387,20 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
         wire.motionPitch = frame.motion.footprint.Footprint.RowPitch;
         wire.primary = primaryLuid;
         wire.secondary = secondary.device->GetAdapterLuid();
-        HANDLE remoteHeap = nullptr, remoteReady = nullptr, remoteDone = nullptr;
+        HANDLE remoteHeap = nullptr, remoteReady = nullptr, remoteDone = nullptr, remoteParent = nullptr;
         if (!DuplicateHandle(GetCurrentProcess(), handles.Heap(), process.value, &remoteHeap, 0, FALSE,
                              DUPLICATE_SAME_ACCESS) ||
             !DuplicateHandle(GetCurrentProcess(), handles.Ready(), process.value, &remoteReady, 0, FALSE,
                              DUPLICATE_SAME_ACCESS) ||
             !DuplicateHandle(GetCurrentProcess(), handles.Done(), process.value, &remoteDone, 0, FALSE,
-                             DUPLICATE_SAME_ACCESS))
+                             DUPLICATE_SAME_ACCESS) ||
+            !DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), process.value, &remoteParent, SYNCHRONIZE, FALSE,
+                             0))
             throw std::runtime_error("Duplicate handles failed");
         wire.heap = reinterpret_cast<uintptr_t>(remoteHeap);
         wire.ready = reinterpret_cast<uintptr_t>(remoteReady);
         wire.done = reinterpret_cast<uintptr_t>(remoteDone);
+        wire.parent = reinterpret_cast<uintptr_t>(remoteParent);
         DWORD written = 0;
         if (!WriteFile(writePipe.value, &wire, sizeof(wire), &written, nullptr) || written != sizeof(wire))
             throw std::runtime_error("Write handshake failed");
@@ -397,6 +413,8 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
                 Fill(frame.color, 4);
             ComPtr<ID3D12CommandAllocator> allocator;
             auto commands = Commands(primary.Get(), allocator);
+            DlssNr::MultiGpu::OwnedCommandChain chain;
+            Check(chain.Initialize(primary.Get(), session.Queue(), commands.Get()), "Initialize owned command chain");
             if (frameNumber > 1)
             {
                 NrFixture::Barrier(commands.Get(), frame.color.texture.Get(),
@@ -437,15 +455,22 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
             NrFixture::Barrier(commands.Get(), frame.motion.texture.Get(),
                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            Transition(commands.Get(), transfer.PrimaryBuffer(), D3D12_RESOURCE_STATE_COMMON,
-                       D3D12_RESOURCE_STATE_COPY_DEST);
-            CopyToShared(commands.Get(), transfer.PrimaryBuffer(), primaryPass ? primaryClamped : frame.color, 0);
-            CopyToShared(commands.Get(), transfer.PrimaryBuffer(), frame.depth, frame.color.bytes);
-            CopyToShared(commands.Get(), transfer.PrimaryBuffer(), frame.motion, frame.color.bytes + frame.depth.bytes);
-            Transition(commands.Get(), transfer.PrimaryBuffer(), D3D12_RESOURCE_STATE_COPY_DEST,
-                       D3D12_RESOURCE_STATE_COMMON);
-            Submit(session.Queue(), commands.Get());
+            // This is an owned list: prove that recorded primary work can be submitted before a
+            // separately owned continuation records the cross-process handoff.
             submitted = true;
+            if (FAILED(chain.Split()))
+                ExitProcess(3);
+            auto* continuation = chain.Current();
+            Transition(continuation, transfer.PrimaryBuffer(), D3D12_RESOURCE_STATE_COMMON,
+                       D3D12_RESOURCE_STATE_COPY_DEST);
+            CopyToShared(continuation, transfer.PrimaryBuffer(), primaryPass ? primaryClamped : frame.color, 0);
+            CopyToShared(continuation, transfer.PrimaryBuffer(), frame.depth, frame.color.bytes);
+            CopyToShared(continuation, transfer.PrimaryBuffer(), frame.motion, frame.color.bytes + frame.depth.bytes);
+            Transition(continuation, transfer.PrimaryBuffer(), D3D12_RESOURCE_STATE_COPY_DEST,
+                       D3D12_RESOURCE_STATE_COMMON);
+            if (FAILED(chain.SubmitFinal()) || chain.SubmittedCount() != 2 || chain.Current() ||
+                chain.Split() != E_ABORT || chain.SubmitFinal() != E_ABORT)
+                ExitProcess(3);
             if (FAILED(session.Queue()->Signal(transfer.PrimaryReady(), frameNumber)))
                 ExitProcess(3);
             Retire(primary.Get(), session.Queue());
@@ -453,15 +478,14 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
             std::cout << (primaryPass ? "Primary neural pass retired and frame sent to secondary.\n"
                                       : "Original primary frame sent to secondary.\n")
                       << std::flush;
-            OwnedHandle doneEvent { CreateEventW(nullptr, FALSE, FALSE, nullptr) };
-            if (!doneEvent.value)
-                throw std::runtime_error("Create return event failed");
-            Check(transfer.PrimaryDone()->SetEventOnCompletion(frameNumber, doneEvent.value), "Return event");
-            HANDLE waits[] = { doneEvent.value, process.value };
-            DWORD result = WaitForMultipleObjects(2, waits, FALSE, 60000);
-            uint64_t returned = transfer.PrimaryDone()->GetCompletedValue();
-            if (returned == (std::numeric_limits<uint64_t>::max)() ||
-                (result != WAIT_OBJECT_0 && returned < frameNumber))
+            const auto result =
+                DlssNr::MultiGpu::WaitForFenceOrPeer(transfer.PrimaryDone(), frameNumber, process.value, 60000);
+            const uint64_t returned = transfer.PrimaryDone()->GetCompletedValue();
+            // A worker may exit cleanly immediately after signaling. Accept that race only when
+            // the result fence really completed; its process exit code is checked below.
+            if ((result != DlssNr::MultiGpu::WorkerFenceWaitResult::Ready &&
+                 result != DlssNr::MultiGpu::WorkerFenceWaitResult::PeerExited) ||
+                returned == (std::numeric_limits<uint64_t>::max)() || returned < frameNumber)
                 throw std::runtime_error("Worker exited or timed out before returning its frame; see worker log");
             auto readback =
                 Buffer(primary.Get(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, frame.color.bytes);

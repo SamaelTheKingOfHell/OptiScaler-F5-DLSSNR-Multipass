@@ -1,3 +1,8 @@
+## 2026-11-01 — Owned submission and process-failure probes (WIP)
+
+- Added an owned command-list chain that can submit a primary list and retain the allocator for its continuation. Added a bounded CPU fence/peer wait for the isolated worker; neither side enqueues a GPU wait on a fence controlled by a potentially dead process. These helpers are not connected to the game path.
+- OpenAI Codex, GPT-6 (exact model and effort unavailable). The three-pass and zero-primary-evaluation fixtures still passed with the primary list split into two submissions. Wrong-device command lists were rejected. A separate process-exit fixture verified timeout, completion and peer-exit handling without a GPU queue wait. The waits poll and have not been evaluated for real-time game performance.
+
 ## 2026-11-01 — Contiguous neural pass fixtures (WIP)
 
 - Extended the isolated frame test to use a separate persistent feature for each of two secondary passes, with the existing precompiled clamp shader between passes. It exercises either one primary pass followed by two secondary passes, or two secondary passes without a primary evaluation. The existing application pass settings and worker lifecycle remain unimplemented.

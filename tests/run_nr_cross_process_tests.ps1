@@ -22,4 +22,10 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Cross-process probe failed with exit code $LASTEXITCODE." }
     & $exe --failure-test
     if ($LASTEXITCODE -ne 0) { throw "Cross-process failure-path probe failed with exit code $LASTEXITCODE." }
+    $waitExe = Join-Path $out 'nr_worker_fence_wait_test.exe'
+    $waitObj = Join-Path $out 'nr_worker_fence_wait_test.obj'
+    & cmd /d /c "`"$VcVars`" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX tests/nr_gpu/nr_worker_fence_wait_test.cpp /Fe:`"$waitExe`" /Fo:`"$waitObj`" /link d3d12.lib dxgi.lib user32.lib"
+    if ($LASTEXITCODE -ne 0) { throw 'Fence wait probe compilation failed.' }
+    & $waitExe
+    if ($LASTEXITCODE -ne 0) { throw "Fence wait probe failed with exit code $LASTEXITCODE." }
 } finally { Pop-Location }
