@@ -1,3 +1,8 @@
+## 2026-11-01 — Owned-list frame handoff (WIP)
+
+- Added a worker generation that manages one submitted frame, its return copy, primary retirement and reset after skipped frames. Its handoff submits only a caller-owned command list and rejects another queue or an unrelated transfer. The application's renderer does not yet invoke this path.
+- OpenAI Codex, GPT-6 (exact model and effort unavailable). The generation passed two-frame RTX 5070 Ti/RTX 3060 tests with RGBA8, half-size and offset guides; an invalid guide was rejected after primary submission without blocking the primary queue. A skipped-frame reset changed the second-frame checksum. GitHub's complete unsigned Windows build passed at `ea2ad748`, before this change.
+
 ## 2026-11-01 — Worker guide layouts (WIP)
 
 - Added optional depth, independently sized depth and motion textures, guide subrect coordinates and RGBA8 color to the worker protocol and frame transport. Unsupported formats and out-of-bounds guide regions are rejected. Additional typed guide formats are accepted but not yet validated with a model.

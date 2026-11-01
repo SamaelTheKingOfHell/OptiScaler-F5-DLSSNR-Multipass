@@ -10,6 +10,8 @@
 #include "../../OptiScaler/dlssnr/worker/WorkerProtocol.h"
 #include "../../OptiScaler/dlssnr/worker/WorkerClient.h"
 #include "../../OptiScaler/dlssnr/worker/WorkerFrameTransfer.h"
+#include "../../OptiScaler/dlssnr/worker/WorkerFrameHandoff.h"
+#include "../../OptiScaler/dlssnr/worker/WorkerGeneration.h"
 #include <d3d12sdklayers.h>
 #include <cwchar>
 #include <limits>
@@ -154,12 +156,6 @@ static void Evaluate(DlssNr::Worker::ModelSession& session, ID3D12GraphicsComman
         throw std::runtime_error("Neural evaluation failed");
     }
 }
-static void Submit(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* commands)
-{
-    Check(commands->Close(), "Close neural command list");
-    ID3D12CommandList* lists[] = { commands };
-    queue->ExecuteCommandLists(1, lists);
-}
 static ComPtr<ID3D12GraphicsCommandList> Commands(ID3D12Device* device, ComPtr<ID3D12CommandAllocator>& allocator)
 {
     Check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)),
@@ -173,7 +169,7 @@ static ComPtr<ID3D12GraphicsCommandList> Commands(ID3D12Device* device, ComPtr<I
 static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* model, const wchar_t* parentData,
                   const wchar_t* workerData, const wchar_t* log, const wchar_t* workerExe, bool primaryPass,
                   unsigned secondaryPasses, unsigned width, unsigned height, bool failureTest, bool resetSecondFrame,
-                  bool noDepth, bool halfGuides, bool rgba8, bool offsetGuides)
+                  bool noDepth, bool halfGuides, bool rgba8, bool offsetGuides, bool invalidGuides)
 {
     MEMORYSTATUSEX memory { sizeof(memory) };
     if (!GlobalMemoryStatusEx(&memory) || memory.ullAvailPageFile < 8ull * 1024 * 1024 * 1024)
@@ -239,7 +235,6 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
     Check(DlssNr::Worker::FrameTransfer::Create(primary.Get(), secondary.device.Get(), frame.color.texture.Get(),
                                                 frame.depth.texture.Get(), frame.motion.texture.Get(), frameTransfer),
           "Create frame transfer");
-    const auto& transfer = frameTransfer.Buffer();
     DlssNr::Worker::ModelSession session;
     session.Initialize(primary.Get(), core, forwarder, model, parentData, width, height,
                        std::vector<DlssNr::Worker::FeatureTuning>(1), 0x24480451ull);
@@ -252,32 +247,35 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
             throw std::runtime_error("Owned command chain accepted a foreign-device list");
     }
     std::cout << "Primary model initialized; starting isolated secondary.\n" << std::flush;
-    DlssNr::Worker::WorkerClient worker;
     Wire wire = frameTransfer.MakeWire(secondaryPasses);
     wire.enableDebug = 1;
     {
         auto invalid = wire;
         invalid.secondary = invalid.primary;
         DlssNr::Worker::WorkerClient rejected;
-        if (rejected.Start(primary.Get(), workerExe, core, forwarder, model, workerData, log, transfer, invalid) !=
-            E_INVALIDARG)
+        if (rejected.Start(primary.Get(), workerExe, core, forwarder, model, workerData, log, frameTransfer.Buffer(),
+                           invalid) != E_INVALIDARG)
             throw std::runtime_error("Accepted invalid worker adapter");
     }
     {
         auto invalid = wire;
         ++invalid.bytes;
         DlssNr::Worker::WorkerClient rejected;
-        if (rejected.Start(primary.Get(), workerExe, core, forwarder, model, workerData, log, transfer, invalid) !=
-            E_INVALIDARG)
+        if (rejected.Start(primary.Get(), workerExe, core, forwarder, model, workerData, log, frameTransfer.Buffer(),
+                           invalid) != E_INVALIDARG)
             throw std::runtime_error("Accepted mismatched transfer size");
     }
-    Check(worker.Start(primary.Get(), workerExe, core, forwarder, model, workerData, log, transfer, wire),
-          "Start worker");
-    const HRESULT immediate = worker.WaitForReady(0);
+    DlssNr::Worker::WorkerGeneration generation(std::move(frameTransfer));
+    const auto& transferLayout = generation.Transfer();
+    const auto& transfer = transferLayout.Buffer();
+    Check(generation.Start(primary.Get(), workerExe, core, forwarder, model, workerData, log, wire),
+          "Start worker generation");
+    const HRESULT immediate = generation.Poll(0);
     if (immediate != S_OK && immediate != E_PENDING)
         throw std::runtime_error("Worker initialization failed");
     if (immediate == E_PENDING)
-        Check(worker.WaitForReady(60000), "Wait for worker initialization");
+        Check(generation.Poll(60000), "Wait for worker initialization");
+    auto& worker = generation.TestingClient();
     bool submitted = false;
     try
     {
@@ -292,20 +290,17 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
             frameCommand.motionHeight = frame.guideHeight;
             frameCommand.depthX = frameCommand.motionX = frame.guideX;
             frameCommand.depthY = frameCommand.motionY = frame.guideY;
-            frameCommand.resetMask = frameNumber == 1 || resetSecondFrame ? ((1u << secondaryPasses) - 1u) : 0u;
-            auto wrongFrame = frameCommand;
-            wrongFrame.frameNumber++;
-            if (worker.SendFrame(wrongFrame) != E_INVALIDARG)
-                throw std::runtime_error("Accepted out-of-order frame");
-            Check(worker.SendFrame(frameCommand), "Send worker frame");
-            if (worker.SendFrame(frameCommand) != E_INVALIDARG)
-                throw std::runtime_error("Accepted overlapping frame");
+            if (invalidGuides)
+                frameCommand.motionX = wire.motionWidth;
+            frameCommand.resetMask = frameNumber == 1 ? ((1u << secondaryPasses) - 1u) : 0u;
+            if (resetSecondFrame && frameNumber == 2)
+                generation.MarkSkipped();
             if (frameNumber > 1)
                 Fill(frame.color, 4);
             ComPtr<ID3D12CommandAllocator> allocator;
             auto commands = Commands(primary.Get(), allocator);
-            if (frameTransfer.RecordOutbound(commands.Get(), frame.motion.texture.Get(), frame.depth.texture.Get(),
-                                             frame.motion.texture.Get()) != E_INVALIDARG)
+            if (transferLayout.RecordOutbound(commands.Get(), frame.motion.texture.Get(), frame.depth.texture.Get(),
+                                              frame.motion.texture.Get()) != E_INVALIDARG)
                 throw std::runtime_error("Accepted mismatched color format");
             DlssNr::MultiGpu::OwnedCommandChain chain;
             Check(chain.Initialize(primary.Get(), session.Queue(), commands.Get()), "Initialize owned command chain");
@@ -352,29 +347,28 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
             NrFixture::Barrier(commands.Get(), frame.motion.texture.Get(),
                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            // This is an owned list: prove that recorded primary work can be submitted before a
-            // separately owned continuation records the cross-process handoff.
+            auto* outboundColor = primaryPass ? primaryClamped.texture.Get() : frame.color.texture.Get();
+            D3D12_COMMAND_QUEUE_DESC otherDesc {};
+            otherDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            ComPtr<ID3D12CommandQueue> otherQueue;
+            Check(primary->CreateCommandQueue(&otherDesc, IID_PPV_ARGS(&otherQueue)), "Create alternate queue");
+            const auto rejectedHandoff = generation.Submit(chain, otherQueue.Get(), frameCommand, outboundColor,
+                                                           frame.depth.texture.Get(), frame.motion.texture.Get(), 0);
+            if (rejectedHandoff.result != E_INVALIDARG ||
+                rejectedHandoff.phase != DlssNr::Worker::HandoffPhase::Validate)
+                throw std::runtime_error("Accepted a different primary queue");
             submitted = true;
-            if (FAILED(chain.Split()))
-                ExitProcess(3);
-            auto* continuation = chain.Current();
-            Check(frameTransfer.RecordOutbound(continuation,
-                                               primaryPass ? primaryClamped.texture.Get() : frame.color.texture.Get(),
-                                               frame.depth.texture.Get(), frame.motion.texture.Get()),
-                  "Record frame transfer outbound");
-            if (FAILED(chain.SubmitFinal()) || chain.SubmittedCount() != 2 || chain.Current() ||
-                chain.Split() != E_ABORT || chain.SubmitFinal() != E_ABORT)
-                ExitProcess(3);
-            if (FAILED(session.Queue()->Signal(transfer.PrimaryReady(), frameNumber)))
-                ExitProcess(3);
-            Retire(primary.Get(), session.Queue());
-            submitted = false;
-            std::cout << (primaryPass ? "Primary neural pass retired and frame sent to secondary.\n"
-                                      : "Original primary frame sent to secondary.\n")
-                      << std::flush;
             if (failureTest)
             {
-                // Only this test's own child is terminated. No primary GPU wait is enqueued on its fence.
+                Check(transferLayout.RecordOutbound(commands.Get(), outboundColor, frame.depth.texture.Get(),
+                                                    frame.motion.texture.Get()),
+                      "Record failure-test outbound");
+                Check(worker.SendFrame(frameCommand), "Send failure-test frame");
+                if (FAILED(chain.Split()) || FAILED(session.Queue()->Signal(transfer.PrimaryReady(), frameNumber)))
+                    ExitProcess(3);
+                Retire(primary.Get(), session.Queue());
+                submitted = false;
+                // Only this test's own child is terminated; the primary queue never waits on its fence.
                 if (!TerminateProcess(worker.ProcessHandle(), 42) ||
                     WaitForSingleObject(worker.ProcessHandle(), 30000) != WAIT_OBJECT_0)
                     throw std::runtime_error("Could not stop test worker");
@@ -386,33 +380,48 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
                           << std::flush;
                 return 0;
             }
-            const auto result = worker.WaitForReturn(frameNumber, 60000);
-            if (result != DlssNr::MultiGpu::WorkerFenceWaitResult::Ready)
-                throw std::runtime_error("Worker exited or timed out before returning its frame; see worker log");
+            const auto handoff = generation.Submit(chain, session.Queue(), frameCommand, outboundColor,
+                                                   frame.depth.texture.Get(), frame.motion.texture.Get(), 60000);
+            if (invalidGuides)
+            {
+                if (handoff.result != E_ABORT || handoff.phase != DlssNr::Worker::HandoffPhase::OutboundSignalled)
+                    ExitProcess(3);
+                Retire(primary.Get(), session.Queue());
+                submitted = false;
+                Check(primary->GetDeviceRemovedReason(), "Primary device after rejected guide");
+                std::cout << "Invalid guide rejected after submission; primary queue remains usable.\n" << std::flush;
+                return 0;
+            }
+            if (FAILED(handoff.result) || handoff.phase != DlssNr::Worker::HandoffPhase::WorkerReturned)
+            {
+                std::cerr << "Worker handoff failed; terminating isolated fixture.\n" << std::flush;
+                ExitProcess(3);
+            }
             ComPtr<ID3D12Fence> pendingRetirement;
             Check(primary->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pendingRetirement)),
                   "Create pending fence");
-            if (worker.AcknowledgeReturn(frameNumber, pendingRetirement.Get(), 1) != E_PENDING)
-                throw std::runtime_error("Reused a frame before the primary GPU retired it");
             auto readback =
                 Buffer(primary.Get(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, frame.color.bytes);
             NrFixture::Surface returnedColor;
             if (!NrFixture::MakeSurface(primary.Get(), frame.colorFormat, false, returnedColor, width, height))
                 throw std::runtime_error("Create returned primary texture failed");
-            ComPtr<ID3D12CommandAllocator> inboundAllocator;
-            auto inbound = Commands(primary.Get(), inboundAllocator);
-            Check(frameTransfer.RecordInbound(inbound.Get(), returnedColor.texture.Get()),
-                  "Record frame transfer inbound");
-            Transition(inbound.Get(), returnedColor.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+            auto* inbound = chain.Current();
+            Check(generation.RecordReturn(inbound, returnedColor.texture.Get()), "Record frame transfer inbound");
+            Transition(inbound, returnedColor.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                        D3D12_RESOURCE_STATE_COPY_SOURCE);
             auto fromTexture = NrFixture::Texture(returnedColor.texture.Get());
             auto toReadback = NrFixture::Buffer(readback.Get(), returnedColor.footprint);
             inbound->CopyTextureRegion(&toReadback, 0, 0, 0, &fromTexture, nullptr);
-            Submit(session.Queue(), inbound.Get());
-            submitted = true;
-            auto retired = Retire(primary.Get(), session.Queue());
+            Check(generation.TrackRetirement(pendingRetirement.Get(), 1), "Track primary retirement");
+            if (generation.Poll() != E_PENDING)
+                throw std::runtime_error("Reused a frame before primary retirement");
+            if (FAILED(chain.SubmitFinal()) || chain.SubmittedCount() != 2 || chain.Current() ||
+                chain.Split() != E_ABORT || chain.SubmitFinal() != E_ABORT ||
+                FAILED(session.Queue()->Signal(pendingRetirement.Get(), 1)))
+                ExitProcess(3);
+            Retire(primary.Get(), session.Queue());
             submitted = false;
-            Check(worker.AcknowledgeReturn(frameNumber, retired.Get(), 1), "Acknowledge returned frame");
+            Check(generation.Poll(), "Acknowledge returned frame");
             CheckDebug(primary.Get());
             D3D12_RANGE range { 0, static_cast<SIZE_T>(frame.color.bytes) }, noWrite { 0, 0 };
             uint8_t* mapped = nullptr;
@@ -443,7 +452,7 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
                       << checksum << std::dec << "\n"
                       << std::flush;
         }
-        Check(worker.Stop(30000), "Stop worker");
+        Check(generation.Stop(30000), "Stop worker");
         std::cout << (primaryPass ? "One primary pass and " : "") << secondaryPasses
                   << " secondary passes evaluated two sequential frames; worker exited cleanly.\n"
                   << std::flush;
@@ -460,10 +469,10 @@ int wmain(int argc, wchar_t** argv)
 {
     try
     {
-        if (argc >= 11 && argc <= 18)
+        if (argc >= 11 && argc <= 19)
         {
             bool primaryPass = true, failureTest = false, resetSecondFrame = false, noDepth = false, halfGuides = false,
-                 rgba8 = false, offsetGuides = false;
+                 rgba8 = false, offsetGuides = false, invalidGuides = false;
             for (int i = 11; i < argc; ++i)
             {
                 if (std::wcscmp(argv[i], L"--no-primary") == 0 && primaryPass)
@@ -480,6 +489,8 @@ int wmain(int argc, wchar_t** argv)
                     rgba8 = true;
                 else if (std::wcscmp(argv[i], L"--offset-guides") == 0 && !offsetGuides)
                     offsetGuides = true;
+                else if (std::wcscmp(argv[i], L"--invalid-guides") == 0 && !invalidGuides)
+                    invalidGuides = true;
                 else
                     return 2;
             }
@@ -493,7 +504,7 @@ int wmain(int argc, wchar_t** argv)
                 return 2;
             return Parent(argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], primaryPass,
                           static_cast<unsigned>(passes), static_cast<unsigned>(width), static_cast<unsigned>(height),
-                          failureTest, resetSecondFrame, noDepth, halfGuides, rgba8, offsetGuides);
+                          failureTest, resetSecondFrame, noDepth, halfGuides, rgba8, offsetGuides, invalidGuides);
         }
         std::cerr << "Expected core, forwarder, model, primary data, worker data, worker log, executable, pass count "
                      "and dimensions.\n";

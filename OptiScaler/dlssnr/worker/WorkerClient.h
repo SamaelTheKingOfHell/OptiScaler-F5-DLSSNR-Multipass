@@ -341,6 +341,11 @@ class WorkerClient
         state_ = State::Stopped;
         return S_OK;
     }
+    bool UsesTransfer(const MultiGpu::CrossAdapterBuffer& transfer) const
+    {
+        return transfer_.PrimaryBuffer() && transfer_.PrimaryBuffer() == transfer.PrimaryBuffer() &&
+               transfer_.PrimaryReady() == transfer.PrimaryReady() && transfer_.PrimaryDone() == transfer.PrimaryDone();
+    }
     HANDLE ProcessHandle() const { return process_.value; }
 };
 } // namespace DlssNr::Worker

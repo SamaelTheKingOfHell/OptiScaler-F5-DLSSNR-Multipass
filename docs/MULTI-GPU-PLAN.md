@@ -69,3 +69,9 @@ The Release worker itself passed synthetic two-frame tests on the RTX 5070 Ti an
 The hardware fixture exercised these components at 320x181 with one primary and four secondary passes. It also killed its own worker after a primary submission and verified that the primary queue remained usable. Resetting both secondary histories on the second frame changed its output checksum. These checks do not establish visual quality, game integration or real-time performance; the client and transfer generation are not yet wired into the application.
 
 The hardware fixture also exercised half-size guides, a missing depth texture, and RGBA8 color with nonzero guide offsets. The actual game textures and their color, depth and motion semantics have not yet been captured or validated.
+
+## Worker generation and owned handoff
+
+`WorkerGeneration` manages asynchronous startup, a single in-flight frame, return recording, primary-fence retirement, and reset after a skipped frame. `SendFrameAndWait` records the outbound copies on an owned list, submits that list, signals the outbound fence, and waits for the worker without enqueuing a peer-dependent GPU wait. It requires the exact queue and transfer owned by the generation. The caller must hold the generation, list chain, and resources through primary retirement, handle failure according to the returned submission phase, and record the returned image on the continuation.
+
+The hardware fixture used this generation for two frames with RGBA8 color and half-size offset guides. A deliberately invalid guide caused worker rejection after primary submission, with the primary queue still usable. These tests do not connect the generation to the application's finished-picture renderer; runtime fallback, application integration, game validation and deployment remain pending.

@@ -64,6 +64,13 @@ class OwnedCommandChain
             return nullptr;
         return continuations_.empty() ? first_.Get() : continuations_.back().list.Get();
     }
+    bool UsesQueue(ID3D12CommandQueue* queue) const
+    {
+        if (!queue_ || !queue)
+            return false;
+        Microsoft::WRL::ComPtr<IUnknown> a, b;
+        return SUCCEEDED(queue_.As(&a)) && SUCCEEDED(queue->QueryInterface(IID_PPV_ARGS(&b))) && a.Get() == b.Get();
+    }
     unsigned SubmittedCount() const { return submitted_; }
     bool Poisoned() const { return poisoned_; }
 
