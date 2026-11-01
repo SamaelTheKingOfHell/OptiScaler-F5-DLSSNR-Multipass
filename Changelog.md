@@ -1,3 +1,8 @@
+## 2026-11-01 — Ordered multi-GPU pass split (WIP)
+
+- Specified a game-GPU pass prefix followed by a secondary-GPU suffix, with at most one outbound handoff and one return. Added a placement-policy prototype and exhaustive split smoke test; the policy is not yet connected to GPU execution.
+- OpenAI Codex, GPT-6 (exact model and effort unavailable). MSVC C++17 smoke test passed for all 495 splits of 1–30 passes and invalid inputs; GPU transport, runtime integration, deployment and game validation remain pending.
+
 ## 2026-11-01 — GPU distribution preparation (WIP)
 
 - Added contributor guidance, local-file exclusions and a proposed multi-GPU implementation plan.
