@@ -1,3 +1,8 @@
+## 2026-11-01 — Standalone neural worker (WIP)
+
+- Added a separately built worker executable, a versioned private-pipe protocol, persistent per-pass model features, per-frame controls and the existing inter-pass clamp. The worker supports a contiguous secondary pass group and returns its image through a shared buffer; the main application does not yet start it.
+- OpenAI Codex, GPT-6 (exact model and effort unavailable). The MSBuild Release worker was tested on RTX 5070 Ti and RTX 3060 with a primary pass followed by up to four secondary passes. A separate run used no primary evaluation and a 320x181 image, testing aligned offsets for padded color/depth/motion. Two synthetic frames completed and both processes exited cleanly. Other resolutions, formats, guide layouts, settings changes, game behavior and real-time performance require further validation.
+
 ## 2026-11-01 — Owned submission and process-failure probes (WIP)
 
 - Added an owned command-list chain that can submit a primary list and retain the allocator for its continuation. Added a bounded CPU fence/peer wait for the isolated worker; neither side enqueues a GPU wait on a fence controlled by a potentially dead process. These helpers are not connected to the game path.

@@ -3,8 +3,11 @@
 #include "../../OptiScaler/dlssnr/DlssNr_CrossAdapterSelect.h"
 #include "../../OptiScaler/dlssnr/DlssNr_OwnedCommandChain.h"
 #include "../../OptiScaler/dlssnr/DlssNr_WorkerFenceWait.h"
-#include "nr_ngx_session_fixture.h"
-#include "nr_interpass_clamp_fixture.h"
+#include "../../OptiScaler/dlssnr/worker/WorkerModelSession.h"
+#include "nr_ngx_evaluate_fixture.h"
+#include "nr_cross_adapter_test_helpers.h"
+#include "../../OptiScaler/dlssnr/worker/InterpassClamp.h"
+#include "../../OptiScaler/dlssnr/worker/WorkerProtocol.h"
 #include <d3d12sdklayers.h>
 #include <cwchar>
 #include <limits>
@@ -18,26 +21,26 @@ struct OwnedHandle
             CloseHandle(value);
     }
 };
-struct Wire
-{
-    uint64_t heap = 0, ready = 0, done = 0, parent = 0, bytes = 0, colorBytes = 0, depthBytes = 0, motionBytes = 0;
-    UINT colorPitch = 0, depthPitch = 0, motionPitch = 0;
-    LUID primary {}, secondary {};
-};
+using Wire = DlssNr::Worker::InitialFrameWire;
+using DlssNr::Worker::InterpassClamp;
 struct Frame
 {
     NrFixture::Surface color, depth, motion, output;
-    explicit Frame(ID3D12Device* device)
+    unsigned width, height;
+    explicit Frame(ID3D12Device* device, unsigned requestedWidth, unsigned requestedHeight)
+        : width(requestedWidth), height(requestedHeight)
     {
-        if (!NrFixture::MakeSurface(device, DXGI_FORMAT_R16G16B16A16_FLOAT, false, color) ||
-            !NrFixture::MakeSurface(device, DXGI_FORMAT_R32_FLOAT, false, depth) ||
-            !NrFixture::MakeSurface(device, DXGI_FORMAT_R16G16_FLOAT, false, motion) ||
-            !NrFixture::MakeSurface(device, DXGI_FORMAT_R16G16B16A16_FLOAT, true, output))
+        if (!NrFixture::MakeSurface(device, DXGI_FORMAT_R16G16B16A16_FLOAT, false, color, width, height) ||
+            !NrFixture::MakeSurface(device, DXGI_FORMAT_R32_FLOAT, false, depth, width, height) ||
+            !NrFixture::MakeSurface(device, DXGI_FORMAT_R16G16_FLOAT, false, motion, width, height) ||
+            !NrFixture::MakeSurface(device, DXGI_FORMAT_R16G16B16A16_FLOAT, true, output, width, height))
             throw std::runtime_error("Could not create neural textures");
-        if (color.bytes % 512 || depth.bytes % 512 || motion.bytes % 512 || color.bytes != output.bytes)
-            throw std::runtime_error("Unsupported copy footprint alignment");
+        if (color.bytes != output.bytes)
+            throw std::runtime_error("Incompatible output footprint");
     }
-    uint64_t Bytes() const { return color.bytes + depth.bytes + motion.bytes; }
+    uint64_t DepthOffset() const { return (color.bytes + 511u) & ~511ull; }
+    uint64_t MotionOffset() const { return (DepthOffset() + depth.bytes + 511u) & ~511ull; }
+    uint64_t Bytes() const { return MotionOffset() + motion.bytes; }
 };
 
 static void Fill(NrFixture::Surface& surface, unsigned kind)
@@ -52,7 +55,7 @@ static void Fill(NrFixture::Surface& surface, unsigned kind)
         if (kind == 0 || kind == 4)
         {
             auto* half = reinterpret_cast<uint16_t*>(row);
-            for (unsigned x = 0; x < 256; ++x)
+            for (unsigned x = 0; x < surface.texture->GetDesc().Width; ++x)
             {
                 half[4 * x] = half[4 * x + 1] = half[4 * x + 2] = kind == 0 ? 0x3800 : 0x3400;
                 half[4 * x + 3] = 0x3c00;
@@ -61,7 +64,7 @@ static void Fill(NrFixture::Surface& surface, unsigned kind)
         else if (kind == 1)
         {
             auto* values = reinterpret_cast<float*>(row);
-            for (unsigned x = 0; x < 256; ++x)
+            for (unsigned x = 0; x < surface.texture->GetDesc().Width; ++x)
                 values[x] = 0.5f;
         }
     }
@@ -87,15 +90,6 @@ static void CopyToShared(ID3D12GraphicsCommandList* commands, ID3D12Resource* sh
     auto src = NrFixture::Texture(surface.texture.Get());
     auto dst = SharedLocation(shared, surface, offset);
     commands->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-}
-static void CopyFromShared(ID3D12GraphicsCommandList* commands, ID3D12Resource* shared, NrFixture::Surface& surface,
-                           UINT64 offset)
-{
-    auto src = SharedLocation(shared, surface, offset);
-    auto dst = NrFixture::Texture(surface.texture.Get());
-    commands->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    NrFixture::Barrier(commands, surface.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
-                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 }
 static void CheckDebug(ID3D12Device* device)
 {
@@ -128,10 +122,22 @@ static void Retire(ID3D12Device* device, ID3D12CommandQueue* queue)
         ExitProcess(3);
     }
 }
-static void Evaluate(NrFixture::ModelSession& session, ID3D12GraphicsCommandList* commands, Frame& frame, bool reset)
+static DlssNr::Worker::Evaluation MakeEvaluation(Frame& frame, bool reset)
 {
-    const int result = session.Record(commands, frame.color.texture.Get(), frame.depth.texture.Get(),
-                                      frame.motion.texture.Get(), frame.output.texture.Get(), reset);
+    DlssNr::Worker::Evaluation request {};
+    request.color = frame.color.texture.Get();
+    request.depth = frame.depth.texture.Get();
+    request.motion = frame.motion.texture.Get();
+    request.output = frame.output.texture.Get();
+    request.width = request.guideWidth = request.motionWidth = frame.width;
+    request.height = request.guideHeight = request.motionHeight = frame.height;
+    request.reset = reset ? 1 : 0;
+    return request;
+}
+static void Evaluate(DlssNr::Worker::ModelSession& session, ID3D12GraphicsCommandList* commands, Frame& frame,
+                     bool reset)
+{
+    const int result = session.Record(commands, MakeEvaluation(frame, reset), 0);
     if (result != 1)
     {
         std::cerr << "Neural evaluation failed: " << std::hex << static_cast<unsigned>(result) << " "
@@ -155,108 +161,9 @@ static ComPtr<ID3D12GraphicsCommandList> Commands(ID3D12Device* device, ComPtr<I
         "Create neural command list");
     return commands;
 }
-static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, const wchar_t* model, const wchar_t* data,
-                  const wchar_t* log)
-{
-    FILE* unused = nullptr;
-    _wfreopen_s(&unused, log, L"w", stderr);
-    Wire wire {};
-    DWORD read = 0;
-    if (!ReadFile(pipe, &wire, sizeof(wire), &read, nullptr) || read != sizeof(wire))
-        return 10;
-    CloseHandle(pipe);
-    OwnedHandle heap { reinterpret_cast<HANDLE>(static_cast<uintptr_t>(wire.heap)) };
-    OwnedHandle ready { reinterpret_cast<HANDLE>(static_cast<uintptr_t>(wire.ready)) };
-    OwnedHandle done { reinterpret_cast<HANDLE>(static_cast<uintptr_t>(wire.done)) };
-    OwnedHandle parent { reinterpret_cast<HANDLE>(static_cast<uintptr_t>(wire.parent)) };
-    ComPtr<ID3D12Debug> debug;
-    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))
-        debug->EnableDebugLayer();
-    ComPtr<IDXGIFactory4> factory;
-    Check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "Worker factory");
-    ComPtr<IDXGIAdapter1> adapter;
-    Check(factory->EnumAdapterByLuid(wire.secondary, IID_PPV_ARGS(&adapter)), "Worker adapter");
-    ComPtr<ID3D12Device> device;
-    Check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "Worker device");
-    DlssNr::MultiGpu::CrossAdapterPeer peer;
-    Check(DlssNr::MultiGpu::CrossAdapterPeer::Open(device.Get(), wire.primary, wire.secondary, wire.bytes, heap.value,
-                                                   ready.value, done.value, peer),
-          "Worker open handles");
-    Frame frame(device.Get());
-    if (frame.Bytes() != wire.bytes || frame.color.bytes != wire.colorBytes || frame.depth.bytes != wire.depthBytes ||
-        frame.motion.bytes != wire.motionBytes || frame.color.footprint.Footprint.RowPitch != wire.colorPitch ||
-        frame.depth.footprint.Footprint.RowPitch != wire.depthPitch ||
-        frame.motion.footprint.Footprint.RowPitch != wire.motionPitch)
-        throw std::runtime_error("Worker footprint mismatch");
-    Fill(frame.output, 3);
-    NrFixture::Surface extraOutput;
-    if (!NrFixture::MakeSurface(device.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, true, extraOutput))
-        throw std::runtime_error("Create additional secondary output failed");
-    Fill(extraOutput, 3);
-    NrFixture::Surface clamped;
-    if (!NrFixture::MakeSurface(device.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, true, clamped))
-        throw std::runtime_error("Create intermediate clamp texture failed");
-    Fill(clamped, 3);
-    InterpassClamp clamp(device.Get());
-    NrFixture::ModelSession session;
-    session.Initialize(device.Get(), core, forwarder, model, data, 2);
-    for (uint64_t frameNumber = 1; frameNumber <= 2; ++frameNumber)
-    {
-        ComPtr<ID3D12CommandAllocator> allocator;
-        auto commands = Commands(device.Get(), allocator);
-        if (frameNumber > 1)
-        {
-            for (auto* input : { &frame.color, &frame.depth, &frame.motion })
-                NrFixture::Barrier(commands.Get(), input->texture.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                                   D3D12_RESOURCE_STATE_COPY_DEST);
-            NrFixture::Barrier(commands.Get(), frame.output.texture.Get(),
-                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-            NrFixture::Barrier(commands.Get(), extraOutput.texture.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
-                               D3D12_RESOURCE_STATE_COPY_DEST);
-            NrFixture::Barrier(commands.Get(), clamped.texture.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                               D3D12_RESOURCE_STATE_COPY_DEST);
-        }
-        Transition(commands.Get(), peer.Buffer(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        CopyFromShared(commands.Get(), peer.Buffer(), frame.color, 0);
-        CopyFromShared(commands.Get(), peer.Buffer(), frame.depth, frame.color.bytes);
-        CopyFromShared(commands.Get(), peer.Buffer(), frame.motion, frame.color.bytes + frame.depth.bytes);
-        CopyUpload(commands.Get(), frame.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        CopyUpload(commands.Get(), extraOutput, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        CopyUpload(commands.Get(), clamped, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        Evaluate(session, commands.Get(), frame, frameNumber == 1);
-        NrFixture::Barrier(commands.Get(), frame.output.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        clamp.Record(commands.Get(), frame.output.texture.Get(), frame.color.texture.Get(), clamped.texture.Get());
-        NrFixture::Barrier(commands.Get(), clamped.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        const int secondResult =
-            session.Record(commands.Get(), clamped.texture.Get(), frame.depth.texture.Get(), frame.motion.texture.Get(),
-                           extraOutput.texture.Get(), frameNumber == 1, 1);
-        if (secondResult != 1)
-            throw std::runtime_error("Second secondary neural pass failed");
-        NrFixture::Barrier(commands.Get(), extraOutput.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                           D3D12_RESOURCE_STATE_COPY_SOURCE);
-        Transition(commands.Get(), peer.Buffer(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-        CopyToShared(commands.Get(), peer.Buffer(), extraOutput, 0);
-        Transition(commands.Get(), peer.Buffer(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-        if (DlssNr::MultiGpu::WaitForFenceOrPeer(peer.Ready(), frameNumber, parent.value, 30000) !=
-            DlssNr::MultiGpu::WorkerFenceWaitResult::Ready)
-            throw std::runtime_error("Parent exited or failed before sending the frame");
-        Submit(session.Queue(), commands.Get());
-        if (FAILED(session.Queue()->Signal(peer.Done(), frameNumber)))
-        {
-            std::cerr << "Cannot signal worker completion.\n" << std::flush;
-            ExitProcess(3);
-        }
-        Retire(device.Get(), session.Queue());
-    }
-    CheckDebug(device.Get());
-    std::cerr << "Worker neural pass retired successfully.\n" << std::flush;
-    return 0;
-}
-
 static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* model, const wchar_t* parentData,
-                  const wchar_t* workerData, const wchar_t* log, bool primaryPass)
+                  const wchar_t* workerData, const wchar_t* log, const wchar_t* workerExe, bool primaryPass,
+                  unsigned secondaryPasses, unsigned width, unsigned height)
 {
     MEMORYSTATUSEX memory { sizeof(memory) };
     if (!GlobalMemoryStatusEx(&memory) || memory.ullAvailPageFile < 8ull * 1024 * 1024 * 1024)
@@ -307,23 +214,24 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
     std::wcout << L"Primary: " << primaryDesc.Description << L"; secondary: " << secondary.description.Description
                << L"\n"
                << std::flush;
-    Frame frame(primary.Get());
+    Frame frame(primary.Get(), width, height);
     Fill(frame.color, 0);
     Fill(frame.depth, 1);
     Fill(frame.motion, 2);
     Fill(frame.output, 3);
     NrFixture::Surface primaryClamped;
-    if (!NrFixture::MakeSurface(primary.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, true, primaryClamped))
+    if (!NrFixture::MakeSurface(primary.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, true, primaryClamped, width, height))
         throw std::runtime_error("Create primary clamp texture failed");
     Fill(primaryClamped, 3);
-    InterpassClamp primaryClamp(primary.Get());
+    InterpassClamp primaryClamp(primary.Get(), width, height);
     DlssNr::MultiGpu::CrossAdapterBuffer transfer;
     Check(DlssNr::MultiGpu::CrossAdapterBuffer::Create(primary.Get(), secondary.device.Get(), frame.Bytes(), transfer),
           "Create frame transfer");
     DlssNr::MultiGpu::CrossAdapterHandles handles;
     Check(DlssNr::MultiGpu::CrossAdapterHandles::Create(transfer, handles), "Export frame handles");
-    NrFixture::ModelSession session;
-    session.Initialize(primary.Get(), core, forwarder, model, parentData);
+    DlssNr::Worker::ModelSession session;
+    session.Initialize(primary.Get(), core, forwarder, model, parentData, width, height,
+                       std::vector<DlssNr::Worker::FeatureTuning>(1), 0x24480451ull);
     {
         ComPtr<ID3D12CommandAllocator> wrongAllocator;
         auto wrongList = Commands(secondary.device.Get(), wrongAllocator);
@@ -351,22 +259,15 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
         DeleteProcThreadAttributeList(attributes);
         throw std::runtime_error("Restrict inherited handles failed");
     }
-    wchar_t executable[32768] {};
-    DWORD length = GetModuleFileNameW(nullptr, executable, static_cast<DWORD>(std::size(executable)));
-    if (!length || length >= std::size(executable))
-    {
-        DeleteProcThreadAttributeList(attributes);
-        throw std::runtime_error("Get executable failed");
-    }
     auto quote = [](const wchar_t* value) { return L"\"" + std::wstring(value) + L"\""; };
-    std::wstring command = quote(executable) + L" --worker " +
+    std::wstring command = quote(workerExe) + L" --worker " +
                            std::to_wstring(reinterpret_cast<uintptr_t>(readPipe.value)) + L" " + quote(core) + L" " +
                            quote(forwarder) + L" " + quote(model) + L" " + quote(workerData) + L" " + quote(log);
     STARTUPINFOEXW startup {};
     startup.StartupInfo.cb = sizeof(startup);
     startup.lpAttributeList = attributes;
     PROCESS_INFORMATION child {};
-    const BOOL created = CreateProcessW(executable, command.data(), nullptr, nullptr, TRUE,
+    const BOOL created = CreateProcessW(workerExe, command.data(), nullptr, nullptr, TRUE,
                                         EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW, nullptr,
                                         nullptr, &startup.StartupInfo, &child);
     DeleteProcThreadAttributeList(attributes);
@@ -378,6 +279,12 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
     try
     {
         Wire wire {};
+        wire.passCount = secondaryPasses;
+        wire.frameCount = 0; // Exercise a persistent worker followed by an explicit shutdown command.
+        wire.width = width;
+        wire.height = height;
+        wire.depthOffset = frame.DepthOffset();
+        wire.motionOffset = frame.MotionOffset();
         wire.bytes = frame.Bytes();
         wire.colorBytes = frame.color.bytes;
         wire.depthBytes = frame.depth.bytes;
@@ -409,6 +316,13 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
         uint64_t previousChecksum = 0;
         for (uint64_t frameNumber = 1; frameNumber <= 2; ++frameNumber)
         {
+            DlssNr::Worker::FrameCommand frameCommand {};
+            frameCommand.frameNumber = frameNumber;
+            frameCommand.resetMask = frameNumber == 1 ? ((1u << secondaryPasses) - 1u) : 0u;
+            DWORD controlWritten = 0;
+            if (!WriteFile(writePipe.value, &frameCommand, sizeof(frameCommand), &controlWritten, nullptr) ||
+                controlWritten != sizeof(frameCommand))
+                throw std::runtime_error("Write frame control failed");
             if (frameNumber > 1)
                 Fill(frame.color, 4);
             ComPtr<ID3D12CommandAllocator> allocator;
@@ -464,8 +378,8 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
             Transition(continuation, transfer.PrimaryBuffer(), D3D12_RESOURCE_STATE_COMMON,
                        D3D12_RESOURCE_STATE_COPY_DEST);
             CopyToShared(continuation, transfer.PrimaryBuffer(), primaryPass ? primaryClamped : frame.color, 0);
-            CopyToShared(continuation, transfer.PrimaryBuffer(), frame.depth, frame.color.bytes);
-            CopyToShared(continuation, transfer.PrimaryBuffer(), frame.motion, frame.color.bytes + frame.depth.bytes);
+            CopyToShared(continuation, transfer.PrimaryBuffer(), frame.depth, frame.DepthOffset());
+            CopyToShared(continuation, transfer.PrimaryBuffer(), frame.motion, frame.MotionOffset());
             Transition(continuation, transfer.PrimaryBuffer(), D3D12_RESOURCE_STATE_COPY_DEST,
                        D3D12_RESOURCE_STATE_COMMON);
             if (FAILED(chain.SubmitFinal()) || chain.SubmittedCount() != 2 || chain.Current() ||
@@ -490,7 +404,8 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
             auto readback =
                 Buffer(primary.Get(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, frame.color.bytes);
             NrFixture::Surface returnedColor;
-            if (!NrFixture::MakeSurface(primary.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, false, returnedColor))
+            if (!NrFixture::MakeSurface(primary.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, false, returnedColor, width,
+                                        height))
                 throw std::runtime_error("Create returned primary texture failed");
             ComPtr<ID3D12CommandAllocator> inboundAllocator;
             auto inbound = Commands(primary.Get(), inboundAllocator);
@@ -519,7 +434,7 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
             for (UINT y = 0; y < frame.color.rows; ++y)
             {
                 auto* row = reinterpret_cast<const uint16_t*>(mapped + y * frame.color.footprint.Footprint.RowPitch);
-                for (unsigned x = 0; x < 256; ++x)
+                for (unsigned x = 0; x < width; ++x)
                     for (unsigned c = 0; c < 3; ++c)
                     {
                         const uint16_t value = row[x * 4 + c];
@@ -538,14 +453,20 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
                       << checksum << std::dec << "\n"
                       << std::flush;
         }
+        DlssNr::Worker::FrameCommand shutdown {};
+        shutdown.kind = DlssNr::Worker::CommandKind::Shutdown;
+        DWORD shutdownWritten = 0;
+        if (!WriteFile(writePipe.value, &shutdown, sizeof(shutdown), &shutdownWritten, nullptr) ||
+            shutdownWritten != sizeof(shutdown))
+            throw std::runtime_error("Write worker shutdown failed");
         if (WaitForSingleObject(process.value, 30000) != WAIT_OBJECT_0)
             throw std::runtime_error("Worker did not exit");
         DWORD exitCode = 1;
         if (!GetExitCodeProcess(process.value, &exitCode) || exitCode != 0)
             throw std::runtime_error("Worker failed; see worker log");
         completed = true;
-        std::cout << (primaryPass ? "One primary and two secondary features" : "Two secondary features")
-                  << " evaluated two sequential frames; worker exited cleanly.\n"
+        std::cout << (primaryPass ? "One primary pass and " : "") << secondaryPasses
+                  << " secondary passes evaluated two sequential frames; worker exited cleanly.\n"
                   << std::flush;
     }
     catch (...)
@@ -565,12 +486,21 @@ int wmain(int argc, wchar_t** argv)
 {
     try
     {
-        if (argc == 8 && std::wcscmp(argv[1], L"--worker") == 0)
-            return Worker(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(_wcstoui64(argv[2], nullptr, 10))), argv[3],
-                          argv[4], argv[5], argv[6], argv[7]);
-        if (argc == 7 || (argc == 8 && std::wcscmp(argv[7], L"--no-primary") == 0))
-            return Parent(argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], argc == 7);
-        std::cerr << "Expected core, forwarder, model, primary data, worker data, worker log.\n";
+        if (argc == 11 || (argc == 12 && std::wcscmp(argv[11], L"--no-primary") == 0))
+        {
+            wchar_t* ends[3] {};
+            const unsigned long passes = std::wcstoul(argv[8], &ends[0], 10);
+            const unsigned long width = std::wcstoul(argv[9], &ends[1], 10);
+            const unsigned long height = std::wcstoul(argv[10], &ends[2], 10);
+            if (!ends[0] || *ends[0] || !ends[1] || *ends[1] || !ends[2] || *ends[2] || passes == 0 ||
+                passes > DlssNr::Worker::MaxWorkerPasses || width == 0 || height == 0 || width > 16384 ||
+                height > 16384)
+                return 2;
+            return Parent(argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], argc == 11,
+                          static_cast<unsigned>(passes), static_cast<unsigned>(width), static_cast<unsigned>(height));
+        }
+        std::cerr << "Expected core, forwarder, model, primary data, worker data, worker log, executable, pass count "
+                     "and dimensions.\n";
         return 2;
     }
     catch (const std::exception& ex)

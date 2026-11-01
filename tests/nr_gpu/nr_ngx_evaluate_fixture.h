@@ -24,12 +24,13 @@ struct Surface
     UINT64 bytes = 0;
 };
 
-inline bool MakeSurface(ID3D12Device* device, DXGI_FORMAT format, bool output, Surface& surface)
+inline bool MakeSurface(ID3D12Device* device, DXGI_FORMAT format, bool output, Surface& surface, unsigned width = 256,
+                        unsigned height = 144)
 {
     D3D12_RESOURCE_DESC desc {};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = 256;
-    desc.Height = 144;
+    desc.Width = width;
+    desc.Height = height;
     desc.DepthOrArraySize = desc.MipLevels = 1;
     desc.Format = format;
     desc.SampleDesc.Count = 1;

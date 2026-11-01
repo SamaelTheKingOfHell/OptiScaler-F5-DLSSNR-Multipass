@@ -1,11 +1,54 @@
 #pragma once
 
-#include "../../external/nvngx_dlss_sdk/nvsdk_ngx.h"
-#include "nr_ngx_evaluate_fixture.h"
-#include "nr_cross_adapter_test_helpers.h"
+#include "../../../external/nvngx_dlss_sdk/nvsdk_ngx.h"
+#include <d3d12.h>
+#include <wrl/client.h>
+#include <cstdint>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <vector>
 
-namespace NrFixture
+namespace DlssNr::Worker
 {
+using Microsoft::WRL::ComPtr;
+using Evaluate = int (*)(ID3D12GraphicsCommandList*, void*, void*, ID3D12Resource*, ID3D12Resource*, ID3D12Resource*,
+                         ID3D12Resource*, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
+                         unsigned, unsigned, unsigned, int, int, float, int, float, float, float, int, float, float);
+using Error = const char* (*) ();
+inline void Check(HRESULT hr, const char* operation)
+{
+    if (FAILED(hr))
+    {
+        std::ostringstream message;
+        message << operation << " failed: 0x" << std::hex << static_cast<unsigned long>(hr);
+        throw std::runtime_error(message.str());
+    }
+}
+
+struct FeatureTuning
+{
+    int preset = 0;
+    float intensity = 1.0f;
+    int style = 0;
+    float structure = 0.0f, tone = 0.0f, skin = 0.0f;
+    int autoMask = 1, uiCorrection = 1;
+};
+struct Evaluation
+{
+    ID3D12Resource* color = nullptr;
+    ID3D12Resource* depth = nullptr;
+    ID3D12Resource* motion = nullptr;
+    ID3D12Resource* output = nullptr;
+    unsigned width = 0, height = 0, guideWidth = 0, guideHeight = 0, motionWidth = 0, motionHeight = 0;
+    unsigned depthX = 0, depthY = 0, motionX = 0, motionY = 0;
+    int invertedDepth = 0, reset = 0;
+    float intensity = 1.0f;
+    int style = 0;
+    float structure = 0.0f, tone = 0.0f, skin = 0.0f;
+    int autoMask = 1;
+    float motionScaleX = 1.0f, motionScaleY = 1.0f;
+};
 using Init = NVSDK_NGX_Result (*)(unsigned long long, const wchar_t*, ID3D12Device*, NVSDK_NGX_Version,
                                   const NVSDK_NGX_FeatureCommonInfo*);
 using GetCapabilities = NVSDK_NGX_Result (*)(NVSDK_NGX_Parameter**);
@@ -17,7 +60,9 @@ using ReleaseFeature = void (*)(void*);
 using ProbeFloat = void (*)(void*, const char*, float, int);
 using SetFloatSlot = void (*)(int);
 
-// Fixture-only one-device NGX session. The caller must retire every submitted command before destruction.
+// One-device NGX session for the isolated worker process only. The caller must retire every
+// submitted evaluation before destruction. An untrackable submitted initialization terminates the
+// worker process to avoid releasing resources still in GPU use; never instantiate inside the game.
 class ModelSession
 {
     HMODULE core_ = nullptr, forwarder_ = nullptr;
@@ -31,6 +76,17 @@ class ModelSession
     Evaluate evaluate_ = nullptr;
     Error error_ = nullptr;
     bool started_ = false;
+    unsigned width_ = 0, height_ = 0;
+
+    bool Owns(ID3D12DeviceChild* child) const
+    {
+        if (!child)
+            return false;
+        ComPtr<ID3D12Device> owner;
+        ComPtr<IUnknown> expectedIdentity, actualIdentity;
+        return SUCCEEDED(child->GetDevice(IID_PPV_ARGS(&owner))) && owner && SUCCEEDED(device_.As(&expectedIdentity)) &&
+               SUCCEEDED(owner.As(&actualIdentity)) && expectedIdentity.Get() == actualIdentity.Get();
+    }
 
   public:
     ModelSession(const ModelSession&) = delete;
@@ -56,11 +112,15 @@ class ModelSession
             FreeLibrary(core_);
     }
     void Initialize(ID3D12Device* device, const wchar_t* corePath, const wchar_t* forwarderPath,
-                    const wchar_t* modelPath, const wchar_t* dataPath, unsigned featureCount = 1)
+                    const wchar_t* modelPath, const wchar_t* dataPath, unsigned width, unsigned height,
+                    const std::vector<FeatureTuning>& tuning, unsigned long long applicationId)
     {
-        if (featureCount == 0 || featureCount > 8)
-            throw std::runtime_error("Invalid feature count");
+        if (device_ || !device || !corePath || !*corePath || !forwarderPath || !*forwarderPath || !modelPath ||
+            !*modelPath || !dataPath || !*dataPath || !width || !height || tuning.empty() || tuning.size() > 30)
+            throw std::runtime_error("Invalid model session configuration");
         device_ = device;
+        width_ = width;
+        height_ = height;
         core_ = LoadLibraryExW(corePath, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
         if (!core_)
             throw std::runtime_error("Load NGX core failed");
@@ -70,7 +130,7 @@ class ModelSession
         shutdown_ = reinterpret_cast<Shutdown>(GetProcAddress(core_, "NVSDK_NGX_D3D12_Shutdown1"));
         if (!init || !get || !destroy_ || !shutdown_)
             throw std::runtime_error("Missing NGX core exports");
-        if (init(0x24480451ull, dataPath, device, NVSDK_NGX_Version_API, nullptr) != NVSDK_NGX_Result_Success)
+        if (init(applicationId, dataPath, device, NVSDK_NGX_Version_API, nullptr) != NVSDK_NGX_Result_Success)
             throw std::runtime_error("NGX initialization failed");
         started_ = true;
         if (get(&params_) != NVSDK_NGX_Result_Success || !params_)
@@ -104,8 +164,8 @@ class ModelSession
         D3D12_COMMAND_QUEUE_DESC queueDesc {};
         queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         Check(device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue_)), "Create model queue");
-        features_.reserve(featureCount);
-        for (unsigned i = 0; i < featureCount; ++i)
+        features_.reserve(tuning.size());
+        for (const FeatureTuning& config : tuning)
         {
             ComPtr<ID3D12CommandAllocator> allocator;
             ComPtr<ID3D12GraphicsCommandList> commands;
@@ -116,8 +176,9 @@ class ModelSession
                                             IID_PPV_ARGS(&commands)),
                   "Create model list");
             Check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "Create model fence");
-            void* feature = create(modelPath, dataPath, device, commands.Get(), params_, 256, 144, 0, 1.0f, 0, 0.0f,
-                                   0.0f, 0.0f, 1, 1);
+            void* feature = create(modelPath, dataPath, device, commands.Get(), params_, width_, height_, config.preset,
+                                   config.intensity, config.style, config.structure, config.tone, config.skin,
+                                   config.autoMask, config.uiCorrection);
             if (!feature)
                 throw std::runtime_error(error_ && error_() ? error_() : "Create model feature failed");
             features_.push_back(feature);
@@ -142,14 +203,21 @@ class ModelSession
         }
     }
     ID3D12CommandQueue* Queue() const { return queue_.Get(); }
-    int Record(ID3D12GraphicsCommandList* commands, ID3D12Resource* color, ID3D12Resource* depth,
-               ID3D12Resource* motion, ID3D12Resource* output, bool reset, unsigned featureIndex = 0)
+    size_t FeatureCount() const { return features_.size(); }
+    int Record(ID3D12GraphicsCommandList* commands, const Evaluation& request, unsigned featureIndex)
     {
-        if (featureIndex >= features_.size())
-            throw std::runtime_error("Invalid feature index");
-        return evaluate_(commands, features_[featureIndex], params_, color, depth, motion, output, 256, 144, 256, 144,
-                         256, 144, 0, 0, 0, 0, 0, reset ? 1 : 0, 1.0f, 0, 0.0f, 0.0f, 0.0f, 1, 1.0f, 1.0f);
+        if (featureIndex >= features_.size() || !Owns(commands) || !Owns(request.color) || !Owns(request.output) ||
+            (request.depth && !Owns(request.depth)) || (request.motion && !Owns(request.motion)) ||
+            request.width != width_ || request.height != height_ || !request.guideWidth || !request.guideHeight ||
+            !request.motionWidth || !request.motionHeight || request.color == request.output)
+            throw std::runtime_error("Invalid worker evaluation inputs");
+        return evaluate_(commands, features_[featureIndex], params_, request.color, request.depth, request.motion,
+                         request.output, request.width, request.height, request.guideWidth, request.guideHeight,
+                         request.motionWidth, request.motionHeight, request.depthX, request.depthY, request.motionX,
+                         request.motionY, request.invertedDepth, request.reset, request.intensity, request.style,
+                         request.structure, request.tone, request.skin, request.autoMask, request.motionScaleX,
+                         request.motionScaleY);
     }
     const char* LastError() const { return error_ ? error_() : "no detail"; }
 };
-} // namespace NrFixture
+} // namespace DlssNr::Worker

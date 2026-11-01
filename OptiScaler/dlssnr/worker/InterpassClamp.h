@@ -2,10 +2,12 @@
 
 #pragma warning(push)
 #pragma warning(disable : 4324) // The production constant buffer is intentionally 256-byte aligned.
-#include "../../OptiScaler/shaders/dlssnr/DlssNr_Common.h"
+#include "../../shaders/dlssnr/DlssNr_Common.h"
 #pragma warning(pop)
-#include "../../OptiScaler/shaders/dlssnr/precompile/DlssNr_Shader.h"
+#include "../../shaders/dlssnr/precompile/DlssNr_Shader.h"
 
+namespace DlssNr::Worker
+{
 // Dispatch the same precompiled inter-pass shader and constants as the application.
 // The caller must retire a dispatch before changing these descriptors or destroying this object.
 class InterpassClamp
@@ -15,10 +17,11 @@ class InterpassClamp
     ComPtr<ID3D12PipelineState> pipeline_;
     ComPtr<ID3D12DescriptorHeap> heap_;
     ComPtr<ID3D12Resource> constants_;
-    UINT stride_ = 0;
+    UINT stride_ = 0, width_ = 0, height_ = 0;
 
   public:
-    explicit InterpassClamp(ID3D12Device* device) : device_(device)
+    explicit InterpassClamp(ID3D12Device* device, UINT width = 256, UINT height = 144, float feedback = 1.0f)
+        : device_(device), width_(width), height_(height)
     {
         D3D12_DESCRIPTOR_RANGE ranges[2] {};
         ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -51,12 +54,23 @@ class InterpassClamp
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         Check(device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&heap_)), "Create clamp descriptors");
         stride_ = device->GetDescriptorHandleIncrementSize(heapDesc.Type);
-        constants_ = Buffer(device, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, sizeof(DlssNrConstants));
+        D3D12_HEAP_PROPERTIES uploadHeap {};
+        uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        uploadHeap.CreationNodeMask = uploadHeap.VisibleNodeMask = 1;
+        D3D12_RESOURCE_DESC bufferDesc {};
+        bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bufferDesc.Width = sizeof(DlssNrConstants);
+        bufferDesc.Height = bufferDesc.DepthOrArraySize = bufferDesc.MipLevels = 1;
+        bufferDesc.SampleDesc.Count = 1;
+        bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        Check(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+                                              D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&constants_)),
+              "Create clamp constants");
         DlssNrConstants constants {};
         constants.Mode = DlssNrMode_ClampProxy;
-        constants.Width = 256;
-        constants.Height = 144;
-        constants.PassFeedback = 1.0f;
+        constants.Width = width_;
+        constants.Height = height_;
+        constants.PassFeedback = feedback;
         D3D12_RANGE noRead { 0, 0 };
         void* mapped = nullptr;
         Check(constants_->Map(0, &noRead, &mapped), "Map clamp constants");
@@ -87,6 +101,8 @@ class InterpassClamp
         commands->SetPipelineState(pipeline_.Get());
         commands->SetComputeRootDescriptorTable(0, heap_->GetGPUDescriptorHandleForHeapStart());
         commands->SetComputeRootConstantBufferView(1, constants_->GetGPUVirtualAddress());
-        commands->Dispatch((256 + 7) / 8, (144 + 7) / 8, 1);
+        commands->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
     }
 };
+
+} // namespace DlssNr::Worker

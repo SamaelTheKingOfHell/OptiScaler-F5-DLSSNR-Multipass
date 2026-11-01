@@ -1,6 +1,8 @@
 # Real neural passes in isolated processes, followed by a cross-adapter return to the primary GPU.
-param([string]$VcVars, [string]$CoreDll, [Parameter(Mandatory=$true)][string]$ForwarderDll,
-      [Parameter(Mandatory=$true)][string]$ModelDll, [switch]$NoPrimaryPass, [switch]$BuildOnly)
+param([string]$VcVars, [string]$CoreDll, [string]$WorkerExe, [Parameter(Mandatory=$true)][string]$ForwarderDll,
+      [Parameter(Mandatory=$true)][string]$ModelDll, [ValidateRange(1,30)][int]$SecondaryPasses = 2,
+      [ValidateRange(1,16384)][int]$Width = 256, [ValidateRange(1,16384)][int]$Height = 144,
+      [switch]$NoPrimaryPass, [switch]$BuildOnly)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 if (!$CoreDll) {
@@ -27,10 +29,16 @@ $obj = Join-Path $out 'nr_cross_process_neural.obj'
 $log = Join-Path $out 'worker.log'
 Push-Location $repo
 try {
+    if (!$WorkerExe) {
+        $WorkerExe = Join-Path $out 'nr_neural_worker.exe'
+        $workerObj = Join-Path $out 'nr_neural_worker.obj'
+        & cmd /d /c "`"$VcVars`" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX OptiScaler/dlssnr/worker/WorkerMain.cpp /Fe:`"$WorkerExe`" /Fo:`"$workerObj`" /link d3d12.lib dxgi.lib user32.lib"
+        if ($LASTEXITCODE -ne 0) { throw 'Neural worker compilation failed.' }
+    } elseif (!(Test-Path -LiteralPath $WorkerExe -PathType Leaf)) { throw 'The specified worker executable does not exist.' }
     & cmd /d /c "`"$VcVars`" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX tests/nr_gpu/nr_cross_process_neural.cpp /Fe:`"$exe`" /Fo:`"$obj`" /link d3d12.lib dxgi.lib user32.lib"
     if ($LASTEXITCODE -ne 0) { throw 'Neural cross-process probe compilation failed.' }
     if ($BuildOnly) { return }
-    $probeArgs = @($CoreDll, $ForwarderDll, $ModelDll, $primaryData, $workerData, $log)
+    $probeArgs = @($CoreDll, $ForwarderDll, $ModelDll, $primaryData, $workerData, $log, $workerExe, $SecondaryPasses.ToString(), $Width.ToString(), $Height.ToString())
     if ($NoPrimaryPass) { $probeArgs += '--no-primary' }
     & $exe @probeArgs
     if ($LASTEXITCODE -ne 0) {
