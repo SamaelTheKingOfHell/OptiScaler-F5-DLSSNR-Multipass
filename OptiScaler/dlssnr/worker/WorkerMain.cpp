@@ -31,12 +31,15 @@ struct OwnedHandle
 struct Frame
 {
     Surface color, depth, motion, output;
-    Frame(ID3D12Device* device, unsigned width, unsigned height)
-        : color(MakeSurface(device, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, false)),
-          depth(MakeSurface(device, width, height, DXGI_FORMAT_R32_FLOAT, false)),
-          motion(MakeSurface(device, width, height, DXGI_FORMAT_R16G16_FLOAT, false)),
-          output(MakeSurface(device, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, true))
+    Frame(ID3D12Device* device, const InitialFrameWire& wire)
+        : color(MakeSurface(device, wire.width, wire.height, static_cast<DXGI_FORMAT>(wire.colorFormat), false)),
+          motion(MakeSurface(device, wire.motionWidth, wire.motionHeight, static_cast<DXGI_FORMAT>(wire.motionFormat),
+                             false)),
+          output(MakeSurface(device, wire.width, wire.height, static_cast<DXGI_FORMAT>(wire.colorFormat), true))
     {
+        if (wire.depthFormat != DXGI_FORMAT_UNKNOWN)
+            depth = MakeSurface(device, wire.depthWidth, wire.depthHeight, static_cast<DXGI_FORMAT>(wire.depthFormat),
+                                false);
         if (color.bytes != output.bytes)
             throw std::runtime_error("Incompatible output footprint");
     }
@@ -128,7 +131,15 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
         !wire.height || wire.width > 16384 || wire.height > 16384 || !wire.passCount ||
         wire.passCount > MaxWorkerPasses || wire.enableDebug > 1 || !std::isfinite(wire.passFeedback) ||
         wire.passFeedback < 0.0f || wire.passFeedback > 1.0f || !wire.heap || !wire.ready || !wire.done ||
-        !wire.parent || !wire.initialized || !wire.bytes)
+        !wire.parent || !wire.initialized || !wire.bytes ||
+        (wire.colorFormat != DXGI_FORMAT_R16G16B16A16_FLOAT && wire.colorFormat != DXGI_FORMAT_R8G8B8A8_UNORM) ||
+        (wire.depthFormat != DXGI_FORMAT_UNKNOWN && wire.depthFormat != DXGI_FORMAT_R32_FLOAT &&
+         wire.depthFormat != DXGI_FORMAT_R16_FLOAT && wire.depthFormat != DXGI_FORMAT_R16_UNORM) ||
+        (wire.motionFormat != DXGI_FORMAT_R16G16_FLOAT && wire.motionFormat != DXGI_FORMAT_R32G32_FLOAT &&
+         wire.motionFormat != DXGI_FORMAT_R16G16_SNORM) ||
+        !wire.motionWidth || !wire.motionHeight || wire.motionWidth > 16384 || wire.motionHeight > 16384 ||
+        (wire.depthFormat != DXGI_FORMAT_UNKNOWN &&
+         (!wire.depthWidth || !wire.depthHeight || wire.depthWidth > 16384 || wire.depthHeight > 16384)))
         throw std::runtime_error("Invalid worker handshake");
     OwnedHandle heap { reinterpret_cast<HANDLE>(static_cast<uintptr_t>(wire.heap)) };
     OwnedHandle ready { reinterpret_cast<HANDLE>(static_cast<uintptr_t>(wire.ready)) };
@@ -151,16 +162,17 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
     Check(DlssNr::MultiGpu::CrossAdapterPeer::Open(device.Get(), wire.primary, wire.secondary, wire.bytes, heap.value,
                                                    ready.value, done.value, peer),
           "Worker open handles");
-    Frame frame(device.Get(), wire.width, wire.height);
+    Frame frame(device.Get(), wire);
     if (frame.Bytes() != wire.bytes || frame.color.bytes != wire.colorBytes || frame.depth.bytes != wire.depthBytes ||
         frame.motion.bytes != wire.motionBytes || frame.DepthOffset() != wire.depthOffset ||
         frame.MotionOffset() != wire.motionOffset || frame.color.footprint.Footprint.RowPitch != wire.colorPitch ||
         frame.depth.footprint.Footprint.RowPitch != wire.depthPitch ||
         frame.motion.footprint.Footprint.RowPitch != wire.motionPitch)
         throw std::runtime_error("Worker footprint mismatch");
-    Surface extraOutput = MakeSurface(device.Get(), wire.width, wire.height, DXGI_FORMAT_R16G16B16A16_FLOAT, true);
-    Surface clampA = MakeSurface(device.Get(), wire.width, wire.height, DXGI_FORMAT_R16G16B16A16_FLOAT, true);
-    Surface clampB = MakeSurface(device.Get(), wire.width, wire.height, DXGI_FORMAT_R16G16B16A16_FLOAT, true);
+    const auto colorFormat = static_cast<DXGI_FORMAT>(wire.colorFormat);
+    Surface extraOutput = MakeSurface(device.Get(), wire.width, wire.height, colorFormat, true);
+    Surface clampA = MakeSurface(device.Get(), wire.width, wire.height, colorFormat, true);
+    Surface clampB = MakeSurface(device.Get(), wire.width, wire.height, colorFormat, true);
     std::array<Surface*, 2> outputs { &frame.output, &extraOutput }, clamps { &clampA, &clampB };
     std::array<D3D12_RESOURCE_STATES, 2> outputStates { D3D12_RESOURCE_STATE_COPY_DEST,
                                                         D3D12_RESOURCE_STATE_COPY_DEST };
@@ -205,15 +217,22 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
         if (frameCommand.kind == CommandKind::Shutdown)
             break;
         if (frameCommand.kind != CommandKind::Frame || frameCommand.frameNumber != frameNumber ||
-            frameCommand.invertedDepth > 1 || !std::isfinite(frameCommand.motionScaleX) ||
-            !std::isfinite(frameCommand.motionScaleY))
+            frameCommand.invertedDepth > 1 || !frameCommand.guideWidth || !frameCommand.guideHeight ||
+            !frameCommand.motionWidth || !frameCommand.motionHeight ||
+            static_cast<uint64_t>(frameCommand.motionX) + frameCommand.motionWidth > wire.motionWidth ||
+            static_cast<uint64_t>(frameCommand.motionY) + frameCommand.motionHeight > wire.motionHeight ||
+            (wire.depthFormat != DXGI_FORMAT_UNKNOWN &&
+             (static_cast<uint64_t>(frameCommand.depthX) + frameCommand.guideWidth > wire.depthWidth ||
+              static_cast<uint64_t>(frameCommand.depthY) + frameCommand.guideHeight > wire.depthHeight)) ||
+            !std::isfinite(frameCommand.motionScaleX) || !std::isfinite(frameCommand.motionScaleY))
             throw std::runtime_error("Invalid frame control");
         ComPtr<ID3D12CommandAllocator> allocator;
         auto commands = Commands(device.Get(), allocator);
         if (frameNumber > 1)
             for (auto* input : { &frame.color, &frame.depth, &frame.motion })
-                Barrier(commands.Get(), input->texture.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                        D3D12_RESOURCE_STATE_COPY_DEST);
+                if (input->texture)
+                    Barrier(commands.Get(), input->texture.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_COPY_DEST);
         auto prepare = [&](Surface& surface, D3D12_RESOURCE_STATES& state)
         {
             if (state == D3D12_RESOURCE_STATE_COPY_DEST)
@@ -228,7 +247,8 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
             prepare(*clamps[i], clampStates[i]);
         Barrier(commands.Get(), peer.Buffer(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
         CopyFromShared(commands.Get(), peer.Buffer(), frame.color, 0);
-        CopyFromShared(commands.Get(), peer.Buffer(), frame.depth, wire.depthOffset);
+        if (frame.depth.texture)
+            CopyFromShared(commands.Get(), peer.Buffer(), frame.depth, wire.depthOffset);
         CopyFromShared(commands.Get(), peer.Buffer(), frame.motion, wire.motionOffset);
         ID3D12Resource* passInput = frame.color.texture.Get();
         Surface* finalOutput = nullptr;
@@ -257,6 +277,14 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
             request.tone = dynamic.tone;
             request.skin = dynamic.skin;
             request.autoMask = dynamic.autoMask;
+            request.guideWidth = frameCommand.guideWidth;
+            request.guideHeight = frameCommand.guideHeight;
+            request.motionWidth = frameCommand.motionWidth;
+            request.motionHeight = frameCommand.motionHeight;
+            request.depthX = frameCommand.depthX;
+            request.depthY = frameCommand.depthY;
+            request.motionX = frameCommand.motionX;
+            request.motionY = frameCommand.motionY;
             request.invertedDepth = static_cast<int>(frameCommand.invertedDepth);
             request.motionScaleX = frameCommand.motionScaleX;
             request.motionScaleY = frameCommand.motionScaleY;

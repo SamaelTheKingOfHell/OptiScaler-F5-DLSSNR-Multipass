@@ -43,15 +43,26 @@ class FrameTransfer
                actual.Height == expected.Height && actual.DepthOrArraySize == 1 && actual.MipLevels == 1 &&
                actual.SampleDesc.Count == 1 && actual.SampleDesc.Quality == 0 && actual.Format == expected.Format;
     }
-    static HRESULT GetLayout(ID3D12Device* primary, ID3D12Device* secondary, ID3D12Resource* texture,
-                             DXGI_FORMAT format, Layout& result)
+    static bool ColorFormat(DXGI_FORMAT f)
+    {
+        return f == DXGI_FORMAT_R16G16B16A16_FLOAT || f == DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
+    static bool DepthFormat(DXGI_FORMAT f)
+    {
+        return f == DXGI_FORMAT_R32_FLOAT || f == DXGI_FORMAT_R16_FLOAT || f == DXGI_FORMAT_R16_UNORM;
+    }
+    static bool MotionFormat(DXGI_FORMAT f)
+    {
+        return f == DXGI_FORMAT_R16G16_FLOAT || f == DXGI_FORMAT_R32G32_FLOAT || f == DXGI_FORMAT_R16G16_SNORM;
+    }
+    static HRESULT GetLayout(ID3D12Device* primary, ID3D12Device* secondary, ID3D12Resource* texture, Layout& result)
     {
         if (!SameIdentity(texture, primary))
             return E_INVALIDARG;
         const auto desc = texture->GetDesc();
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !desc.Width || !desc.Height || desc.Width > 16384 ||
             desc.Height > 16384 || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 || desc.SampleDesc.Count != 1 ||
-            desc.SampleDesc.Quality != 0 || desc.Format != format)
+            desc.SampleDesc.Quality != 0)
             return E_NOTIMPL;
         Layout other;
         result.desc = desc;
@@ -102,20 +113,21 @@ class FrameTransfer
         if (!primary || !secondary)
             return E_INVALIDARG;
         FrameTransfer result;
-        HRESULT hr = GetLayout(primary, secondary, color, DXGI_FORMAT_R16G16B16A16_FLOAT, result.color_);
-        if (FAILED(hr))
-            return hr;
-        hr = GetLayout(primary, secondary, depth, DXGI_FORMAT_R32_FLOAT, result.depth_);
-        if (FAILED(hr))
-            return hr;
-        hr = GetLayout(primary, secondary, motion, DXGI_FORMAT_R16G16_FLOAT, result.motion_);
-        if (FAILED(hr))
-            return hr;
-        if (result.color_.desc.Width != result.depth_.desc.Width ||
-            result.color_.desc.Height != result.depth_.desc.Height ||
-            result.color_.desc.Width != result.motion_.desc.Width ||
-            result.color_.desc.Height != result.motion_.desc.Height)
+        if (!color || !motion || !ColorFormat(color->GetDesc().Format) || !MotionFormat(motion->GetDesc().Format) ||
+            (depth && !DepthFormat(depth->GetDesc().Format)))
             return E_NOTIMPL;
+        HRESULT hr = GetLayout(primary, secondary, color, result.color_);
+        if (FAILED(hr))
+            return hr;
+        if (depth)
+        {
+            hr = GetLayout(primary, secondary, depth, result.depth_);
+            if (FAILED(hr))
+                return hr;
+        }
+        hr = GetLayout(primary, secondary, motion, result.motion_);
+        if (FAILED(hr))
+            return hr;
         constexpr uint64_t align = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
         constexpr uint64_t max = (std::numeric_limits<uint64_t>::max)();
         if (result.color_.bytes > max - (align - 1))
@@ -142,6 +154,13 @@ class FrameTransfer
         InitialFrameWire wire {};
         wire.width = static_cast<uint32_t>(color_.desc.Width);
         wire.height = color_.desc.Height;
+        wire.colorFormat = color_.desc.Format;
+        wire.depthFormat = depth_.desc.Format;
+        wire.depthWidth = static_cast<uint32_t>(depth_.desc.Width);
+        wire.depthHeight = depth_.desc.Height;
+        wire.motionFormat = motion_.desc.Format;
+        wire.motionWidth = static_cast<uint32_t>(motion_.desc.Width);
+        wire.motionHeight = motion_.desc.Height;
         wire.frameCount = 0;
         wire.passCount = passes;
         wire.bytes = buffer_.Size();
@@ -158,23 +177,27 @@ class FrameTransfer
         wire.secondary = secondary_;
         return wire;
     }
-    // All three textures must be in COPY_SOURCE and the shared buffer must be in COMMON.
+    // Present textures must be in COPY_SOURCE and the shared buffer must be in COMMON.
     HRESULT RecordOutbound(ID3D12GraphicsCommandList* commands, ID3D12Resource* color, ID3D12Resource* depth,
                            ID3D12Resource* motion) const
     {
+        const bool hasDepth = depth_.desc.Format != DXGI_FORMAT_UNKNOWN;
         if (!buffer_.PrimaryBuffer() || !SameIdentity(commands, primary_.Get()) ||
-            !SameIdentity(color, primary_.Get()) || !SameIdentity(depth, primary_.Get()) ||
-            !SameIdentity(motion, primary_.Get()) || !Compatible(color, color_.desc) ||
-            !Compatible(depth, depth_.desc) || !Compatible(motion, motion_.desc))
+            !SameIdentity(color, primary_.Get()) || !SameIdentity(motion, primary_.Get()) ||
+            !Compatible(color, color_.desc) || !Compatible(motion, motion_.desc) ||
+            (hasDepth ? (!SameIdentity(depth, primary_.Get()) || !Compatible(depth, depth_.desc)) : depth != nullptr))
             return E_INVALIDARG;
         Barrier(commands, buffer_.PrimaryBuffer(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-        for (const auto& item :
-             { std::pair<ID3D12Resource*, const Layout*> { color, &color_ }, { depth, &depth_ }, { motion, &motion_ } })
+        const auto copy = [&](ID3D12Resource* resource, const Layout& layout)
         {
-            auto src = Texture(item.first);
-            auto dst = Shared(*item.second);
+            auto src = Texture(resource);
+            auto dst = Shared(layout);
             commands->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-        }
+        };
+        copy(color, color_);
+        if (hasDepth)
+            copy(depth, depth_);
+        copy(motion, motion_);
         Barrier(commands, buffer_.PrimaryBuffer(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
         return S_OK;
     }

@@ -28,14 +28,22 @@ using DlssNr::Worker::InterpassClamp;
 struct Frame
 {
     NrFixture::Surface color, depth, motion, output;
-    unsigned width, height;
-    explicit Frame(ID3D12Device* device, unsigned requestedWidth, unsigned requestedHeight)
-        : width(requestedWidth), height(requestedHeight)
+    unsigned width, height, guideWidth, guideHeight, guideX, guideY;
+    DXGI_FORMAT colorFormat;
+    explicit Frame(ID3D12Device* device, unsigned requestedWidth, unsigned requestedHeight, bool noDepth,
+                   bool halfGuides, bool rgba8, bool offsetGuides)
+        : width(requestedWidth), height(requestedHeight),
+          guideWidth(halfGuides ? (requestedWidth + 1) / 2 : requestedWidth),
+          guideHeight(halfGuides ? (requestedHeight + 1) / 2 : requestedHeight), guideX(offsetGuides ? 2u : 0u),
+          guideY(offsetGuides ? 2u : 0u),
+          colorFormat(rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT)
     {
-        if (!NrFixture::MakeSurface(device, DXGI_FORMAT_R16G16B16A16_FLOAT, false, color, width, height) ||
-            !NrFixture::MakeSurface(device, DXGI_FORMAT_R32_FLOAT, false, depth, width, height) ||
-            !NrFixture::MakeSurface(device, DXGI_FORMAT_R16G16_FLOAT, false, motion, width, height) ||
-            !NrFixture::MakeSurface(device, DXGI_FORMAT_R16G16B16A16_FLOAT, true, output, width, height))
+        if (!NrFixture::MakeSurface(device, colorFormat, false, color, width, height) ||
+            (!noDepth && !NrFixture::MakeSurface(device, DXGI_FORMAT_R32_FLOAT, false, depth, guideWidth + guideX,
+                                                 guideHeight + guideY)) ||
+            !NrFixture::MakeSurface(device, DXGI_FORMAT_R16G16_FLOAT, false, motion, guideWidth + guideX,
+                                    guideHeight + guideY) ||
+            !NrFixture::MakeSurface(device, colorFormat, true, output, width, height))
             throw std::runtime_error("Could not create neural textures");
         if (color.bytes != output.bytes)
             throw std::runtime_error("Incompatible output footprint");
@@ -56,11 +64,19 @@ static void Fill(NrFixture::Surface& surface, unsigned kind)
         auto* row = mapped + y * surface.footprint.Footprint.RowPitch;
         if (kind == 0 || kind == 4)
         {
-            auto* half = reinterpret_cast<uint16_t*>(row);
             for (unsigned x = 0; x < surface.texture->GetDesc().Width; ++x)
             {
-                half[4 * x] = half[4 * x + 1] = half[4 * x + 2] = kind == 0 ? 0x3800 : 0x3400;
-                half[4 * x + 3] = 0x3c00;
+                if (surface.texture->GetDesc().Format == DXGI_FORMAT_R8G8B8A8_UNORM)
+                {
+                    row[4 * x] = row[4 * x + 1] = row[4 * x + 2] = kind == 0 ? 128 : 64;
+                    row[4 * x + 3] = 255;
+                }
+                else
+                {
+                    auto* half = reinterpret_cast<uint16_t*>(row);
+                    half[4 * x] = half[4 * x + 1] = half[4 * x + 2] = kind == 0 ? 0x3800 : 0x3400;
+                    half[4 * x + 3] = 0x3c00;
+                }
             }
         }
         else if (kind == 1)
@@ -118,8 +134,12 @@ static DlssNr::Worker::Evaluation MakeEvaluation(Frame& frame, bool reset)
     request.depth = frame.depth.texture.Get();
     request.motion = frame.motion.texture.Get();
     request.output = frame.output.texture.Get();
-    request.width = request.guideWidth = request.motionWidth = frame.width;
-    request.height = request.guideHeight = request.motionHeight = frame.height;
+    request.width = frame.width;
+    request.height = frame.height;
+    request.guideWidth = request.motionWidth = frame.guideWidth;
+    request.guideHeight = request.motionHeight = frame.guideHeight;
+    request.depthX = request.motionX = frame.guideX;
+    request.depthY = request.motionY = frame.guideY;
     request.reset = reset ? 1 : 0;
     return request;
 }
@@ -152,7 +172,8 @@ static ComPtr<ID3D12GraphicsCommandList> Commands(ID3D12Device* device, ComPtr<I
 }
 static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* model, const wchar_t* parentData,
                   const wchar_t* workerData, const wchar_t* log, const wchar_t* workerExe, bool primaryPass,
-                  unsigned secondaryPasses, unsigned width, unsigned height, bool failureTest, bool resetSecondFrame)
+                  unsigned secondaryPasses, unsigned width, unsigned height, bool failureTest, bool resetSecondFrame,
+                  bool noDepth, bool halfGuides, bool rgba8, bool offsetGuides)
 {
     MEMORYSTATUSEX memory { sizeof(memory) };
     if (!GlobalMemoryStatusEx(&memory) || memory.ullAvailPageFile < 8ull * 1024 * 1024 * 1024)
@@ -203,13 +224,14 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
     std::wcout << L"Primary: " << primaryDesc.Description << L"; secondary: " << secondary.description.Description
                << L"\n"
                << std::flush;
-    Frame frame(primary.Get(), width, height);
+    Frame frame(primary.Get(), width, height, noDepth, halfGuides, rgba8, offsetGuides);
     Fill(frame.color, 0);
-    Fill(frame.depth, 1);
+    if (frame.depth.texture)
+        Fill(frame.depth, 1);
     Fill(frame.motion, 2);
     Fill(frame.output, 3);
     NrFixture::Surface primaryClamped;
-    if (!NrFixture::MakeSurface(primary.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, true, primaryClamped, width, height))
+    if (!NrFixture::MakeSurface(primary.Get(), frame.colorFormat, true, primaryClamped, width, height))
         throw std::runtime_error("Create primary clamp texture failed");
     Fill(primaryClamped, 3);
     InterpassClamp primaryClamp(primary.Get(), width, height);
@@ -264,6 +286,12 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
         {
             DlssNr::Worker::FrameCommand frameCommand {};
             frameCommand.frameNumber = frameNumber;
+            frameCommand.guideWidth = frame.guideWidth;
+            frameCommand.guideHeight = frame.guideHeight;
+            frameCommand.motionWidth = frame.guideWidth;
+            frameCommand.motionHeight = frame.guideHeight;
+            frameCommand.depthX = frameCommand.motionX = frame.guideX;
+            frameCommand.depthY = frameCommand.motionY = frame.guideY;
             frameCommand.resetMask = frameNumber == 1 || resetSecondFrame ? ((1u << secondaryPasses) - 1u) : 0u;
             auto wrongFrame = frameCommand;
             wrongFrame.frameNumber++;
@@ -288,8 +316,9 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
                                                : D3D12_RESOURCE_STATE_COPY_SOURCE,
                                    D3D12_RESOURCE_STATE_COPY_DEST);
                 for (auto* input : { &frame.depth, &frame.motion })
-                    NrFixture::Barrier(commands.Get(), input->texture.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
-                                       D3D12_RESOURCE_STATE_COPY_DEST);
+                    if (input->texture)
+                        NrFixture::Barrier(commands.Get(), input->texture.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                           D3D12_RESOURCE_STATE_COPY_DEST);
                 NrFixture::Barrier(commands.Get(), frame.output.texture.Get(),
                                    primaryPass ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                                                : D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -300,7 +329,8 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
             }
             CopyUpload(commands.Get(), frame.color,
                        primaryPass ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_SOURCE);
-            CopyUpload(commands.Get(), frame.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (frame.depth.texture)
+                CopyUpload(commands.Get(), frame.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             CopyUpload(commands.Get(), frame.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             CopyUpload(commands.Get(), frame.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             if (primaryPass)
@@ -317,8 +347,9 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
             else
                 NrFixture::Barrier(commands.Get(), frame.output.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                    D3D12_RESOURCE_STATE_COPY_SOURCE);
-            NrFixture::Barrier(commands.Get(), frame.depth.texture.Get(),
-                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            if (frame.depth.texture)
+                NrFixture::Barrier(commands.Get(), frame.depth.texture.Get(),
+                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
             NrFixture::Barrier(commands.Get(), frame.motion.texture.Get(),
                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
             // This is an owned list: prove that recorded primary work can be submitted before a
@@ -366,8 +397,7 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
             auto readback =
                 Buffer(primary.Get(), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, frame.color.bytes);
             NrFixture::Surface returnedColor;
-            if (!NrFixture::MakeSurface(primary.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, false, returnedColor, width,
-                                        height))
+            if (!NrFixture::MakeSurface(primary.Get(), frame.colorFormat, false, returnedColor, width, height))
                 throw std::runtime_error("Create returned primary texture failed");
             ComPtr<ID3D12CommandAllocator> inboundAllocator;
             auto inbound = Commands(primary.Get(), inboundAllocator);
@@ -391,13 +421,15 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
             uint64_t checksum = 1469598103934665603ull;
             for (UINT y = 0; y < frame.color.rows; ++y)
             {
-                auto* row = reinterpret_cast<const uint16_t*>(mapped + y * frame.color.footprint.Footprint.RowPitch);
+                auto* row = mapped + y * frame.color.footprint.Footprint.RowPitch;
                 for (unsigned x = 0; x < width; ++x)
                     for (unsigned c = 0; c < 3; ++c)
                     {
-                        const uint16_t value = row[x * 4 + c];
-                        finite = finite && (value & 0x7c00u) != 0x7c00u;
-                        nonzero = nonzero || (value & 0x7fffu) != 0;
+                        const uint16_t value =
+                            rgba8 ? row[x * 4 + c] : reinterpret_cast<const uint16_t*>(row)[x * 4 + c];
+                        if (!rgba8)
+                            finite = finite && (value & 0x7c00u) != 0x7c00u;
+                        nonzero = nonzero || (rgba8 ? value != 0 : (value & 0x7fffu) != 0);
                         checksum = (checksum ^ value) * 1099511628211ull;
                     }
             }
@@ -428,9 +460,10 @@ int wmain(int argc, wchar_t** argv)
 {
     try
     {
-        if (argc >= 11 && argc <= 14)
+        if (argc >= 11 && argc <= 18)
         {
-            bool primaryPass = true, failureTest = false, resetSecondFrame = false;
+            bool primaryPass = true, failureTest = false, resetSecondFrame = false, noDepth = false, halfGuides = false,
+                 rgba8 = false, offsetGuides = false;
             for (int i = 11; i < argc; ++i)
             {
                 if (std::wcscmp(argv[i], L"--no-primary") == 0 && primaryPass)
@@ -439,6 +472,14 @@ int wmain(int argc, wchar_t** argv)
                     failureTest = true;
                 else if (std::wcscmp(argv[i], L"--reset-second-frame") == 0 && !resetSecondFrame)
                     resetSecondFrame = true;
+                else if (std::wcscmp(argv[i], L"--no-depth") == 0 && !noDepth)
+                    noDepth = true;
+                else if (std::wcscmp(argv[i], L"--half-guides") == 0 && !halfGuides)
+                    halfGuides = true;
+                else if (std::wcscmp(argv[i], L"--rgba8") == 0 && !rgba8)
+                    rgba8 = true;
+                else if (std::wcscmp(argv[i], L"--offset-guides") == 0 && !offsetGuides)
+                    offsetGuides = true;
                 else
                     return 2;
             }
@@ -452,7 +493,7 @@ int wmain(int argc, wchar_t** argv)
                 return 2;
             return Parent(argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], primaryPass,
                           static_cast<unsigned>(passes), static_cast<unsigned>(width), static_cast<unsigned>(height),
-                          failureTest, resetSecondFrame);
+                          failureTest, resetSecondFrame, noDepth, halfGuides, rgba8, offsetGuides);
         }
         std::cerr << "Expected core, forwarder, model, primary data, worker data, worker log, executable, pass count "
                      "and dimensions.\n";

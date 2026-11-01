@@ -1,3 +1,8 @@
+## 2026-11-01 — Worker guide layouts (WIP)
+
+- Added optional depth, independently sized depth and motion textures, guide subrect coordinates and RGBA8 color to the worker protocol and frame transport. Unsupported formats and out-of-bounds guide regions are rejected. Additional typed guide formats are accepted but not yet validated with a model.
+- OpenAI Codex, GPT-6 (exact model and effort unavailable). The Release worker completed two synthetic frames on RTX 5070 Ti and RTX 3060 with half-size guides, with depth omitted, and with RGBA8 color plus offset guide subrects. No game integration, visual quality or performance claim is implied.
+
 ## 2026-11-01 — Worker client and frame transfer (WIP)
 
 - Added a host worker client with an asynchronous initialization handshake, one in-flight frame, peer-exit detection and an explicit primary-GPU retirement acknowledgement. Added a validated, shared-buffer color/depth/motion transfer generation. These components are not yet called from the application.
