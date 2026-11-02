@@ -190,7 +190,7 @@ class WorkerClient
             startup.lpAttributeList = list;
             PROCESS_INFORMATION child {};
             if (!CreateProcessW(executable, command.data(), nullptr, nullptr, TRUE,
-                                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW, nullptr, nullptr,
+                                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW, nullptr, data,
                                 &startup.StartupInfo, &child))
                 return LastErrorResult();
             process_.value = child.hProcess;

@@ -11,6 +11,8 @@ std::weak_ptr<WorkerGeneration> retired;
 std::wstring currentKey, failedKey;
 bool primaryFeatureSkipped = false;
 uint64_t successfulFrames = 0;
+double handoffSum = 0.0, handoffMax = 0.0;
+unsigned handoffSamples = 0;
 
 void RetireCurrent()
 {
@@ -37,6 +39,7 @@ void Disabled()
     DlssNr::Worker::currentStatus.store(DlssNr::Worker::Status::Disabled, std::memory_order_relaxed);
     RetireCurrent();
     failedKey.clear();
+    DlssNr::Worker::handoffMilliseconds.store(0.0f, std::memory_order_relaxed);
 }
 
 std::wstring Key(ID3D12Device* primary, ID3D12Resource* color, ID3D12Resource* depth, ID3D12Resource* motion,
@@ -149,7 +152,17 @@ std::shared_ptr<WorkerGeneration> Prepare(ID3D12Device* primary, ID3D12Resource*
                     DlssNr::Worker::UnavailableReason::Transfer);
     }
     const auto model = FindSelectedModel();
-    const auto worker = Util::FindFilePath(g_dllDir, "dlssnr_worker.exe");
+    // The worker must not run beside the game's dxgi.dll proxy: the Windows
+    // loader would inject OptiScaler into its own helper process.
+    std::optional<std::filesystem::path> worker;
+    const auto exeDir = Util::ExePath().remove_filename();
+    for (const auto& candidate : { g_dllDir / L"OptiScaler" / L"NR-Worker" / L"dlssnr_worker.exe",
+                                   g_dllDir / L"NR-Worker" / L"dlssnr_worker.exe",
+                                   exeDir / L"OptiScaler" / L"NR-Worker" / L"dlssnr_worker.exe" })
+    {
+        std::error_code error;
+        if (std::filesystem::is_regular_file(candidate, error) && !error) { worker = candidate; break; }
+    }
     const auto coreDir = Util::NvngxPath();
     if (!model || !worker || !coreDir || !g_nr.forwarder)
         return fail("the worker, model or NVIDIA core is missing", DlssNr::Worker::UnavailableReason::MissingFiles);
@@ -190,6 +203,9 @@ std::shared_ptr<WorkerGeneration> Prepare(ID3D12Device* primary, ID3D12Resource*
     current = std::move(next);
     currentKey = key;
     successfulFrames = 0;
+    handoffSum = handoffMax = 0.0;
+    handoffSamples = 0;
+    DlssNr::Worker::handoffMilliseconds.store(0.0f, std::memory_order_relaxed);
     DlssNr::Worker::currentStatus.store(DlssNr::Worker::Status::Starting, std::memory_order_relaxed);
     LOG_INFO("DLSS-NR multi-GPU: starting {} secondary passes on {}", total - first,
              wstring_to_string(secondary.description.Description));

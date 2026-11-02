@@ -2,6 +2,8 @@
 #include "../../OptiScaler/dlssnr/DlssNr_WorkerFenceWait.h"
 #include "nr_cross_adapter_test_helpers.h"
 #include <cwchar>
+#include <thread>
+#include <chrono>
 
 using DlssNr::MultiGpu::WaitForFenceOrPeer;
 using DlssNr::MultiGpu::WorkerFenceWaitResult;
@@ -24,7 +26,12 @@ int wmain(int argc, wchar_t** argv)
         ComPtr<IDXGIAdapter1> adapter;
         Check(factory->EnumAdapters1(0, &adapter), "Select adapter");
         ComPtr<ID3D12Device> device;
-        Check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "Create device");
+        if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))))
+        {
+            adapter.Reset();
+            Check(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)), "Select WARP adapter");
+            Check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)), "Create WARP device");
+        }
         ComPtr<ID3D12Fence> fence;
         Check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "Create fence");
         HANDLE realSelf = nullptr;
@@ -40,6 +47,24 @@ int wmain(int argc, wchar_t** argv)
         Check(fence->Signal(1), "Signal fence");
         Expect(WaitForFenceOrPeer(fence.Get(), 1, realSelf, 1), WorkerFenceWaitResult::Ready,
                "Signalled fence was not ready");
+        // More timed-out waits than the event pool can hold must remain bounded,
+        // then recover when the registered fence values eventually complete.
+        DWORD saturatedHandles = 0, afterHandles = 0;
+        for (uint64_t ticket = 2; ticket < 34; ++ticket)
+            Expect(WaitForFenceOrPeer(fence.Get(), ticket, realSelf, 1), WorkerFenceWaitResult::Timeout,
+                   "Unsignalled fence did not time out under load");
+        if (!GetProcessHandleCount(GetCurrentProcess(), &saturatedHandles))
+            throw std::runtime_error("Could not read handle count");
+        for (uint64_t ticket = 34; ticket < 66; ++ticket)
+            Expect(WaitForFenceOrPeer(fence.Get(), ticket, realSelf, 1), WorkerFenceWaitResult::Timeout,
+                   "Saturated fence waits did not time out");
+        if (!GetProcessHandleCount(GetCurrentProcess(), &afterHandles) || afterHandles > saturatedHandles + 8)
+            throw std::runtime_error("Timed-out fence waits exceeded the event handle bound");
+        Check(fence->Signal(66), "Signal timed-out registrations");
+        std::thread signal([&] { std::this_thread::sleep_for(std::chrono::milliseconds(25)); fence->Signal(67); });
+        const auto signalled = WaitForFenceOrPeer(fence.Get(), 67, realSelf, 1000);
+        signal.join();
+        Expect(signalled, WorkerFenceWaitResult::Ready, "Asynchronous fence completion was not observed");
         CloseHandle(realSelf);
         wchar_t path[32768] {};
         DWORD length = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)));
@@ -53,7 +78,7 @@ int wmain(int argc, wchar_t** argv)
                             &child))
             throw std::runtime_error("Could not start peer process");
         CloseHandle(child.hThread);
-        const auto result = WaitForFenceOrPeer(fence.Get(), 2, child.hProcess, 30000);
+        const auto result = WaitForFenceOrPeer(fence.Get(), 68, child.hProcess, 30000);
         const DWORD waited = WaitForSingleObject(child.hProcess, 30000);
         CloseHandle(child.hProcess);
         Expect(result, WorkerFenceWaitResult::PeerExited, "Peer exit did not interrupt unsignalled fence wait");

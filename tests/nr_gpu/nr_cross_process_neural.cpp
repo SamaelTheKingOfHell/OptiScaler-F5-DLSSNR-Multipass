@@ -13,8 +13,11 @@
 #include "../../OptiScaler/dlssnr/worker/WorkerFrameHandoff.h"
 #include "../../OptiScaler/dlssnr/worker/WorkerGeneration.h"
 #include <d3d12sdklayers.h>
+#include <psapi.h>
 #include <cwchar>
 #include <limits>
+#include <chrono>
+#include <algorithm>
 
 struct OwnedHandle
 {
@@ -157,6 +160,33 @@ static void Evaluate(DlssNr::Worker::ModelSession& session, ID3D12GraphicsComman
         throw std::runtime_error("Neural evaluation failed");
     }
 }
+
+static void CheckWorkerDxgi(HANDLE process)
+{
+    HMODULE modules[1024] {};
+    DWORD bytes = 0;
+    if (!EnumProcessModules(process, modules, sizeof(modules), &bytes) || bytes > sizeof(modules))
+        throw std::runtime_error("Could not inspect worker modules");
+    wchar_t system[MAX_PATH] {};
+    if (!GetSystemDirectoryW(system, MAX_PATH))
+        throw std::runtime_error("Could not identify the system directory");
+    const std::wstring expected = std::wstring(system) + L"\\dxgi.dll";
+    bool found = false;
+    for (DWORD i = 0; i < bytes / sizeof(HMODULE); ++i)
+    {
+        wchar_t path[32768] {};
+        if (!GetModuleFileNameExW(process, modules[i], path, static_cast<DWORD>(std::size(path)))) continue;
+        const wchar_t* name = std::wcsrchr(path, L'\\');
+        if (name && _wcsicmp(name + 1, L"dxgi.dll") == 0)
+        {
+            if (_wcsicmp(path, expected.c_str()) != 0)
+                throw std::runtime_error("Worker loaded a non-system DXGI proxy");
+            found = true;
+        }
+    }
+    if (!found) throw std::runtime_error("Worker system DXGI was not found");
+    std::cout << "Worker uses system DXGI rather than the game proxy.\n";
+}
 static ComPtr<ID3D12GraphicsCommandList> Commands(ID3D12Device* device, ComPtr<ID3D12CommandAllocator>& allocator)
 {
     Check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)),
@@ -170,7 +200,8 @@ static ComPtr<ID3D12GraphicsCommandList> Commands(ID3D12Device* device, ComPtr<I
 static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* model, const wchar_t* parentData,
                   const wchar_t* workerData, const wchar_t* log, const wchar_t* workerExe, bool primaryPass,
                   unsigned secondaryPasses, unsigned width, unsigned height, bool failureTest, bool resetSecondFrame,
-                  bool noDepth, bool halfGuides, bool rgba8, bool offsetGuides, bool invalidGuides, bool depthStencil)
+                  bool noDepth, bool halfGuides, bool rgba8, bool offsetGuides, bool invalidGuides, bool depthStencil,
+                  bool benchmark, bool verifyIsolation, bool mainPreset)
 {
     MEMORYSTATUSEX memory { sizeof(memory) };
     if (!GlobalMemoryStatusEx(&memory) || memory.ullAvailPageFile < 8ull * 1024 * 1024 * 1024)
@@ -250,6 +281,8 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
     std::cout << "Primary model initialized; starting isolated secondary.\n" << std::flush;
     Wire wire = frameTransfer.MakeWire(secondaryPasses);
     wire.enableDebug = 1;
+    if (mainPreset)
+        for (unsigned i = 0; i < secondaryPasses; ++i) wire.passes[i].preset = 1;
     {
         auto invalid = wire;
         invalid.secondary = invalid.primary;
@@ -276,12 +309,16 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
         throw std::runtime_error("Worker initialization failed");
     if (immediate == E_PENDING)
         Check(generation.Poll(60000), "Wait for worker initialization");
+    if (verifyIsolation)
+        CheckWorkerDxgi(generation.ProcessHandle());
     auto& worker = generation.TestingClient();
     bool submitted = false;
     try
     {
         uint64_t previousChecksum = 0;
-        for (uint64_t frameNumber = 1; frameNumber <= 2; ++frameNumber)
+        std::vector<double> handoffTimes;
+        const uint64_t frameCount = benchmark ? 30 : 2;
+        for (uint64_t frameNumber = 1; frameNumber <= frameCount; ++frameNumber)
         {
             DlssNr::Worker::FrameCommand frameCommand {};
             frameCommand.frameNumber = frameNumber;
@@ -381,8 +418,12 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
                           << std::flush;
                 return 0;
             }
+            const auto handoffStart = std::chrono::steady_clock::now();
             const auto handoff = generation.Submit(chain, session.Queue(), frameCommand, outboundColor,
                                                    frame.depth.texture.Get(), frame.motion.texture.Get(), 60000);
+            if (benchmark && frameNumber > 1)
+                handoffTimes.push_back(std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - handoffStart).count());
             if (invalidGuides)
             {
                 if (handoff.result != E_ABORT || handoff.phase != DlssNr::Worker::HandoffPhase::OutboundSignalled)
@@ -446,16 +487,22 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
             readback->Unmap(0, &noWrite);
             if (!finite || !nonzero)
                 throw std::runtime_error("Returned neural output was nonfinite or empty");
-            if (frameNumber > 1 && checksum == previousChecksum)
+            if (frameNumber == 2 && checksum == previousChecksum)
                 throw std::runtime_error("Distinct frames returned identical output");
             previousChecksum = checksum;
             std::cout << "Frame " << frameNumber << " returned to a primary GPU texture; checksum " << std::hex
                       << checksum << std::dec << "\n"
                       << std::flush;
         }
+        if (!handoffTimes.empty())
+        {
+            std::sort(handoffTimes.begin(), handoffTimes.end());
+            std::cout << "Handoff latency median=" << handoffTimes[handoffTimes.size() / 2]
+                      << " ms p95=" << handoffTimes[(handoffTimes.size() * 95) / 100] << " ms\n";
+        }
         Check(generation.Stop(30000), "Stop worker");
         std::cout << (primaryPass ? "One primary pass and " : "") << secondaryPasses
-                  << " secondary passes evaluated two sequential frames; worker exited cleanly.\n"
+                  << " secondary passes evaluated " << frameCount << " sequential frames; worker exited cleanly.\n"
                   << std::flush;
     }
     catch (...)
@@ -470,10 +517,11 @@ int wmain(int argc, wchar_t** argv)
 {
     try
     {
-        if (argc >= 11 && argc <= 20)
+        if (argc >= 11 && argc <= 23)
         {
             bool primaryPass = true, failureTest = false, resetSecondFrame = false, noDepth = false, halfGuides = false,
-                 rgba8 = false, offsetGuides = false, invalidGuides = false, depthStencil = false;
+                 rgba8 = false, offsetGuides = false, invalidGuides = false, depthStencil = false, benchmark = false,
+                 verifyIsolation = false, mainPreset = false;
             for (int i = 11; i < argc; ++i)
             {
                 if (std::wcscmp(argv[i], L"--no-primary") == 0 && primaryPass)
@@ -494,6 +542,12 @@ int wmain(int argc, wchar_t** argv)
                     invalidGuides = true;
                 else if (std::wcscmp(argv[i], L"--depth-stencil") == 0 && !depthStencil)
                     depthStencil = true;
+                else if (std::wcscmp(argv[i], L"--benchmark") == 0 && !benchmark)
+                    benchmark = true;
+                else if (std::wcscmp(argv[i], L"--verify-isolation") == 0 && !verifyIsolation)
+                    verifyIsolation = true;
+                else if (std::wcscmp(argv[i], L"--main-preset") == 0 && !mainPreset)
+                    mainPreset = true;
                 else
                     return 2;
             }
@@ -508,7 +562,7 @@ int wmain(int argc, wchar_t** argv)
             return Parent(argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], primaryPass,
                           static_cast<unsigned>(passes), static_cast<unsigned>(width), static_cast<unsigned>(height),
                           failureTest, resetSecondFrame, noDepth, halfGuides, rgba8, offsetGuides, invalidGuides,
-                          depthStencil);
+                          depthStencil, benchmark, verifyIsolation, mainPreset);
         }
         std::cerr << "Expected core, forwarder, model, primary data, worker data, worker log, executable, pass count "
                      "and dimensions.\n";

@@ -4198,6 +4198,8 @@ static void RenderPassesPage(Config* config, float menuResScale)
 
     ImGui::TextWrapped("Settings apply when you release a slider.");
     ImGui::TextWrapped("Second GPU: %s", DlssNr::Worker::StatusText());
+    if (DlssNr::Worker::currentStatus.load(std::memory_order_relaxed) == DlssNr::Worker::Status::Running)
+        ImGui::Text("CPU handoff wait: %.1f ms", DlssNr::Worker::handoffMilliseconds.load(std::memory_order_relaxed));
     if (config->DlssNrDetailReuse.value_or_default() || config->DlssNrEditCache.value_or_default())
         ImGui::TextWrapped("Detail reuse or edit cache can keep passes on the game GPU; turn them off to use the second GPU.");
     const auto gpuReadings = DlssNr::Worker::Telemetry().Readings();

@@ -5759,10 +5759,23 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                         workerContext->needsRetirement = true;
                         DlssNr::Worker::currentStatus.store(DlssNr::Worker::Status::Running,
                                                             std::memory_order_relaxed);
+                        const auto elapsed = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - handoffStarted).count();
+                        const float previousMs = DlssNr::Worker::handoffMilliseconds.load(std::memory_order_relaxed);
+                        DlssNr::Worker::handoffMilliseconds.store(previousMs > 0.0f
+                            ? previousMs * 0.9f + static_cast<float>(elapsed) * 0.1f
+                            : static_cast<float>(elapsed), std::memory_order_relaxed);
+                        MultiGpuRun::handoffSum += elapsed;
+                        MultiGpuRun::handoffMax = std::max(MultiGpuRun::handoffMax, elapsed);
+                        if (++MultiGpuRun::handoffSamples == 300)
+                        {
+                            LOG_INFO("DLSS-NR multi-GPU: 300 CPU handoff waits averaged {:.1f} ms; slowest {:.1f} ms",
+                                     MultiGpuRun::handoffSum / MultiGpuRun::handoffSamples, MultiGpuRun::handoffMax);
+                            MultiGpuRun::handoffSum = MultiGpuRun::handoffMax = 0.0;
+                            MultiGpuRun::handoffSamples = 0;
+                        }
                         if (++MultiGpuRun::successfulFrames == 1 || MultiGpuRun::successfulFrames % 1800 == 0)
                         {
-                            const auto elapsed = std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() - handoffStarted).count();
                             LOG_INFO("DLSS-NR multi-GPU: {} primary passes, {} secondary passes, {}x{}, handoff {:.1f} ms",
                                      pass, effectivePasses - pass, modelWidth, modelHeight, elapsed);
                         }

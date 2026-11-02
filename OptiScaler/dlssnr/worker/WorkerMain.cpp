@@ -9,6 +9,8 @@
 #include <cmath>
 #include <memory>
 #include <iostream>
+#include <chrono>
+#include <algorithm>
 #include <limits>
 #include <vector>
 #include "../DlssNr_CrossAdapterIpc.h"
@@ -78,6 +80,65 @@ static void Retire(ID3D12Device* device, ID3D12CommandQueue* queue)
         ExitProcess(3);
     }
 }
+
+// Used only by the synthetic debug fixture. One readback is reused after each
+// retired frame, and the timings are printed once on shutdown.
+struct DebugGpuTiming
+{
+    ComPtr<ID3D12QueryHeap> queries;
+    ComPtr<ID3D12Resource> readback;
+    UINT64 frequency = 0;
+    std::array<std::vector<double>, 3> samples;
+
+    bool Initialize(ID3D12Device* device, ID3D12CommandQueue* queue)
+    {
+        D3D12_QUERY_HEAP_DESC q {};
+        q.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        q.Count = 4;
+        if (FAILED(device->CreateQueryHeap(&q, IID_PPV_ARGS(&queries))) ||
+            FAILED(queue->GetTimestampFrequency(&frequency)) || !frequency)
+            return false;
+        D3D12_HEAP_PROPERTIES heap {};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC desc {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = 4 * sizeof(UINT64);
+        desc.Height = 1;
+        desc.DepthOrArraySize = desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        return SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                        IID_PPV_ARGS(&readback)));
+    }
+    void Mark(ID3D12GraphicsCommandList* cmd, unsigned index) const
+    {
+        cmd->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, index);
+    }
+    void Resolve(ID3D12GraphicsCommandList* cmd) const
+    {
+        cmd->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 4, readback.Get(), 0);
+    }
+    void Collect()
+    {
+        if (samples[0].size() >= 512) return;
+        D3D12_RANGE read { 0, 4 * sizeof(UINT64) }, noWrite { 0, 0 };
+        UINT64* ticks = nullptr;
+        if (FAILED(readback->Map(0, &read, reinterpret_cast<void**>(&ticks)))) return;
+        for (unsigned i = 0; i < samples.size(); ++i)
+            samples[i].push_back(ticks[i + 1] >= ticks[i]
+                                     ? (ticks[i + 1] - ticks[i]) * 1000.0 / frequency : 0.0);
+        readback->Unmap(0, &noWrite);
+    }
+    void Print()
+    {
+        if (samples[0].empty()) return;
+        for (auto& values : samples) std::sort(values.begin(), values.end());
+        std::cerr << "Worker GPU median: input copies " << samples[0][samples[0].size() / 2]
+                  << " ms, neural passes " << samples[1][samples[1].size() / 2]
+                  << " ms, return copy " << samples[2][samples[2].size() / 2] << " ms.\n";
+    }
+};
 
 static Evaluation MakeEvaluation(Frame& frame, unsigned width, unsigned height, bool reset)
 {
@@ -204,6 +265,9 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
     session.Initialize(device.Get(), core, forwarder, model, data, wire.width, wire.height, tuning, wire.applicationId);
     if (!SetEvent(initialized.value))
         throw std::runtime_error("Could not signal worker initialization");
+    std::vector<double> debugReadyWait, debugGpuCompletion;
+    DebugGpuTiming debugTiming;
+    const bool useGpuTiming = wire.enableDebug && debugTiming.Initialize(device.Get(), session.Queue());
     for (uint64_t frameNumber = 1; !wire.frameCount || frameNumber <= wire.frameCount; ++frameNumber)
     {
         FrameCommand frameCommand {};
@@ -229,6 +293,7 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
             throw std::runtime_error("Invalid frame control");
         ComPtr<ID3D12CommandAllocator> allocator;
         auto commands = Commands(device.Get(), allocator);
+        if (useGpuTiming) debugTiming.Mark(commands.Get(), 0);
         if (frameNumber > 1)
             for (auto* input : { &frame.color, &frame.depth, &frame.motion })
                 if (input->texture)
@@ -251,6 +316,7 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
         if (frame.depth.texture)
             CopyFromShared(commands.Get(), peer.Buffer(), frame.depth, wire.depthOffset);
         CopyFromShared(commands.Get(), peer.Buffer(), frame.motion, wire.motionOffset);
+        if (useGpuTiming) debugTiming.Mark(commands.Get(), 1);
         ID3D12Resource* passInput = frame.color.texture.Get();
         Surface* finalOutput = nullptr;
         for (uint32_t pass = 0; pass < wire.passCount; ++pass)
@@ -315,12 +381,18 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
             clampStates[slot] = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             passInput = clamped.texture.Get();
         }
+        if (useGpuTiming) debugTiming.Mark(commands.Get(), 2);
         Barrier(commands.Get(), peer.Buffer(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
         CopyToShared(commands.Get(), peer.Buffer(), *finalOutput, 0);
         Barrier(commands.Get(), peer.Buffer(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        if (useGpuTiming) { debugTiming.Mark(commands.Get(), 3); debugTiming.Resolve(commands.Get()); }
+        const auto readyStarted = wire.enableDebug ? std::chrono::steady_clock::now()
+                                                   : std::chrono::steady_clock::time_point {};
         if (DlssNr::MultiGpu::WaitForFenceOrPeer(peer.Ready(), frameNumber, parent.value, 30000) !=
             DlssNr::MultiGpu::WorkerFenceWaitResult::Ready)
             throw std::runtime_error("Parent exited or failed before sending the frame");
+        const auto gpuStarted = wire.enableDebug ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point {};
         Submit(session.Queue(), commands.Get());
         if (FAILED(session.Queue()->Signal(peer.Done(), frameNumber)))
         {
@@ -328,10 +400,28 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
             ExitProcess(3);
         }
         Retire(device.Get(), session.Queue());
+        if (useGpuTiming && frameNumber > 1) debugTiming.Collect();
+        if (wire.enableDebug && frameNumber > 1 && debugReadyWait.size() < 512)
+        {
+            debugReadyWait.push_back(std::chrono::duration<double, std::milli>(gpuStarted - readyStarted).count());
+            debugGpuCompletion.push_back(std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - gpuStarted).count());
+        }
     }
     CloseHandle(pipe);
     if (wire.enableDebug)
+    {
         CheckDebug(device.Get());
+        if (!debugReadyWait.empty())
+        {
+            std::sort(debugReadyWait.begin(), debugReadyWait.end());
+            std::sort(debugGpuCompletion.begin(), debugGpuCompletion.end());
+            std::cerr << "Worker timing median: input fence " << debugReadyWait[debugReadyWait.size() / 2]
+                      << " ms, secondary queue completion " << debugGpuCompletion[debugGpuCompletion.size() / 2]
+                      << " ms.\n";
+        }
+        if (useGpuTiming) debugTiming.Print();
+    }
     std::cerr << "Worker neural pass retired successfully.\n" << std::flush;
     return 0;
 }

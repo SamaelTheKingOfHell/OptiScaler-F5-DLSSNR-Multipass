@@ -1,3 +1,8 @@
+## 2026-11-02 — Reduce multi-GPU handoff latency (WIP)
+
+- Replaced timer-based fence polling with completion events and a bounded fallback for timed-out registrations. The worker now runs from `OptiScaler/NR-Worker` with its own working directory, so it does not load the game's DXGI proxy or overwrite the game log. The pass page and periodic log entries show CPU handoff wait time.
+- OpenAI Codex, GPT-6 (exact model and effort unavailable). In a 30-frame synthetic test at 1280x720 on an RTX 5070 Ti and RTX 3060, the smaller model's median handoff fell from 56.6 ms to 17.7 ms; the larger Preset A measured 29.7 ms after the change. These are fixture measurements, not in-game frame rates. Failure, timeout and peer-exit tests passed; game validation remains pending.
+
 ## 2026-11-02 — Per-pass GPU handoff and depth format support (WIP)
 
 - Moved the second-GPU handoff into each pass card. The earliest checked pass starts the secondary sequence; every later pass stays on that GPU. Existing `PrimaryPasses` settings remain compatible. The pass page shows detected adapter names, overall GPU utilization when available, handoff status and a note when reuse or cache can prevent the handoff.

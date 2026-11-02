@@ -14,6 +14,8 @@ enum class Status
     PrimaryOnly
 };
 inline std::atomic<Status> currentStatus { Status::Disabled };
+// Exponential moving average of the synchronous handoff, in milliseconds.
+inline std::atomic<float> handoffMilliseconds { 0.0f };
 enum class UnavailableReason { Other, NoAdapter, Transfer, MissingFiles, Startup };
 inline std::atomic<UnavailableReason> unavailableReason { UnavailableReason::Other };
 inline const char* StatusText()

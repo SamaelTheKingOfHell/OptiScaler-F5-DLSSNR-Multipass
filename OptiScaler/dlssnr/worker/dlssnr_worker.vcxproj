@@ -22,7 +22,7 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup>
     <TargetName>dlssnr_worker</TargetName>
-    <OutDir>$(SolutionDir)x64\$(Configuration)\a\</OutDir>
+    <OutDir>$(SolutionDir)x64\$(Configuration)\a\OptiScaler\NR-Worker\</OutDir>
     <IntDir>$(SolutionDir)x64\$(Configuration)\dlssnr_worker\</IntDir>
   </PropertyGroup>
   <ItemDefinitionGroup>
