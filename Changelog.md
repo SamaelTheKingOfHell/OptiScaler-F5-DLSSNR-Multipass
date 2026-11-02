@@ -1,6 +1,6 @@
 ## 2026-11-02 — Per-pass GPU handoff and depth format support (WIP)
 
-- Moved the second-GPU handoff into each pass card. The earliest checked pass starts the secondary sequence; every later pass stays on that GPU. Existing `PrimaryPasses` settings remain compatible. The pass page shows the detected adapter names, overall GPU utilization when the driver provides it, and the handoff status.
+- Moved the second-GPU handoff into each pass card. The earliest checked pass starts the secondary sequence; every later pass stays on that GPU. Existing `PrimaryPasses` settings remain compatible. The pass page shows detected adapter names, overall GPU utilization when available, handoff status and a note when reuse or cache can prevent the handoff.
 - Added cross-device transport for the R32_FLOAT_X8X24 depth format encountered in a Requiem game session, plus clearer failure diagnostics. OpenAI Codex, GPT-6 (exact model and effort unavailable). A two-GPU synthetic neural fixture passed with this depth format; in-game validation of the change remains pending.
 
 ## 2026-11-01 — Experimental Finished Picture multi-GPU integration (WIP)
