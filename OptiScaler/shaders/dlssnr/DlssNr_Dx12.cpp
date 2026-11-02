@@ -57,6 +57,7 @@
 #include <dlssnr/worker/WorkerDispatch.h>
 #include <dlssnr/worker/WorkerGeneration.h>
 #include <dlssnr/worker/WorkerStatus.h>
+#include <dlssnr/worker/WorkerGpuTelemetry.h>
 
 #include <Config.h>
 #include <State.h>
@@ -5667,8 +5668,11 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     if (g_ngxTime != nullptr)
         g_ngxTime->Start(cmdList);
 
-    const auto placement = DlssNr::MultiGpu::MakePassPlan(
-        effectivePasses, cfg.DlssNrPrimaryPasses.value_or_default(), DlssNr::MaxPassCount);
+    const auto placement = cfg.DlssNrSecondaryPassMask.has_value()
+        ? DlssNr::MultiGpu::MakePassPlanFromMask(effectivePasses, cfg.DlssNrSecondaryPassMask.value(),
+                                                DlssNr::MaxPassCount)
+        : DlssNr::MultiGpu::MakePassPlan(effectivePasses, cfg.DlssNrPrimaryPasses.value_or_default(),
+                                         DlssNr::MaxPassCount);
     const bool fgActive = State::Instance().currentFG && State::Instance().currentFG->IsActive() &&
                           !State::Instance().currentFG->IsPaused();
     const bool multiEligible = workerContext && workerContext->chain && workerContext->queue &&

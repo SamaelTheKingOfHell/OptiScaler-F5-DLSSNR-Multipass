@@ -134,7 +134,8 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
         !wire.parent || !wire.initialized || !wire.bytes ||
         (wire.colorFormat != DXGI_FORMAT_R16G16B16A16_FLOAT && wire.colorFormat != DXGI_FORMAT_R8G8B8A8_UNORM) ||
         (wire.depthFormat != DXGI_FORMAT_UNKNOWN && wire.depthFormat != DXGI_FORMAT_R32_FLOAT &&
-         wire.depthFormat != DXGI_FORMAT_R16_FLOAT && wire.depthFormat != DXGI_FORMAT_R16_UNORM) ||
+         wire.depthFormat != DXGI_FORMAT_R16_FLOAT && wire.depthFormat != DXGI_FORMAT_R16_UNORM &&
+         wire.depthFormat != DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS) ||
         (wire.motionFormat != DXGI_FORMAT_R16G16_FLOAT && wire.motionFormat != DXGI_FORMAT_R32G32_FLOAT &&
          wire.motionFormat != DXGI_FORMAT_R16G16_SNORM) ||
         !wire.motionWidth || !wire.motionHeight || wire.motionWidth > 16384 || wire.motionHeight > 16384 ||

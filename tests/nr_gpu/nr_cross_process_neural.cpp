@@ -33,7 +33,7 @@ struct Frame
     unsigned width, height, guideWidth, guideHeight, guideX, guideY;
     DXGI_FORMAT colorFormat;
     explicit Frame(ID3D12Device* device, unsigned requestedWidth, unsigned requestedHeight, bool noDepth,
-                   bool halfGuides, bool rgba8, bool offsetGuides)
+                   bool halfGuides, bool rgba8, bool offsetGuides, bool depthStencil)
         : width(requestedWidth), height(requestedHeight),
           guideWidth(halfGuides ? (requestedWidth + 1) / 2 : requestedWidth),
           guideHeight(halfGuides ? (requestedHeight + 1) / 2 : requestedHeight), guideX(offsetGuides ? 2u : 0u),
@@ -41,7 +41,8 @@ struct Frame
           colorFormat(rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT)
     {
         if (!NrFixture::MakeSurface(device, colorFormat, false, color, width, height) ||
-            (!noDepth && !NrFixture::MakeSurface(device, DXGI_FORMAT_R32_FLOAT, false, depth, guideWidth + guideX,
+            (!noDepth && !NrFixture::MakeSurface(device, depthStencil ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS :
+                                                 DXGI_FORMAT_R32_FLOAT, false, depth, guideWidth + guideX,
                                                  guideHeight + guideY)) ||
             !NrFixture::MakeSurface(device, DXGI_FORMAT_R16G16_FLOAT, false, motion, guideWidth + guideX,
                                     guideHeight + guideY) ||
@@ -169,7 +170,7 @@ static ComPtr<ID3D12GraphicsCommandList> Commands(ID3D12Device* device, ComPtr<I
 static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* model, const wchar_t* parentData,
                   const wchar_t* workerData, const wchar_t* log, const wchar_t* workerExe, bool primaryPass,
                   unsigned secondaryPasses, unsigned width, unsigned height, bool failureTest, bool resetSecondFrame,
-                  bool noDepth, bool halfGuides, bool rgba8, bool offsetGuides, bool invalidGuides)
+                  bool noDepth, bool halfGuides, bool rgba8, bool offsetGuides, bool invalidGuides, bool depthStencil)
 {
     MEMORYSTATUSEX memory { sizeof(memory) };
     if (!GlobalMemoryStatusEx(&memory) || memory.ullAvailPageFile < 8ull * 1024 * 1024 * 1024)
@@ -220,7 +221,7 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
     std::wcout << L"Primary: " << primaryDesc.Description << L"; secondary: " << secondary.description.Description
                << L"\n"
                << std::flush;
-    Frame frame(primary.Get(), width, height, noDepth, halfGuides, rgba8, offsetGuides);
+    Frame frame(primary.Get(), width, height, noDepth, halfGuides, rgba8, offsetGuides, depthStencil);
     Fill(frame.color, 0);
     if (frame.depth.texture)
         Fill(frame.depth, 1);
@@ -469,10 +470,10 @@ int wmain(int argc, wchar_t** argv)
 {
     try
     {
-        if (argc >= 11 && argc <= 19)
+        if (argc >= 11 && argc <= 20)
         {
             bool primaryPass = true, failureTest = false, resetSecondFrame = false, noDepth = false, halfGuides = false,
-                 rgba8 = false, offsetGuides = false, invalidGuides = false;
+                 rgba8 = false, offsetGuides = false, invalidGuides = false, depthStencil = false;
             for (int i = 11; i < argc; ++i)
             {
                 if (std::wcscmp(argv[i], L"--no-primary") == 0 && primaryPass)
@@ -491,6 +492,8 @@ int wmain(int argc, wchar_t** argv)
                     offsetGuides = true;
                 else if (std::wcscmp(argv[i], L"--invalid-guides") == 0 && !invalidGuides)
                     invalidGuides = true;
+                else if (std::wcscmp(argv[i], L"--depth-stencil") == 0 && !depthStencil)
+                    depthStencil = true;
                 else
                     return 2;
             }
@@ -504,7 +507,8 @@ int wmain(int argc, wchar_t** argv)
                 return 2;
             return Parent(argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], primaryPass,
                           static_cast<unsigned>(passes), static_cast<unsigned>(width), static_cast<unsigned>(height),
-                          failureTest, resetSecondFrame, noDepth, halfGuides, rgba8, offsetGuides, invalidGuides);
+                          failureTest, resetSecondFrame, noDepth, halfGuides, rgba8, offsetGuides, invalidGuides,
+                          depthStencil);
         }
         std::cerr << "Expected core, forwarder, model, primary data, worker data, worker log, executable, pass count "
                      "and dimensions.\n";

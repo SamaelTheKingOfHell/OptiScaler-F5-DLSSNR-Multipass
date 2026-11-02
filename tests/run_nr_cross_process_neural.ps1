@@ -3,7 +3,8 @@ param([string]$VcVars, [string]$CoreDll, [string]$WorkerExe, [Parameter(Mandator
       [Parameter(Mandatory=$true)][string]$ModelDll, [ValidateRange(1,30)][int]$SecondaryPasses = 2,
       [ValidateRange(1,16384)][int]$Width = 256, [ValidateRange(1,16384)][int]$Height = 144,
       [switch]$NoPrimaryPass, [switch]$FailureTest, [switch]$ResetSecondFrame, [switch]$NoDepth,
-      [switch]$HalfGuides, [switch]$Rgba8, [switch]$OffsetGuides, [switch]$InvalidGuides, [switch]$BuildOnly)
+      [switch]$HalfGuides, [switch]$Rgba8, [switch]$OffsetGuides, [switch]$InvalidGuides, [switch]$DepthStencil,
+      [switch]$BuildOnly)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 if (!$CoreDll) {
@@ -48,6 +49,7 @@ try {
     if ($Rgba8) { $probeArgs += '--rgba8' }
     if ($OffsetGuides) { $probeArgs += '--offset-guides' }
     if ($InvalidGuides) { $probeArgs += '--invalid-guides' }
+    if ($DepthStencil) { $probeArgs += '--depth-stencil' }
     if (Test-Path -LiteralPath $log) { Set-Content -LiteralPath $log -Value '' }
     & $exe @probeArgs
     if ($LASTEXITCODE -ne 0) {

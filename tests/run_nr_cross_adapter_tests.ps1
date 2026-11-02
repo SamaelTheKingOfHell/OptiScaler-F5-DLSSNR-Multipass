@@ -23,6 +23,12 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Cross-adapter protocol test compilation failed.' }
     & $protocolExe
     if ($LASTEXITCODE -ne 0) { throw 'Cross-adapter protocol test failed.' }
+    $telemetryExe = Join-Path $out 'nr_gpu_telemetry_smoke.exe'
+    $telemetryObj = Join-Path $out 'nr_gpu_telemetry_smoke.obj'
+    & cmd /d /c "`"$VcVars`" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX tests/nr_gpu/nr_gpu_telemetry_smoke.cpp /Fe:`"$telemetryExe`" /Fo:`"$telemetryObj`" /link dxgi.lib"
+    if ($LASTEXITCODE -ne 0) { throw 'GPU telemetry test compilation failed.' }
+    & $telemetryExe
+    if ($LASTEXITCODE -ne 0) { throw 'GPU telemetry test failed.' }
     & cmd /d /c "`"$VcVars`" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX tests/nr_gpu/nr_cross_adapter_roundtrip.cpp /Fe:`"$exe`" /Fo:`"$obj`" /link d3d12.lib dxgi.lib user32.lib"
     if ($LASTEXITCODE -ne 0) { throw 'Cross-adapter probe compilation failed.' }
     $testArgs = @()

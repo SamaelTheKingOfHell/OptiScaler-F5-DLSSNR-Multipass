@@ -102,9 +102,11 @@ std::shared_ptr<WorkerGeneration> Prepare(ID3D12Device* primary, ID3D12Resource*
     }
     if (!retired.expired() || failedKey == key)
         return nullptr;
-    auto fail = [&](const char* why) -> std::shared_ptr<WorkerGeneration>
+    auto fail = [&](const char* why, DlssNr::Worker::UnavailableReason reason =
+                                      DlssNr::Worker::UnavailableReason::Other) -> std::shared_ptr<WorkerGeneration>
     {
         failedKey = key;
+        DlssNr::Worker::unavailableReason.store(reason, std::memory_order_relaxed);
         DlssNr::Worker::currentStatus.store(DlssNr::Worker::Status::Unavailable, std::memory_order_relaxed);
         LOG_WARN("DLSS-NR multi-GPU: {}; using the game GPU.", why);
         return nullptr;
@@ -119,21 +121,38 @@ std::shared_ptr<WorkerGeneration> Prepare(ID3D12Device* primary, ID3D12Resource*
             FAILED(base.As(&factory)))
             return fail("could not enumerate graphics adapters");
     }
+    ComPtr<IDXGIAdapter1> gameAdapter;
+    DXGI_ADAPTER_DESC1 gameDescription {};
+    if (SUCCEEDED(factory->EnumAdapterByLuid(primary->GetAdapterLuid(), IID_PPV_ARGS(&gameAdapter))) &&
+        SUCCEEDED(gameAdapter->GetDesc1(&gameDescription)))
+        DlssNr::Worker::Telemetry().Set(0, gameDescription);
     auto createDevice = D3d12Proxy::D3D12CreateDevice_();
     DlssNr::MultiGpu::SelectedAdapter secondary;
     ScopedSkipSpoofingThread skipSpoofing {};
     ScopedCreatingD3DDevice creatingDevice {};
     if (!createDevice || FAILED(DlssNr::MultiGpu::SelectSecondary(factory.Get(), primary->GetAdapterLuid(), nullptr,
                                                                   0x10de, createDevice, secondary)))
-        return fail("no compatible secondary NVIDIA adapter was found");
+        return fail("no compatible secondary NVIDIA adapter was found", DlssNr::Worker::UnavailableReason::NoAdapter);
+    DlssNr::Worker::Telemetry().Set(1, secondary.description);
     FrameTransfer transfer;
-    if (FAILED(FrameTransfer::Create(primary, secondary.device.Get(), color, depth, motion, transfer)))
-        return fail("the frame or guide textures are unsupported");
+    const HRESULT transferResult = FrameTransfer::Create(primary, secondary.device.Get(), color, depth, motion, transfer);
+    if (FAILED(transferResult))
+    {
+        const auto c = color->GetDesc();
+        const auto d = depth ? depth->GetDesc() : D3D12_RESOURCE_DESC {};
+        const auto m = motion->GetDesc();
+        LOG_WARN("DLSS-NR multi-GPU transfer failed: HRESULT 0x{:08X}; color {}x{} format {}, depth {}x{} format {}, "
+                 "motion {}x{} format {}.", static_cast<unsigned>(transferResult), c.Width, c.Height,
+                 static_cast<unsigned>(c.Format), d.Width, d.Height, static_cast<unsigned>(d.Format), m.Width, m.Height,
+                 static_cast<unsigned>(m.Format));
+        return fail("the frame or guide textures or shared allocation are unsupported",
+                    DlssNr::Worker::UnavailableReason::Transfer);
+    }
     const auto model = FindSelectedModel();
     const auto worker = Util::FindFilePath(g_dllDir, "dlssnr_worker.exe");
     const auto coreDir = Util::NvngxPath();
     if (!model || !worker || !coreDir || !g_nr.forwarder)
-        return fail("the worker, model or NVIDIA core is missing");
+        return fail("the worker, model or NVIDIA core is missing", DlssNr::Worker::UnavailableReason::MissingFiles);
     wchar_t forwarderPath[32768] {};
     const DWORD length =
         GetModuleFileNameW(g_nr.forwarder, forwarderPath, static_cast<DWORD>(std::size(forwarderPath)));
@@ -167,7 +186,7 @@ std::shared_ptr<WorkerGeneration> Prepare(ID3D12Device* primary, ID3D12Resource*
     auto next = std::make_shared<WorkerGeneration>(std::move(transfer));
     if (FAILED(next->Start(primary, worker->c_str(), core.c_str(), forwarderPath, model->c_str(), data.c_str(),
                            log.c_str(), wire)))
-        return fail("the isolated worker could not be started");
+        return fail("the isolated worker could not be started", DlssNr::Worker::UnavailableReason::Startup);
     current = std::move(next);
     currentKey = key;
     successfulFrames = 0;

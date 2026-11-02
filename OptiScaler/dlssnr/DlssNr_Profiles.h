@@ -71,6 +71,7 @@ inline constexpr std::string_view kKeptKeys[] = {
     "Passes",
     "MultiGpu",
     "PrimaryPasses",
+    "SecondaryPassMask",
     "PassFeedback",
     "UnlockPasses",
     "Style",

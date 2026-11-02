@@ -49,7 +49,8 @@ class FrameTransfer
     }
     static bool DepthFormat(DXGI_FORMAT f)
     {
-        return f == DXGI_FORMAT_R32_FLOAT || f == DXGI_FORMAT_R16_FLOAT || f == DXGI_FORMAT_R16_UNORM;
+        return f == DXGI_FORMAT_R32_FLOAT || f == DXGI_FORMAT_R16_FLOAT || f == DXGI_FORMAT_R16_UNORM ||
+               f == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
     }
     static bool MotionFormat(DXGI_FORMAT f)
     {

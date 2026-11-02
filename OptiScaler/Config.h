@@ -868,6 +868,8 @@ class Config
     // Experimental D3D12 finished-picture multi-GPU placement. Disabled by default.
     CustomOptional<bool> DlssNrMultiGpu { false };
     CustomOptional<uint32_t> DlssNrPrimaryPasses { 1 };
+    // Bit i requests the secondary GPU beginning with pass i + 1. The first set bit wins.
+    CustomOptional<uint32_t, NoDefault> DlssNrSecondaryPassMask;
 
     // How much of an interpass boundary's raw answer the next pass actually receives.
     // next_input = proxy + PassFeedback * (restored - proxy). 1.0 (default) is exactly today's

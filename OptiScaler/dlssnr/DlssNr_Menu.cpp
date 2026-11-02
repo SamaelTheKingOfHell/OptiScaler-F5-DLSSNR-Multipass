@@ -1,5 +1,7 @@
 #include "pch.h"
 #include <dlssnr/worker/WorkerStatus.h>
+#include <dlssnr/worker/WorkerGpuTelemetry.h>
+#include <dlssnr/DlssNr_MultiGpuPlan.h>
 #include "DlssNrFeature_Vk.h"
 
 #include "DlssNr.h"
@@ -2223,22 +2225,6 @@ static void RenderStatusPage(Config* config, float menuResScale, const NrCommon&
                        "gentler, steadier extra passes. Default: 1.0. No effect with 1 pass.");
         }
 
-        bool multiGpu = config->DlssNrMultiGpu.value_or_default();
-        if (ImGui::Checkbox("Use a second GPU for neural passes (experimental)", &multiGpu))
-            config->DlssNrMultiGpu = multiGpu;
-        HelpMarker("For native DirectX 12 Finished Picture. The game GPU runs the first passes, then the second NVIDIA "
-                   "GPU runs the remaining passes and returns the result to the game GPU. Other modes use the game GPU. "
-                   "Transfers and waiting may reduce performance.");
-        if (multiGpu)
-        {
-            const int total = (int) std::clamp(config->DlssNrPasses.value_or_default(), 1u, passLimit);
-            int primary = (int) std::min(config->DlssNrPrimaryPasses.value_or_default(), (uint32_t) total);
-            if (ImGui::SliderInt("Passes on game GPU", &primary, 0, total))
-                config->DlssNrPrimaryPasses = (uint32_t) primary;
-            const char* status = config->DlssNrFinishedPicture.value_or_default()
-                                     ? DlssNr::Worker::StatusText() : "Enable Finished Picture to use the second GPU";
-            ImGui::TextWrapped("%d on game GPU, %d on second GPU. %s", primary, total - primary, status);
-        }
         ImGui::PopItemWidth();
     }
 
@@ -4184,8 +4170,52 @@ static void RenderPassesPage(Config* config, float menuResScale)
 
     const bool unlockPasses = config->DlssNrUnlockPasses.value_or_default();
     const unsigned int passLimit = unlockPasses ? MaxPassCount : DefaultMaxPassCount;
+    const unsigned int visiblePasses = std::clamp(config->DlssNrPasses.value_or_default(), 1u, passLimit);
+    uint32_t secondaryMask = config->DlssNrSecondaryPassMask.has_value()
+        ? config->DlssNrSecondaryPassMask.value()
+        : config->DlssNrMultiGpu.value_or_default() && config->DlssNrPrimaryPasses.value_or_default() < MaxPassCount
+            ? (uint32_t { 1 } << config->DlssNrPrimaryPasses.value_or_default()) : 0u;
+    const auto handoffControl = [&](unsigned pass)
+    {
+        ImGui::PushID(static_cast<int>(pass));
+        const uint32_t bit = uint32_t { 1 } << pass;
+        bool selected = (secondaryMask & bit) != 0;
+        if (ImGui::Checkbox("Start second GPU here", &selected))
+        {
+            secondaryMask = selected ? (secondaryMask | bit) : (secondaryMask & ~bit);
+            config->DlssNrSecondaryPassMask = secondaryMask;
+            config->DlssNrMultiGpu = secondaryMask != 0;
+        }
+        HelpMarker("The first checked pass starts the second GPU. That pass and all later passes run together on it; "
+                   "the picture returns to the game GPU. Requires DirectX 12 Finished Picture and no frame generation.");
+        const auto plan = DlssNr::MultiGpu::MakePassPlanFromMask(visiblePasses, secondaryMask, MaxPassCount);
+        if (plan && pass < visiblePasses)
+            ImGui::TextDisabled("Planned device: %s", plan->IsPrimary(pass) ? "game GPU" : "second GPU");
+        else if (pass >= visiblePasses)
+            ImGui::TextDisabled("This pass is not active at the current pass count.");
+        ImGui::PopID();
+    };
 
     ImGui::TextWrapped("Settings apply when you release a slider.");
+    ImGui::TextWrapped("Second GPU: %s", DlssNr::Worker::StatusText());
+    const auto gpuReadings = DlssNr::Worker::Telemetry().Readings();
+    for (unsigned i = 0; i < gpuReadings.size(); ++i)
+    {
+        const auto& gpu = gpuReadings[i];
+        if (!gpu.present)
+        {
+            ImGui::TextDisabled("%s: waiting for detection", i == 0 ? "Game GPU" : "Second GPU");
+            continue;
+        }
+        ImGui::TextWrapped("%s: %s", i == 0 ? "Game GPU" : "Second GPU", gpu.name.c_str());
+        if (gpu.utilization >= 0)
+        {
+            const std::string label = std::format("{}% overall GPU load", gpu.utilization);
+            ImGui::ProgressBar(gpu.utilization / 100.0f, ImVec2(220.0f * menuResScale, 0), label.c_str());
+        }
+        else
+            ImGui::TextDisabled("GPU load unavailable from driver");
+    }
     static const char* styles[] = { "Standard", "Natural", "Cinematic" };
     static const char* inheritedStyles[] = { "Auto (inherit pass 1)", "Standard", "Natural", "Cinematic" };
     // [DlssNr] Preset / Pass2Preset / Pass3Preset, the model's DLSSNR.Hint.Render.Preset: 1 and 2 named as NVIDIA names
@@ -4203,6 +4233,7 @@ static void RenderPassesPage(Config* config, float menuResScale)
 
     if (NrCard card("Pass 1", menuResScale); card.IsOpen())
     {
+        handoffControl(0);
         int style = (int) std::min(config->DlssNrStyle.value_or_default(), 2u);
         if (ImGui::Combo("Style", &style, styles, IM_ARRAYSIZE(styles)))
             config->DlssNrStyle = (uint32_t) style;
@@ -4224,6 +4255,7 @@ static void RenderPassesPage(Config* config, float menuResScale)
 
     if (NrCard card("Pass 2", menuResScale); card.IsOpen())
     {
+        handoffControl(1);
         ImGui::TextWrapped("Defaults: inherit Pass 1; Local tone = 0. Reset restores these defaults.");
         InheritedProfileCombo("Style", &config->DlssNrPass2Style, inheritedStyles, IM_ARRAYSIZE(inheritedStyles));
         InheritedProfileCombo("Preset", &config->DlssNrPass2Preset, inheritedPresets, IM_ARRAYSIZE(inheritedPresets));
@@ -4246,6 +4278,7 @@ static void RenderPassesPage(Config* config, float menuResScale)
 
     if (NrCard card("Pass 3", menuResScale); card.IsOpen())
     {
+        handoffControl(2);
         ImGui::TextWrapped("Defaults: inherit Pass 1; Local tone = 0. Reset restores these defaults.");
         InheritedProfileCombo("Style", &config->DlssNrPass3Style, inheritedStyles, IM_ARRAYSIZE(inheritedStyles));
         InheritedProfileCombo("Preset", &config->DlssNrPass3Preset, inheritedPresets, IM_ARRAYSIZE(inheritedPresets));
@@ -4266,7 +4299,6 @@ static void RenderPassesPage(Config* config, float menuResScale)
             config->DlssNrPass3AutoMask = std::optional<bool> {};
     }
 
-    const unsigned int visiblePasses = std::clamp(config->DlssNrPasses.value_or_default(), 1u, passLimit);
     for (unsigned int pass = 3; pass < visiblePasses; ++pass)
     {
         auto& settings = config->DlssNrExtraPasses[pass - 3];
@@ -4275,6 +4307,7 @@ static void RenderPassesPage(Config* config, float menuResScale)
 
         if (!card.IsOpen())
             continue;
+        handoffControl(pass);
         ImGui::TextWrapped("Defaults: inherit Pass 1; Local tone = 0.");
         InheritedProfileCombo("Style", &settings.style, inheritedStyles, IM_ARRAYSIZE(inheritedStyles));
         DeferredSlider("Intensity", &settings.intensity, 0.0f, 2.0f, config->DlssNrIntensity.value_or_default(), "%.2f",

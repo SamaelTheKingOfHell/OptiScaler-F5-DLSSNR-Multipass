@@ -14,6 +14,8 @@ enum class Status
     PrimaryOnly
 };
 inline std::atomic<Status> currentStatus { Status::Disabled };
+enum class UnavailableReason { Other, NoAdapter, Transfer, MissingFiles, Startup };
+inline std::atomic<UnavailableReason> unavailableReason { UnavailableReason::Other };
 inline const char* StatusText()
 {
     switch (currentStatus.load(std::memory_order_relaxed))
@@ -27,7 +29,14 @@ inline const char* StatusText()
     case Status::Running:
         return "Running with the second GPU";
     case Status::Unavailable:
-        return "Unavailable for this configuration; using the game GPU";
+        switch (unavailableReason.load(std::memory_order_relaxed))
+        {
+        case UnavailableReason::NoAdapter: return "No compatible second NVIDIA GPU; using the game GPU";
+        case UnavailableReason::Transfer: return "Frame, guide or GPU transfer unsupported; see log; using the game GPU";
+        case UnavailableReason::MissingFiles: return "Worker or model files missing; using the game GPU";
+        case UnavailableReason::Startup: return "Could not start the second GPU worker; using the game GPU";
+        default: return "Unavailable; see log; using the game GPU";
+        }
     case Status::Failed:
         return "Worker stopped; using the game GPU";
     case Status::PrimaryOnly:
