@@ -3,6 +3,7 @@
 - Added named, side-by-side secondary-GPU runtimes, selected inside the first secondary pass card and persisted as `SecondaryModel`. The primary runtime and per-pass presets remain separate. Runtime DLLs are supplied by the user; see `docs/Multi-GPU-runtimes.md` for the experimental Ampere Preset B candidate and its published identity.
 - Reuse the worker command allocator, list and event after GPU completion, using the existing return fence instead of an extra retirement fence and queue signal. A 30-frame Preset A fixture returned identical checksums; medians of 30.5854 and 30.502 ms do not establish a speed gain. Added separate-model and adapter-direction fixture options.
 - Implemented and independently reviewed by OpenAI Codex, GPT-6.1 Sol (reasoning effort unavailable). Local Release build and focused GPU/failure checks passed; the new selector and alternative Ampere runtime still require in-game validation.
+- Verified the Ampere v0.4.0 archive and DLL against the author's published hashes. On the RTX 3060, a 30-frame 1280x720 Preset B fixture measured 15.0 to 7.6 ms neural evaluation and 18.8 to 11.4 ms CPU handoff versus the compatibility runtime; this is not game FPS or image-quality validation. Added the runtime setting to named profiles after CI detected the missing profile classification.
 
 ## 2026-11-02 — Reduce multi-GPU handoff latency (WIP)
 

@@ -62,7 +62,12 @@ This difference does not establish a speed gain. GPU timestamps attributed about
 26.7 ms to the 3060's neural evaluation. The existing compatibility runtime's
 Preset B evaluation measured about 15.0 ms in a separate run. A and B produce
 different images; these are not interchangeable quality settings or game FPS.
-The optimized Ampere candidate has not yet been measured on this GPU pair.
+On the same GPU pair, a separate 30-frame Preset B comparison measured the
+compatibility runtime's median CPU handoff at 18.7926 ms and the hash-verified
+Ampere v0.4.0 runtime at 11.3603 ms. Worker GPU timestamps measured neural
+evaluation at 14.9925 and 7.5977 ms respectively. The two-GPU return and clean
+shutdown passed with the optimized runtime. These synthetic measurements do not
+establish in-game FPS, temporal image quality or bit equality between runtimes.
 
 The fixture accepts a separate worker model while preserving the primary model.
 It reports CPU handoff and worker GPU stage timings. `-SwapAdapters` is a
