@@ -1,3 +1,9 @@
+## 2026-11-02 — Independent secondary runtimes and worker reuse (WIP)
+
+- Added named, side-by-side secondary-GPU runtimes, selected inside the first secondary pass card and persisted as `SecondaryModel`. The primary runtime and per-pass presets remain separate. Runtime DLLs are supplied by the user; see `docs/Multi-GPU-runtimes.md` for the experimental Ampere Preset B candidate and its published identity.
+- Reuse the worker command allocator, list and event after GPU completion, using the existing return fence instead of an extra retirement fence and queue signal. A 30-frame Preset A fixture returned identical checksums; medians of 30.5854 and 30.502 ms do not establish a speed gain. Added separate-model and adapter-direction fixture options.
+- Implemented and independently reviewed by OpenAI Codex, GPT-6.1 Sol (reasoning effort unavailable). Local Release build and focused GPU/failure checks passed; the new selector and alternative Ampere runtime still require in-game validation.
+
 ## 2026-11-02 — Reduce multi-GPU handoff latency (WIP)
 
 - Replaced timer-based fence polling with completion events and a bounded fallback for timed-out registrations. The worker now runs from `OptiScaler/NR-Worker` with its own working directory, so it does not load the game's DXGI proxy or overwrite the game log. The pass page and periodic log entries show CPU handoff wait time.

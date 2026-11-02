@@ -201,7 +201,8 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
                   const wchar_t* workerData, const wchar_t* log, const wchar_t* workerExe, bool primaryPass,
                   unsigned secondaryPasses, unsigned width, unsigned height, bool failureTest, bool resetSecondFrame,
                   bool noDepth, bool halfGuides, bool rgba8, bool offsetGuides, bool invalidGuides, bool depthStencil,
-                  bool benchmark, bool verifyIsolation, bool mainPreset)
+                  bool benchmark, bool verifyIsolation, bool mainPreset, bool swapAdapters,
+                  const wchar_t* secondaryModel)
 {
     MEMORYSTATUSEX memory { sizeof(memory) };
     if (!GlobalMemoryStatusEx(&memory) || memory.ullAvailPageFile < 8ull * 1024 * 1024 * 1024)
@@ -247,6 +248,14 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
     DlssNr::MultiGpu::SelectedAdapter secondary;
     Check(DlssNr::MultiGpu::SelectSecondary(factory.Get(), primaryLuid, nullptr, 0x10de, &D3D12CreateDevice, secondary),
           "Select secondary");
+    // Diagnostic only: compare the same model with the two physical devices
+    // exchanging transport roles. This never changes a game's presentation GPU.
+    if (swapAdapters)
+    {
+        primary.Swap(secondary.device);
+        primaryAdapter.Swap(secondary.adapter);
+        Check(secondary.adapter->GetDesc1(&secondary.description), "Swapped secondary description");
+    }
     DXGI_ADAPTER_DESC1 primaryDesc {};
     Check(primaryAdapter->GetDesc1(&primaryDesc), "Primary adapter description");
     std::wcout << L"Primary: " << primaryDesc.Description << L"; secondary: " << secondary.description.Description
@@ -287,7 +296,7 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
         auto invalid = wire;
         invalid.secondary = invalid.primary;
         DlssNr::Worker::WorkerClient rejected;
-        if (rejected.Start(primary.Get(), workerExe, core, forwarder, model, workerData, log, frameTransfer.Buffer(),
+        if (rejected.Start(primary.Get(), workerExe, core, forwarder, secondaryModel, workerData, log, frameTransfer.Buffer(),
                            invalid) != E_INVALIDARG)
             throw std::runtime_error("Accepted invalid worker adapter");
     }
@@ -295,14 +304,14 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
         auto invalid = wire;
         ++invalid.bytes;
         DlssNr::Worker::WorkerClient rejected;
-        if (rejected.Start(primary.Get(), workerExe, core, forwarder, model, workerData, log, frameTransfer.Buffer(),
+        if (rejected.Start(primary.Get(), workerExe, core, forwarder, secondaryModel, workerData, log, frameTransfer.Buffer(),
                            invalid) != E_INVALIDARG)
             throw std::runtime_error("Accepted mismatched transfer size");
     }
     DlssNr::Worker::WorkerGeneration generation(std::move(frameTransfer));
     const auto& transferLayout = generation.Transfer();
     const auto& transfer = transferLayout.Buffer();
-    Check(generation.Start(primary.Get(), workerExe, core, forwarder, model, workerData, log, wire),
+    Check(generation.Start(primary.Get(), workerExe, core, forwarder, secondaryModel, workerData, log, wire),
           "Start worker generation");
     const HRESULT immediate = generation.Poll(0);
     if (immediate != S_OK && immediate != E_PENDING)
@@ -517,11 +526,13 @@ int wmain(int argc, wchar_t** argv)
 {
     try
     {
-        if (argc >= 11 && argc <= 23)
+        if (argc >= 11 && argc <= 26)
         {
+            const wchar_t* secondaryModel = argv[3];
+            bool secondaryModelSet = false;
             bool primaryPass = true, failureTest = false, resetSecondFrame = false, noDepth = false, halfGuides = false,
                  rgba8 = false, offsetGuides = false, invalidGuides = false, depthStencil = false, benchmark = false,
-                 verifyIsolation = false, mainPreset = false;
+                 verifyIsolation = false, mainPreset = false, swapAdapters = false;
             for (int i = 11; i < argc; ++i)
             {
                 if (std::wcscmp(argv[i], L"--no-primary") == 0 && primaryPass)
@@ -548,6 +559,13 @@ int wmain(int argc, wchar_t** argv)
                     verifyIsolation = true;
                 else if (std::wcscmp(argv[i], L"--main-preset") == 0 && !mainPreset)
                     mainPreset = true;
+                else if (std::wcscmp(argv[i], L"--swap-adapters") == 0 && !swapAdapters)
+                    swapAdapters = true;
+                else if (std::wcscmp(argv[i], L"--secondary-model") == 0 && !secondaryModelSet && i + 1 < argc)
+                {
+                    secondaryModel = argv[++i];
+                    secondaryModelSet = true;
+                }
                 else
                     return 2;
             }
@@ -562,7 +580,7 @@ int wmain(int argc, wchar_t** argv)
             return Parent(argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], primaryPass,
                           static_cast<unsigned>(passes), static_cast<unsigned>(width), static_cast<unsigned>(height),
                           failureTest, resetSecondFrame, noDepth, halfGuides, rgba8, offsetGuides, invalidGuides,
-                          depthStencil, benchmark, verifyIsolation, mainPreset);
+                          depthStencil, benchmark, verifyIsolation, mainPreset, swapAdapters, secondaryModel);
         }
         std::cerr << "Expected core, forwarder, model, primary data, worker data, worker log, executable, pass count "
                      "and dimensions.\n";

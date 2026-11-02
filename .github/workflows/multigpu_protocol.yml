@@ -6,6 +6,8 @@ on:
       - 'OptiScaler/dlssnr/DlssNr_CrossAdapterProtocol.h'
       - 'OptiScaler/dlssnr/DlssNr_MultiGpuPlan.h'
       - 'OptiScaler/dlssnr/DlssNr_WorkerFenceWait.h'
+      - 'OptiScaler/dlssnr/worker/WorkerModelCatalog.h'
+      - 'tests/nr_worker_model_catalog_smoke.cpp'
       - 'tests/nr_cross_adapter_protocol_smoke.cpp'
       - 'tests/nr_multigpu_plan_smoke.cpp'
       - 'tests/nr_gpu/nr_worker_fence_wait_test.cpp'
@@ -15,6 +17,8 @@ on:
       - 'OptiScaler/dlssnr/DlssNr_CrossAdapterProtocol.h'
       - 'OptiScaler/dlssnr/DlssNr_MultiGpuPlan.h'
       - 'OptiScaler/dlssnr/DlssNr_WorkerFenceWait.h'
+      - 'OptiScaler/dlssnr/worker/WorkerModelCatalog.h'
+      - 'tests/nr_worker_model_catalog_smoke.cpp'
       - 'tests/nr_cross_adapter_protocol_smoke.cpp'
       - 'tests/nr_multigpu_plan_smoke.cpp'
       - 'tests/nr_gpu/nr_worker_fence_wait_test.cpp'
@@ -44,6 +48,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Pass placement test compilation failed.' }
           & "$env:RUNNER_TEMP/nr_multigpu_plan_smoke.exe"
           if ($LASTEXITCODE -ne 0) { throw 'Pass placement test failed.' }
+          & cmd /d /c "`"$vcvars`" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX tests/nr_worker_model_catalog_smoke.cpp /Fe:`"$env:RUNNER_TEMP/nr_worker_model_catalog_smoke.exe`" /Fo:`"$env:RUNNER_TEMP/nr_worker_model_catalog_smoke.obj`""
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime catalog test compilation failed.' }
+          & "$env:RUNNER_TEMP/nr_worker_model_catalog_smoke.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime catalog test failed.' }
           & cmd /d /c "`"$vcvars`" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX tests/nr_gpu/nr_worker_fence_wait_test.cpp /Fe:`"$env:RUNNER_TEMP/nr_worker_fence_wait_test.exe`" /Fo:`"$env:RUNNER_TEMP/nr_worker_fence_wait_test.obj`" /link d3d12.lib dxgi.lib user32.lib"
           if ($LASTEXITCODE -ne 0) { throw 'Fence wait test compilation failed.' }
           & "$env:RUNNER_TEMP/nr_worker_fence_wait_test.exe"

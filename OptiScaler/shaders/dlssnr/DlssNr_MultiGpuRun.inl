@@ -48,7 +48,8 @@ std::wstring Key(ID3D12Device* primary, ID3D12Resource* color, ID3D12Resource* d
     std::wostringstream out;
     out << reinterpret_cast<uintptr_t>(g_nr.feature) << L':' << primary->GetAdapterLuid().HighPart << L':'
         << primary->GetAdapterLuid().LowPart << L':' << first << L':' << total << L':' << std::hexfloat
-        << std::clamp(cfg.DlssNrPassFeedback.value_or_default(), 0.0f, 1.0f);
+        << std::clamp(cfg.DlssNrPassFeedback.value_or_default(), 0.0f, 1.0f)
+        << L':' << string_to_wstring(cfg.DlssNrSecondaryModel.value_or_default());
     for (auto* resource : { color, depth, motion })
     {
         if (!resource)
@@ -151,7 +152,10 @@ std::shared_ptr<WorkerGeneration> Prepare(ID3D12Device* primary, ID3D12Resource*
         return fail("the frame or guide textures or shared allocation are unsupported",
                     DlssNr::Worker::UnavailableReason::Transfer);
     }
-    const auto model = FindSelectedModel();
+    const auto selectedModel = cfg.DlssNrSecondaryModel.value_or_default();
+    const auto model = selectedModel.empty() || selectedModel == "auto" ? FindSelectedModel()
+        : DlssNr::Worker::ModelCatalog::Resolve(
+            { g_dllDir, Util::ExePath().remove_filename() }, selectedModel);
     // The worker must not run beside the game's dxgi.dll proxy: the Windows
     // loader would inject OptiScaler into its own helper process.
     std::optional<std::filesystem::path> worker;
@@ -209,6 +213,8 @@ std::shared_ptr<WorkerGeneration> Prepare(ID3D12Device* primary, ID3D12Resource*
     DlssNr::Worker::currentStatus.store(DlssNr::Worker::Status::Starting, std::memory_order_relaxed);
     LOG_INFO("DLSS-NR multi-GPU: starting {} secondary passes on {}", total - first,
              wstring_to_string(secondary.description.Description));
+    LOG_INFO("DLSS-NR multi-GPU: secondary runtime {}", selectedModel.empty() || selectedModel == "auto"
+                                                                 ? "same as game GPU" : selectedModel);
     return nullptr; // model loading is asynchronous; this frame stays on the game GPU
 }
 } // namespace MultiGpuRun

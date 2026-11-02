@@ -1241,6 +1241,7 @@ void Config::ReadDlssNr()
     DlssNrMultiGpu.set_from_config(readBool("DlssNr", "MultiGpu"));
     DlssNrPrimaryPasses.set_from_config(readUInt("DlssNr", "PrimaryPasses"));
     DlssNrSecondaryPassMask.set_from_config(readUInt("DlssNr", "SecondaryPassMask"));
+    DlssNrSecondaryModel.set_from_config(readString("DlssNr", "SecondaryModel"));
     DlssNrPassFeedback.set_from_config(readFloat("DlssNr", "PassFeedback"));
     DlssNrScanAnchorValue.set_from_config(readFloat("DlssNr", "ScanAnchorValue"));
     DlssNrScanAnchorWhitePoint.set_from_config(readFloat("DlssNr", "ScanAnchorWhitePoint"));
@@ -1489,6 +1490,7 @@ static void WriteDlssNr(Config& c, CSimpleIniA& out)
     out.SetValue("DlssNr", "MultiGpu", GetBoolValue(c.DlssNrMultiGpu.value_for_config()).c_str());
     out.SetValue("DlssNr", "PrimaryPasses", GetIntValue(c.DlssNrPrimaryPasses.value_for_config()).c_str());
     out.SetValue("DlssNr", "SecondaryPassMask", GetIntValue(c.DlssNrSecondaryPassMask.value_for_config()).c_str());
+    out.SetValue("DlssNr", "SecondaryModel", c.DlssNrSecondaryModel.value_for_config_or("").c_str());
     out.SetValue("DlssNr", "PassFeedback", GetFloatValue(c.DlssNrPassFeedback.value_for_config()).c_str());
     out.SetValue("DlssNr", "UseProxy", GetBoolValue(c.DlssNrUseProxy.value_for_config()).c_str());
     out.SetValue("DlssNr", "ProxyProbe", GetBoolValue(c.DlssNrProxyProbe.value_for_config()).c_str());
@@ -1758,6 +1760,7 @@ size_t Config::ApplyDlssNrSection(const DlssNrProfiles::Section& section)
         NR_PROFILE_FIELD("MultiGpu", DlssNrMultiGpu),
         NR_PROFILE_FIELD("PrimaryPasses", DlssNrPrimaryPasses),
         NR_PROFILE_FIELD("SecondaryPassMask", DlssNrSecondaryPassMask),
+        NR_PROFILE_FIELD("SecondaryModel", DlssNrSecondaryModel),
         NR_PROFILE_FIELD("PassFeedback", DlssNrPassFeedback),
         NR_PROFILE_FIELD("UnlockPasses", DlssNrUnlockPasses),
         NR_PROFILE_FIELD("Style", DlssNrStyle),

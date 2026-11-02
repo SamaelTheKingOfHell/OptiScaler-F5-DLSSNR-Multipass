@@ -52,6 +52,7 @@
 #include <dlssnr/DlssNr_OwnedCommandChain.h>
 #include <dlssnr/DlssNr_CrossAdapterSelect.h>
 #include <dlssnr/DlssNr_MultiGpuPlan.h>
+#include <dlssnr/worker/WorkerModelCatalog.h>
 #include <proxies/D3D12_Proxy.h>
 #include <proxies/DXGI_Proxy.h>
 #include <dlssnr/worker/WorkerDispatch.h>

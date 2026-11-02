@@ -1,11 +1,11 @@
 # Real neural passes in isolated processes, followed by a cross-adapter return to the primary GPU.
-param([string]$VcVars, [string]$CoreDll, [string]$WorkerExe, [string]$ParentWorkingDirectory,
+param([string]$VcVars, [string]$CoreDll, [string]$WorkerExe, [string]$ParentWorkingDirectory, [string]$SecondaryModelDll,
       [Parameter(Mandatory=$true)][string]$ForwarderDll,
       [Parameter(Mandatory=$true)][string]$ModelDll, [ValidateRange(1,30)][int]$SecondaryPasses = 2,
       [ValidateRange(1,16384)][int]$Width = 256, [ValidateRange(1,16384)][int]$Height = 144,
       [switch]$NoPrimaryPass, [switch]$FailureTest, [switch]$ResetSecondFrame, [switch]$NoDepth,
       [switch]$HalfGuides, [switch]$Rgba8, [switch]$OffsetGuides, [switch]$InvalidGuides, [switch]$DepthStencil,
-      [switch]$Benchmark, [switch]$VerifyWorkerIsolation, [switch]$MainPreset, [switch]$BuildOnly)
+      [switch]$Benchmark, [switch]$VerifyWorkerIsolation, [switch]$MainPreset, [switch]$SwapAdapters, [switch]$BuildOnly)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 if (!$CoreDll) {
@@ -15,6 +15,16 @@ if (!$CoreDll) {
 foreach ($dll in @($CoreDll, $ForwarderDll, $ModelDll)) {
     if (!(Test-Path -LiteralPath $dll -PathType Leaf)) { throw "Missing DLL: $dll" }
 }
+if ($SecondaryModelDll -and !(Test-Path -LiteralPath $SecondaryModelDll -PathType Leaf)) {
+    throw "Missing secondary model DLL: $SecondaryModelDll"
+}
+# The child runs from its own data directory; resolve caller-relative paths now.
+$CoreDll = (Resolve-Path -LiteralPath $CoreDll).ProviderPath
+$ForwarderDll = (Resolve-Path -LiteralPath $ForwarderDll).ProviderPath
+$ModelDll = (Resolve-Path -LiteralPath $ModelDll).ProviderPath
+if ($SecondaryModelDll) { $SecondaryModelDll = (Resolve-Path -LiteralPath $SecondaryModelDll).ProviderPath }
+if ($WorkerExe) { $WorkerExe = (Resolve-Path -LiteralPath $WorkerExe).ProviderPath }
+if ($ParentWorkingDirectory) { $ParentWorkingDirectory = (Resolve-Path -LiteralPath $ParentWorkingDirectory).ProviderPath }
 if (!$VcVars) {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
     if (Test-Path -LiteralPath $vswhere) {
@@ -54,6 +64,8 @@ try {
     if ($Benchmark) { $probeArgs += '--benchmark' }
     if ($VerifyWorkerIsolation) { $probeArgs += '--verify-isolation' }
     if ($MainPreset) { $probeArgs += '--main-preset' }
+    if ($SwapAdapters) { $probeArgs += '--swap-adapters' }
+    if ($SecondaryModelDll) { $probeArgs += @('--secondary-model', $SecondaryModelDll) }
     if (Test-Path -LiteralPath $log) { Set-Content -LiteralPath $log -Value '' }
     if ($ParentWorkingDirectory) {
         if (!(Test-Path -LiteralPath $ParentWorkingDirectory -PathType Container)) { throw 'Parent working directory missing.' }

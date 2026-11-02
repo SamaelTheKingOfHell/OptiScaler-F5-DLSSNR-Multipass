@@ -2,6 +2,7 @@
 #include <dlssnr/worker/WorkerStatus.h>
 #include <dlssnr/worker/WorkerGpuTelemetry.h>
 #include <dlssnr/DlssNr_MultiGpuPlan.h>
+#include <dlssnr/DlssNr_SecondaryModelMenu.h>
 #include "DlssNrFeature_Vk.h"
 
 #include "DlssNr.h"
@@ -4193,6 +4194,9 @@ static void RenderPassesPage(Config* config, float menuResScale)
             ImGui::TextDisabled("Planned device: %s", plan->IsPrimary(pass) ? "game GPU" : "second GPU");
         else if (pass >= visiblePasses)
             ImGui::TextDisabled("This pass is not active at the current pass count.");
+        if (plan && plan->HasSecondary() && pass == plan->primaryPasses)
+            DlssNr::Worker::SecondaryModelMenu::Render(*config,
+                { Util::DllPath().remove_filename(), Util::ExePath().remove_filename() });
         ImGui::PopID();
     };
 

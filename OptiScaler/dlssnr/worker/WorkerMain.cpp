@@ -16,6 +16,7 @@
 #include "../DlssNr_CrossAdapterIpc.h"
 #include "../DlssNr_WorkerFenceWait.h"
 #include "WorkerModelSession.h"
+#include "WorkerCommandContext.h"
 #include "WorkerSurface.h"
 #include "InterpassClamp.h"
 #include "WorkerProtocol.h"
@@ -66,18 +67,6 @@ static void CheckDebug(ID3D12Device* device)
             throw std::runtime_error(std::string("D3D12 debug error: ") + message->pDescription);
         if (message->Severity == D3D12_MESSAGE_SEVERITY_WARNING)
             std::cerr << "D3D12 debug warning: " << message->pDescription << "\n";
-    }
-}
-static void Retire(ID3D12Device* device, ID3D12CommandQueue* queue)
-{
-    ComPtr<ID3D12Fence> fence;
-    OwnedHandle event { CreateEventW(nullptr, FALSE, FALSE, nullptr) };
-    if (!event.value || FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))) ||
-        FAILED(queue->Signal(fence.Get(), 1)) || FAILED(fence->SetEventOnCompletion(1, event.value)) ||
-        WaitForSingleObject(event.value, 30000) != WAIT_OBJECT_0 || FAILED(device->GetDeviceRemovedReason()))
-    {
-        std::cerr << "Could not retire submitted neural work; terminating probe.\n" << std::flush;
-        ExitProcess(3);
     }
 }
 
@@ -151,22 +140,6 @@ static Evaluation MakeEvaluation(Frame& frame, unsigned width, unsigned height, 
     request.height = request.guideHeight = request.motionHeight = height;
     request.reset = reset ? 1 : 0;
     return request;
-}
-static void Submit(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* commands)
-{
-    Check(commands->Close(), "Close neural command list");
-    ID3D12CommandList* lists[] = { commands };
-    queue->ExecuteCommandLists(1, lists);
-}
-static ComPtr<ID3D12GraphicsCommandList> Commands(ID3D12Device* device, ComPtr<ID3D12CommandAllocator>& allocator)
-{
-    Check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)),
-          "Create neural allocator");
-    ComPtr<ID3D12GraphicsCommandList> commands;
-    Check(
-        device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&commands)),
-        "Create neural command list");
-    return commands;
 }
 static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, const wchar_t* model, const wchar_t* data,
                   const wchar_t* log)
@@ -268,6 +241,7 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
     std::vector<double> debugReadyWait, debugGpuCompletion;
     DebugGpuTiming debugTiming;
     const bool useGpuTiming = wire.enableDebug && debugTiming.Initialize(device.Get(), session.Queue());
+    WorkerCommandContext recording(device.Get(), session.Queue(), peer.Done());
     for (uint64_t frameNumber = 1; !wire.frameCount || frameNumber <= wire.frameCount; ++frameNumber)
     {
         FrameCommand frameCommand {};
@@ -291,32 +265,31 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
               static_cast<uint64_t>(frameCommand.depthY) + frameCommand.guideHeight > wire.depthHeight)) ||
             !std::isfinite(frameCommand.motionScaleX) || !std::isfinite(frameCommand.motionScaleY))
             throw std::runtime_error("Invalid frame control");
-        ComPtr<ID3D12CommandAllocator> allocator;
-        auto commands = Commands(device.Get(), allocator);
-        if (useGpuTiming) debugTiming.Mark(commands.Get(), 0);
+        auto* commands = recording.Begin();
+        if (useGpuTiming) debugTiming.Mark(commands, 0);
         if (frameNumber > 1)
             for (auto* input : { &frame.color, &frame.depth, &frame.motion })
                 if (input->texture)
-                    Barrier(commands.Get(), input->texture.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    Barrier(commands, input->texture.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                             D3D12_RESOURCE_STATE_COPY_DEST);
         auto prepare = [&](Surface& surface, D3D12_RESOURCE_STATES& state)
         {
             if (state == D3D12_RESOURCE_STATE_COPY_DEST)
-                CopyUpload(commands.Get(), surface);
+                CopyUpload(commands, surface);
             else if (state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
-                Barrier(commands.Get(), surface.texture.Get(), state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                Barrier(commands, surface.texture.Get(), state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         };
         for (size_t i = 0; i < outputs.size(); ++i)
             prepare(*outputs[i], outputStates[i]);
         for (size_t i = 0; i < clamps.size(); ++i)
             prepare(*clamps[i], clampStates[i]);
-        Barrier(commands.Get(), peer.Buffer(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        CopyFromShared(commands.Get(), peer.Buffer(), frame.color, 0);
+        Barrier(commands, peer.Buffer(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        CopyFromShared(commands, peer.Buffer(), frame.color, 0);
         if (frame.depth.texture)
-            CopyFromShared(commands.Get(), peer.Buffer(), frame.depth, wire.depthOffset);
-        CopyFromShared(commands.Get(), peer.Buffer(), frame.motion, wire.motionOffset);
-        if (useGpuTiming) debugTiming.Mark(commands.Get(), 1);
+            CopyFromShared(commands, peer.Buffer(), frame.depth, wire.depthOffset);
+        CopyFromShared(commands, peer.Buffer(), frame.motion, wire.motionOffset);
+        if (useGpuTiming) debugTiming.Mark(commands, 1);
         ID3D12Resource* passInput = frame.color.texture.Get();
         Surface* finalOutput = nullptr;
         for (uint32_t pass = 0; pass < wire.passCount; ++pass)
@@ -325,7 +298,7 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
             Surface& output = *outputs[slot];
             if (outputStates[slot] != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
             {
-                Barrier(commands.Get(), output.texture.Get(), outputStates[slot],
+                Barrier(commands, output.texture.Get(), outputStates[slot],
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 outputStates[slot] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             }
@@ -355,37 +328,37 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
             request.invertedDepth = static_cast<int>(frameCommand.invertedDepth);
             request.motionScaleX = frameCommand.motionScaleX;
             request.motionScaleY = frameCommand.motionScaleY;
-            if (session.Record(commands.Get(), request, pass) != 1)
+            if (session.Record(commands, request, pass) != 1)
                 throw std::runtime_error("Secondary neural pass failed");
             if (pass + 1 == wire.passCount)
             {
-                Barrier(commands.Get(), output.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                Barrier(commands, output.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         D3D12_RESOURCE_STATE_COPY_SOURCE);
                 outputStates[slot] = D3D12_RESOURCE_STATE_COPY_SOURCE;
                 finalOutput = &output;
                 break;
             }
-            Barrier(commands.Get(), output.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            Barrier(commands, output.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             outputStates[slot] = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             Surface& clamped = *clamps[slot];
             if (clampStates[slot] != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
             {
-                Barrier(commands.Get(), clamped.texture.Get(), clampStates[slot],
+                Barrier(commands, clamped.texture.Get(), clampStates[slot],
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 clampStates[slot] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             }
-            clampShaders[pass]->Record(commands.Get(), output.texture.Get(), passInput, clamped.texture.Get());
-            Barrier(commands.Get(), clamped.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            clampShaders[pass]->Record(commands, output.texture.Get(), passInput, clamped.texture.Get());
+            Barrier(commands, clamped.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             clampStates[slot] = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             passInput = clamped.texture.Get();
         }
-        if (useGpuTiming) debugTiming.Mark(commands.Get(), 2);
-        Barrier(commands.Get(), peer.Buffer(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-        CopyToShared(commands.Get(), peer.Buffer(), *finalOutput, 0);
-        Barrier(commands.Get(), peer.Buffer(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-        if (useGpuTiming) { debugTiming.Mark(commands.Get(), 3); debugTiming.Resolve(commands.Get()); }
+        if (useGpuTiming) debugTiming.Mark(commands, 2);
+        Barrier(commands, peer.Buffer(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        CopyToShared(commands, peer.Buffer(), *finalOutput, 0);
+        Barrier(commands, peer.Buffer(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        if (useGpuTiming) { debugTiming.Mark(commands, 3); debugTiming.Resolve(commands); }
         const auto readyStarted = wire.enableDebug ? std::chrono::steady_clock::now()
                                                    : std::chrono::steady_clock::time_point {};
         if (DlssNr::MultiGpu::WaitForFenceOrPeer(peer.Ready(), frameNumber, parent.value, 30000) !=
@@ -393,13 +366,7 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
             throw std::runtime_error("Parent exited or failed before sending the frame");
         const auto gpuStarted = wire.enableDebug ? std::chrono::steady_clock::now()
                                                  : std::chrono::steady_clock::time_point {};
-        Submit(session.Queue(), commands.Get());
-        if (FAILED(session.Queue()->Signal(peer.Done(), frameNumber)))
-        {
-            std::cerr << "Cannot signal worker completion.\n" << std::flush;
-            ExitProcess(3);
-        }
-        Retire(device.Get(), session.Queue());
+        recording.SubmitAndRetire(frameNumber);
         if (useGpuTiming && frameNumber > 1) debugTiming.Collect();
         if (wire.enableDebug && frameNumber > 1 && debugReadyWait.size() < 512)
         {

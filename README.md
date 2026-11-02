@@ -23,6 +23,8 @@ An NVIDIA RTX 20, 30, 40 or 50-series GPU and a supported 64-bit game. Older car
 
 Download the NVIDIA model file, `nvngx_dlssnr.dll`, separately. The file you need depends on your GPU. The [setup guide](INSTALL-DLSSNR.md#choose-the-correct-runtime) explains which one to use and how to check it.
 
+The experimental multi-GPU path supports [separate runtimes for the second GPU](docs/Multi-GPU-runtimes.md), including user-supplied architecture-specific builds.
+
 ## Install on Windows
 
 1. Close the game and back up any existing mod files.
