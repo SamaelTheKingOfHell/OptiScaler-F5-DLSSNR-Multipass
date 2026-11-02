@@ -1238,6 +1238,8 @@ void Config::ReadDlssNr()
     DlssNrScanMeter.set_from_config(readBool("DlssNr", "ScanMeter"));
     DlssNrScanTrim.set_from_config(readFloat("DlssNr", "ScanTrim"));
     DlssNrPasses.set_from_config(readUInt("DlssNr", "Passes"));
+    DlssNrMultiGpu.set_from_config(readBool("DlssNr", "MultiGpu"));
+    DlssNrPrimaryPasses.set_from_config(readUInt("DlssNr", "PrimaryPasses"));
     DlssNrPassFeedback.set_from_config(readFloat("DlssNr", "PassFeedback"));
     DlssNrScanAnchorValue.set_from_config(readFloat("DlssNr", "ScanAnchorValue"));
     DlssNrScanAnchorWhitePoint.set_from_config(readFloat("DlssNr", "ScanAnchorWhitePoint"));
@@ -1483,6 +1485,8 @@ static void WriteDlssNr(Config& c, CSimpleIniA& out)
     out.SetValue("DlssNr", "ScanInverted", GetBoolValue(c.DlssNrScanInverted.value_for_config()).c_str());
     out.SetValue("DlssNr", "ScanMeter", GetBoolValue(c.DlssNrScanMeter.value_for_config()).c_str());
     out.SetValue("DlssNr", "Passes", GetIntValue(c.DlssNrPasses.value_for_config()).c_str());
+    out.SetValue("DlssNr", "MultiGpu", GetBoolValue(c.DlssNrMultiGpu.value_for_config()).c_str());
+    out.SetValue("DlssNr", "PrimaryPasses", GetIntValue(c.DlssNrPrimaryPasses.value_for_config()).c_str());
     out.SetValue("DlssNr", "PassFeedback", GetFloatValue(c.DlssNrPassFeedback.value_for_config()).c_str());
     out.SetValue("DlssNr", "UseProxy", GetBoolValue(c.DlssNrUseProxy.value_for_config()).c_str());
     out.SetValue("DlssNr", "ProxyProbe", GetBoolValue(c.DlssNrProxyProbe.value_for_config()).c_str());
@@ -1749,6 +1753,8 @@ size_t Config::ApplyDlssNrSection(const DlssNrProfiles::Section& section)
         NR_PROFILE_FIELD("MaxRatio", DlssNrMaxRatio),
         NR_PROFILE_FIELD("ReversibleMode", DlssNrReversibleMode),
         NR_PROFILE_FIELD("Passes", DlssNrPasses),
+        NR_PROFILE_FIELD("MultiGpu", DlssNrMultiGpu),
+        NR_PROFILE_FIELD("PrimaryPasses", DlssNrPrimaryPasses),
         NR_PROFILE_FIELD("PassFeedback", DlssNrPassFeedback),
         NR_PROFILE_FIELD("UnlockPasses", DlssNrUnlockPasses),
         NR_PROFILE_FIELD("Style", DlssNrStyle),

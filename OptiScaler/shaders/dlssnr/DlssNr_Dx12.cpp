@@ -49,6 +49,14 @@
 #include "DlssNr_FinishedReady.h"
 #include <dlssnr/DlssNr_StreamlinePicture.h>
 #include <dlssnr/DlssNr_GameDefaults.h>
+#include <dlssnr/DlssNr_OwnedCommandChain.h>
+#include <dlssnr/DlssNr_CrossAdapterSelect.h>
+#include <dlssnr/DlssNr_MultiGpuPlan.h>
+#include <proxies/D3D12_Proxy.h>
+#include <proxies/DXGI_Proxy.h>
+#include <dlssnr/worker/WorkerDispatch.h>
+#include <dlssnr/worker/WorkerGeneration.h>
+#include <dlssnr/worker/WorkerStatus.h>
 
 #include <Config.h>
 #include <State.h>
@@ -65,6 +73,8 @@
 #include <mutex>
 #include <algorithm>
 #include <cstring>
+#include <sstream>
+#include <iomanip>
 #include "precompile/DlssNr_Shader.h"
 #include "precompile/dlssnr_finished_color_Shader.h"
 #include "precompile/dlssnr_finished_pq_direct_Shader.h"
@@ -2142,7 +2152,8 @@ struct ScopedNrStateEnvelope
 
     ~ScopedNrStateEnvelope()
     {
-        D3D12Hooks::RestoreRoot(cmd);
+        if (cmd)
+            D3D12Hooks::RestoreRoot(cmd);
         D3D12Hooks::SetRootSignatureTracking(true);
     }
 };
@@ -2519,6 +2530,8 @@ void ParkIdleViews()
         LOG_INFO("DLSS-NR: {} view model(s) not used for {} minutes released", parked,
                  std::chrono::duration_cast<std::chrono::minutes>(kKeepIdle).count());
 }
+
+#include "DlssNr_MultiGpuRun.inl"
 
 } // namespace
 
@@ -3454,7 +3467,8 @@ bool DlssNr_Dx12::DispatchResidualPass(ID3D12GraphicsCommandList* InCmdList,
 
 void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* colour,
                            ID3D12Resource* depth, ID3D12Resource* motion, ID3D12Resource* output,
-                           const DlssNrFrameInfo& frame, ID3D12CommandQueue* timingQueue)
+                           const DlssNrFrameInfo& frame, ID3D12CommandQueue* timingQueue,
+                           DlssNr::Worker::DispatchContext* workerContext)
 {
     std::lock_guard<std::recursive_mutex> nrLock(g_nrMutex);
     const Config& cfg = *Config::Instance();
@@ -5653,9 +5667,121 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     if (g_ngxTime != nullptr)
         g_ngxTime->Start(cmdList);
 
+    const auto placement = DlssNr::MultiGpu::MakePassPlan(
+        effectivePasses, cfg.DlssNrPrimaryPasses.value_or_default(), DlssNr::MaxPassCount);
+    const bool fgActive = State::Instance().currentFG && State::Instance().currentFG->IsActive() &&
+                          !State::Instance().currentFG->IsPaused();
+    const bool multiEligible = workerContext && workerContext->chain && workerContext->queue &&
+        cfg.DlssNrMultiGpu.value_or_default() && placement && placement->HasSecondary() &&
+        !g_multiRun && !superior && !spatial && !reusePlan.active && !cachePlan.runs && !fgActive;
+    if (workerContext)
+    {
+        if (!cfg.DlssNrMultiGpu.value_or_default()) MultiGpuRun::Disabled();
+        else if (!multiEligible || reused || cached)
+        {
+            MultiGpuRun::Skipped();
+            DlssNr::Worker::currentStatus.store(placement && !placement->HasSecondary()
+                                                   ? DlssNr::Worker::Status::PrimaryOnly
+                                                   : DlssNr::Worker::Status::Waiting,
+                                               std::memory_order_relaxed);
+        }
+    }
+
     for (unsigned int pass = 0; !reused && !cached && pass < effectivePasses && result == NVSDK_NGX_Result_Success;
          ++pass)
     {
+        if (multiEligible && pass == placement->primaryPasses)
+        {
+            auto generation = MultiGpuRun::Prepare(device, passInput, modelDepth, evalMotion, cfg,
+                                                    placement->primaryPasses, effectivePasses);
+            if (generation)
+            {
+                DlssNr::Worker::FrameCommand command {};
+                command.guideWidth = evalGuideW; command.guideHeight = evalGuideH;
+                command.motionWidth = evalMotionW; command.motionHeight = evalMotionH;
+                command.depthX = evalDepthX; command.depthY = evalDepthY;
+                command.motionX = evalMotionBaseX; command.motionY = evalMotionBaseY;
+                command.invertedDepth = g_nr.guideDepthInverted ? 1u : 0u;
+                command.motionScaleX = evalMvScaleX; command.motionScaleY = evalMvScaleY;
+                if (g_nr.reset || frame.Reset)
+                    command.resetMask = (1u << (effectivePasses - pass)) - 1u;
+                for (unsigned i = pass; i < effectivePasses; ++i)
+                {
+                    const auto t = PassTuning(cfg, i);
+                    auto& p = command.passes[i - pass];
+                    p.intensity = t.intensity; p.structure = t.structure; p.tone = t.tone; p.skin = t.skin;
+                    p.style = static_cast<int>(PassStyle(cfg, i)); p.autoMask = t.autoMask ? 1 : 0;
+                }
+                std::array<ID3D12Resource*, 3> sources {};
+                size_t sourceCount = 0;
+                for (auto* source : { passInput, modelDepth, evalMotion })
+                    if (source && std::find(sources.begin(), sources.begin() + sourceCount, source) ==
+                                      sources.begin() + sourceCount)
+                    {
+                        Barrier(cmdList, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        sources[sourceCount++] = source;
+                    }
+                // These query pairs began on the original list. They cannot be ended on the
+                // continuation and still be retired by the original-list submission observer.
+                if (g_gpuTime) g_gpuTime->Abandon();
+                if (g_ngxTime) g_ngxTime->Abandon();
+                workerContext->generation = generation; // keep transport and worker alive through the slot fence
+                const auto handoffStarted = std::chrono::steady_clock::now();
+                const auto handoff = generation->Submit(*workerContext->chain, workerContext->queue, command,
+                                                         passInput, modelDepth, evalMotion, 10000);
+                cmdList = workerContext->chain->Current();
+                stateEnvelope.cmd = cmdList;
+                if (!cmdList)
+                {
+                    workerContext->unusable = true;
+                    MultiGpuRun::FailCurrent();
+                    device->Release();
+                    return;
+                }
+                for (size_t i = 0; i < sourceCount; ++i)
+                    Barrier(cmdList, sources[i], D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                if (SUCCEEDED(handoff.result))
+                {
+                    MakeModelWritable(passOutput);
+                    Barrier(cmdList, passOutput, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                    if (SUCCEEDED(generation->RecordReturn(cmdList, passOutput)))
+                    {
+                        Barrier(cmdList, passOutput, D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                        ReadableFlag(passOutput) = true;
+                        finalAnswer = passOutput;
+                        workerContext->needsRetirement = true;
+                        DlssNr::Worker::currentStatus.store(DlssNr::Worker::Status::Running,
+                                                            std::memory_order_relaxed);
+                        if (++MultiGpuRun::successfulFrames == 1 || MultiGpuRun::successfulFrames % 1800 == 0)
+                        {
+                            const auto elapsed = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - handoffStarted).count();
+                            LOG_INFO("DLSS-NR multi-GPU: {} primary passes, {} secondary passes, {}x{}, handoff {:.1f} ms",
+                                     pass, effectivePasses - pass, modelWidth, modelHeight, elapsed);
+                        }
+                        for (unsigned skipped = pass; skipped < effectivePasses; ++skipped)
+                            if (skipped > 0) g_nr.passNeedsReset[skipped] = true;
+                        if (pass == 0) MultiGpuRun::primaryFeatureSkipped = true;
+                        superiorCompleted = effectivePasses;
+                        break;
+                    }
+                    Barrier(cmdList, passOutput, D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                }
+                LOG_WARN("DLSS-NR multi-GPU: worker handoff failed; remaining passes use the game GPU.");
+                MultiGpuRun::FailCurrent();
+            }
+            else
+                MultiGpuRun::Skipped();
+        }
+        if (pass == 0 && MultiGpuRun::primaryFeatureSkipped)
+        {
+            g_nr.reset = true;
+            MultiGpuRun::primaryFeatureSkipped = false;
+        }
         void* const passFeature = pass == 0 ? g_nr.feature : g_nr.passFeature[pass];
         const bool passReset = g_nr.reset || (pass > 0 && g_nr.passNeedsReset[pass]);
         const auto tuning = PassTuning(cfg, pass);

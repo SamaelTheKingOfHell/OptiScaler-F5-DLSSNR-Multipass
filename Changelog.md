@@ -1,3 +1,8 @@
+## 2026-11-01 — Experimental Finished Picture multi-GPU integration (WIP)
+
+- Connected the DirectX 12 Finished Picture renderer to the isolated secondary-GPU worker. A configurable prefix runs on the presentation GPU, the remaining sequential passes run on one secondary NVIDIA GPU, and the final image returns to the presentation GPU. Unsupported configurations remain on the game GPU; the option is off by default.
+- Added settings, status, safe slot retirement, and failure quarantine. OpenAI Codex, GPT-6 (exact model and effort unavailable). The Release solution built locally; the two-physical-GPU transport, cross-process failure and synthetic neural-model tests passed. Game-runtime correctness, visual quality, frame time and deployment remain unverified.
+
 ## 2026-11-01 — Owned-list frame handoff (WIP)
 
 - Added a worker generation that manages one submitted frame, its return copy, primary retirement and reset after skipped frames. Its handoff submits only a caller-owned command list and rejects another queue or an unrelated transfer. The application's renderer does not yet invoke this path.

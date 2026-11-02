@@ -1,4 +1,12 @@
-# Multi-GPU multipass plan (not implemented)
+# Multi-GPU multipass implementation and plan
+
+## Current status
+
+The experimental DirectX 12 Finished Picture path now connects the renderer to the separate GPU worker. Enable `MultiGpu` under `[DlssNr]` and set `PrimaryPasses` from zero through the configured pass count. The game GPU performs that many initial passes; one secondary NVIDIA GPU performs the remaining passes, and the final image returns to the game GPU for composition. When the worker or resource layout is unavailable, the remaining passes stay on the game GPU. The option is off by default.
+
+Frame generation, Superior Scaling, spatial compression, detail/edit reuse, multiview and non-DirectX 12 paths remain on the game GPU. Transfers and the worker synchronization can reduce frame rate. Resource lifetime is fenced, and a graphics submission that cannot be safely retired is quarantined until restart.
+
+Real two-GPU tests have exercised synthetic images and the actual neural model, including split passes, guide offsets, resets, failure handling and a return to the primary device. A game-runtime test, visual quality and frame-time measurements are still required before treating this option as production ready. The sections below document earlier prototypes and plans; their references to missing integration describe those earlier stages.
 
 The game device remains the presentation device. Passes run in two contiguous groups: zero or more passes on the game device first, then zero or more on a compatible secondary device. The pass split is user-selectable. The secondary group consumes the last game-device pass, or the original input if the game-device group is empty. There is at most one outbound handoff and one return; passes never alternate between devices. The final image returns to the game device before composition and presentation. Passes remain sequential because each consumes the previous result.
 

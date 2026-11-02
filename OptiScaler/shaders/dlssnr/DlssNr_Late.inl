@@ -8,11 +8,14 @@ struct Slot
     ComPtr<ID3D12Fence> fence;
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> commands;
+    std::unique_ptr<MultiGpu::OwnedCommandChain> ownedChain;
+    std::shared_ptr<Worker::WorkerGeneration> workerGeneration;
     ComPtr<ID3D12CommandQueue> producerQueue; // real queue that signals `ready`; held so its identity stays valid
     ID3D12CommandList* producer = nullptr; // identity only; never dereferenced
     DlssNrFrameInfo frame {};
     uint64_t ready = 0, done = 0, serial = 0;
     bool pending = false, submitted = false, expired = false, residualOnly = false, sceneLinear = true;
+    bool quarantined = false; // submission may be in flight without a reliable retirement fence
 };
 std::array<Slot, 4> slots;
 ComPtr<ID3D12Device> device;
@@ -59,8 +62,8 @@ void Say(const char* message)
 
 bool Finished(const Slot& slot)
 {
-    return !slot.fence || (slot.fence->GetCompletedValue() != UINT64_MAX &&
-                          slot.fence->GetCompletedValue() >= slot.done);
+    return !slot.quarantined && (!slot.fence || (slot.fence->GetCompletedValue() != UINT64_MAX &&
+                          slot.fence->GetCompletedValue() >= slot.done));
 }
 
 // The pair for a picture of this size and format, in frame `epoch` (native::PresentEpoch). False when it could not be made.
@@ -161,6 +164,9 @@ Slot* Acquire(ID3D12GraphicsCommandList* cmd)
         return nullptr;
     }
     auto& slot = *next;
+    // Finished(slot) was checked above: the previous chain's allocators and generation may retire.
+    slot.ownedChain.reset();
+    slot.workerGeneration.reset();
     if (!slot.commands)
     {
         if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&slot.fence))) ||
@@ -335,6 +341,7 @@ bool WaitForFinishedPicture()
     Late::Cancel();
     for (auto& slot : Late::slots)
     {
+        if (slot.quarantined) return false;
         // A capture-only slot signals on the producer queue, which may itself wait on a present.
         if (!slot.submitted || !TouchedBackBuffer(slot.ready, slot.done) || Late::Finished(slot)) continue;
         HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -548,6 +555,21 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
         return;
     }
     auto* cmd = slot.commands.Get();
+    Worker::DispatchContext workerContext {};
+    // Native Streamline interpolation uses an application-frame handoff even
+    // when no OptiScaler FG feature is active; keep that path single-GPU too.
+    if (!slot.residualOnly && !gameFrameHandoff && Config::Instance()->DlssNrMultiGpu.value_or_default())
+    {
+        slot.ownedChain = std::make_unique<MultiGpu::OwnedCommandChain>();
+        auto* realQueue = Late::RealQueue(queue);
+        if (SUCCEEDED(slot.ownedChain->Initialize(Late::device.Get(), realQueue, cmd)))
+        {
+            workerContext.chain = slot.ownedChain.get();
+            workerContext.queue = realQueue;
+        }
+        else
+            slot.ownedChain.reset();
+    }
     if (!g_compose)
         g_compose = std::make_unique<DlssNr_Dx12>("Neural Rendering", Late::device.Get());
     const auto before = g_nr.successfulDispatches;
@@ -625,7 +647,18 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
             }
         }
         if (colorReady)
-            g_compose->Dispatch(cmd, nrColor, slot.depth.Get(), slot.motion.Get(), nrColor, frame, queue);
+        {
+            g_compose->Dispatch(cmd, nrColor, slot.depth.Get(), slot.motion.Get(), nrColor, frame, queue, &workerContext);
+            slot.workerGeneration = std::move(workerContext.generation);
+            if (workerContext.unusable || (slot.ownedChain && !(cmd = slot.ownedChain->Current())))
+            {
+                Late::Say("The graphics submission could not continue. Restart the game to retry.");
+                slot.quarantined = true;
+                slot.pending = true;
+                slot.submitted = false;
+                return;
+            }
+        }
         if (pq && colorReady && g_nr.successfulDispatches > before && Config::Instance()->DlssNrApplyModel.value_or_default())
         {
             RecordPqEncode(cmd, slot.linear.Get(), color.Get(), D3D12_RESOURCE_STATE_PRESENT, slot.encoded.Get(),
@@ -634,19 +667,48 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
         Barrier(cmd, slot.motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
         if (slot.depth) Barrier(cmd, slot.depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     }
-    if (FAILED(cmd->Close()))
+    if (slot.ownedChain)
     {
-        Late::Say("Could not finish the picture. Restart the game to retry.");
-        slot.pending = true; // quarantine the slot; do not reuse possibly recorded NR resources
-        slot.submitted = false;
-        return;
+        if (FAILED(slot.ownedChain->SubmitFinal()))
+        {
+            Late::Say("Could not finish the picture. Restart the game to retry.");
+            slot.quarantined = true;
+            slot.pending = true;
+            slot.submitted = false;
+            return;
+        }
     }
-    ID3D12CommandList* lists[] = { cmd };
-    queue->ExecuteCommandLists(1, lists);
+    else
+    {
+        if (FAILED(cmd->Close()))
+        {
+            Late::Say("Could not finish the picture. Restart the game to retry.");
+            slot.quarantined = true;
+            slot.pending = true; // quarantine the slot; do not reuse possibly recorded NR resources
+            slot.submitted = false;
+            return;
+        }
+        ID3D12CommandList* lists[] = { cmd };
+        queue->ExecuteCommandLists(1, lists);
+    }
     slot.done = slot.ready + 1;
     if (FAILED(queue->Signal(slot.fence.Get(), slot.done)))
     {
         Late::Say("The graphics queue stopped. Restart the game to retry.");
+        // Submission already occurred, so retain its resources even though no
+        // retirement fence is available to tell us when reuse would be safe.
+        slot.quarantined = true;
+        slot.pending = true;
+        slot.submitted = false;
+        return;
+    }
+    if (workerContext.needsRetirement && slot.workerGeneration &&
+        FAILED(slot.workerGeneration->TrackRetirement(slot.fence.Get(), slot.done)))
+    {
+        Late::Say("Could not track multi-GPU retirement. Restart the game to retry.");
+        slot.quarantined = true;
+        slot.pending = true;
+        slot.submitted = false;
         return;
     }
     const bool ran = slot.residualOnly ? appliedResidual : g_nr.successfulDispatches > before;

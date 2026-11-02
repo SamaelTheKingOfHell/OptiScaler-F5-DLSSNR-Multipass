@@ -865,6 +865,9 @@ class Config
     // again -- so 3 costs three times, near enough. There is no shortcut and no amortisation: the
     // passes are sequential and each one needs the last one's output.
     CustomOptional<uint32_t> DlssNrPasses { 1 };
+    // Experimental D3D12 finished-picture multi-GPU placement. Disabled by default.
+    CustomOptional<bool> DlssNrMultiGpu { false };
+    CustomOptional<uint32_t> DlssNrPrimaryPasses { 1 };
 
     // How much of an interpass boundary's raw answer the next pass actually receives.
     // next_input = proxy + PassFeedback * (restored - proxy). 1.0 (default) is exactly today's

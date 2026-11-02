@@ -62,6 +62,8 @@ static_assert(sizeof(DlssNrDetailReuseConstants) == sizeof(DlssNrConstants));
 static_assert(sizeof(DlssNrEditCacheConstants) == sizeof(DlssNrConstants));
 static_assert(sizeof(DlssNr::Spatial::Constants) == sizeof(DlssNrConstants));
 
+namespace DlssNr::Worker { struct DispatchContext; }
+
 class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
 {
   private:
@@ -204,7 +206,8 @@ class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
     // resource. timingQueue is the queue this list will be executed on, when the caller knows it.
     void Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* colour, ID3D12Resource* depth,
                   ID3D12Resource* motion, ID3D12Resource* output, const DlssNrFrameInfo& frame,
-                  ID3D12CommandQueue* timingQueue = nullptr);
+                  ID3D12CommandQueue* timingQueue = nullptr,
+                  DlssNr::Worker::DispatchContext* workerContext = nullptr);
 
     // Records one pass. Resources that a given mode does not read may be null; a stand-in is bound in
     // their place so every descriptor in the table is valid.

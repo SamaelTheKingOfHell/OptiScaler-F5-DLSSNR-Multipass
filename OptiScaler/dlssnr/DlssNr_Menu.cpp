@@ -1,4 +1,5 @@
 #include "pch.h"
+#include <dlssnr/worker/WorkerStatus.h>
 #include "DlssNrFeature_Vk.h"
 
 #include "DlssNr.h"
@@ -2222,6 +2223,22 @@ static void RenderStatusPage(Config* config, float menuResScale, const NrCommon&
                        "gentler, steadier extra passes. Default: 1.0. No effect with 1 pass.");
         }
 
+        bool multiGpu = config->DlssNrMultiGpu.value_or_default();
+        if (ImGui::Checkbox("Use a second GPU for neural passes (experimental)", &multiGpu))
+            config->DlssNrMultiGpu = multiGpu;
+        HelpMarker("For native DirectX 12 Finished Picture. The game GPU runs the first passes, then the second NVIDIA "
+                   "GPU runs the remaining passes and returns the result to the game GPU. Other modes use the game GPU. "
+                   "Transfers and waiting may reduce performance.");
+        if (multiGpu)
+        {
+            const int total = (int) std::clamp(config->DlssNrPasses.value_or_default(), 1u, passLimit);
+            int primary = (int) std::min(config->DlssNrPrimaryPasses.value_or_default(), (uint32_t) total);
+            if (ImGui::SliderInt("Passes on game GPU", &primary, 0, total))
+                config->DlssNrPrimaryPasses = (uint32_t) primary;
+            const char* status = config->DlssNrFinishedPicture.value_or_default()
+                                     ? DlssNr::Worker::StatusText() : "Enable Finished Picture to use the second GPU";
+            ImGui::TextWrapped("%d on game GPU, %d on second GPU. %s", primary, total - primary, status);
+        }
         ImGui::PopItemWidth();
     }
 

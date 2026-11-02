@@ -69,6 +69,8 @@ inline constexpr std::string_view kKeptKeys[] = {
     "MaxRatio",
     "ReversibleMode",
     "Passes",
+    "MultiGpu",
+    "PrimaryPasses",
     "PassFeedback",
     "UnlockPasses",
     "Style",
