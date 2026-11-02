@@ -459,6 +459,8 @@ dlssg_for_sm86/
 # Local operational material
 /.agents/
 /.cluster/
+/agents/
+/knowledge/
 /WINDEX.md
 /INDEX.md
 /OBJECTIVE.md
