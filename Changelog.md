@@ -1,3 +1,9 @@
+## 2026-11-03 — Experimental automatic GPU pass balancing (WIP)
+
+- Added optional `MultiGpuAutoBalance` on the pass page, persisted in settings and named profiles. Measured native-picture intervals drive bounded split trials, including primary-only placement, with warmup exclusion, median/p95 comparisons, hysteresis and cooldown. Presets, runtimes, pass count, appearance and saved manual masks remain unchanged.
+- Unsupported routes avoid the delayed-picture snapshot/presentation copies. Active pipeline status no longer alternates two log messages each frame. The menu reports effective placement and calibration phase; manual handoff controls disable automatic placement.
+- OpenAI Codex, GPT-6.1 Sol (reasoning effort unavailable). Release build, Finished Picture regressions, profile coverage and scheduling-policy checks passed. Deterministic scheduling test vectors are not GPU performance measurements. In-game calibration, throughput and visual acceptance remain pending. See `docs/Automatic-GPU-balance.md`.
+
 ## 2026-11-03 — Parallel frame-overlap prototype (WIP)
 
 - Added optional `MultiGpuPipelined` controls on the first secondary pass card. One owned picture may await secondary inference while the game renders ahead; the full completed picture returns to primary presentation. The cooperative recorder retains its settings and resources and releases its mutex and compute-state envelope while suspended. The initial mode adds buffering latency and supports up to three passes.

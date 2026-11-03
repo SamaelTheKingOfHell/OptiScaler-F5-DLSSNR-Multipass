@@ -23,6 +23,7 @@ $end = $late.IndexOf('// The body of ApplyNativeInput', $start)
 if ($start -lt 0 -or $end -le $start) { throw 'Finished Picture routing source markers changed.' }
 [IO.File]::WriteAllText((Join-Path $validation 'FinishedRouting.inl'), $late.Substring($start, $end - $start), [Text.UTF8Encoding]::new($false))
 $cases = @(
+    @{ Source = 'tests/nr_adaptive_balance.cpp'; Libs = '' },
     @{ Source = 'tests/nr_gpu/nr_streamline_hooks.cpp'; Libs = 'd3d12.lib dxgi.lib' },
     @{ Source = 'tests/nr_gpu/nr_streamline_picture_smoke.cpp'; Libs = 'd3d12.lib dxgi.lib' },
     @{ Source = 'tests/nr_gpu/nr_finished_routing.cpp'; Libs = 'd3d12.lib dxgi.lib' },

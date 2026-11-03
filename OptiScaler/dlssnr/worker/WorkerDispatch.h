@@ -19,6 +19,8 @@ struct DispatchContext
     bool needsRetirement = false;
     bool unusable = false;
     bool pipelineRequested = false;
+    unsigned adaptivePrimaryPasses = ~0u;
+    bool balanceEligible = false;
     std::shared_ptr<DispatchTask> deferredTask;
 };
 } // namespace DlssNr::Worker

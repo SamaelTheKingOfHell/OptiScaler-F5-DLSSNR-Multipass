@@ -1,5 +1,6 @@
 #include "pch.h"
 #include <dlssnr/worker/WorkerStatus.h>
+#include <dlssnr/worker/AdaptiveBalanceStatus.h>
 #include <dlssnr/worker/WorkerGpuTelemetry.h>
 #include <dlssnr/DlssNr_MultiGpuPlan.h>
 #include <dlssnr/DlssNr_SecondaryModelMenu.h>
@@ -4186,15 +4187,21 @@ static void RenderPassesPage(Config* config, float menuResScale)
             secondaryMask = selected ? (secondaryMask | bit) : (secondaryMask & ~bit);
             config->DlssNrSecondaryPassMask = secondaryMask;
             config->DlssNrMultiGpu = secondaryMask != 0;
+            config->DlssNrMultiGpuAutoBalance = false;
         }
         HelpMarker("The first checked pass starts the second GPU. That pass and all later passes run together on it; "
                    "the picture returns to the game GPU. Requires DirectX 12 Finished Picture and no frame generation.");
         const auto plan = DlssNr::MultiGpu::MakePassPlanFromMask(visiblePasses, secondaryMask, MaxPassCount);
-        if (plan && pass < visiblePasses)
+        const auto automaticPhase = DlssNr::Worker::AdaptiveStatus::phase.load(std::memory_order_relaxed);
+        if (config->DlssNrMultiGpuAutoBalance.value_or_default() && automaticPhase >= 2 && pass < visiblePasses)
+            ImGui::TextDisabled("Effective device: %s", pass < DlssNr::Worker::AdaptiveStatus::primaryPasses.load(std::memory_order_relaxed)
+                                                        ? "game GPU" : "second GPU");
+        else if (plan && pass < visiblePasses)
             ImGui::TextDisabled("Planned device: %s", plan->IsPrimary(pass) ? "game GPU" : "second GPU");
         else if (pass >= visiblePasses)
             ImGui::TextDisabled("This pass is not active at the current pass count.");
-        if (plan && plan->HasSecondary() && pass == plan->primaryPasses)
+        if ((config->DlssNrMultiGpuAutoBalance.value_or_default() && pass == 0) ||
+            (!config->DlssNrMultiGpuAutoBalance.value_or_default() && plan && plan->HasSecondary() && pass == plan->primaryPasses))
         {
             DlssNr::Worker::SecondaryModelMenu::Render(*config,
                 { Util::DllPath().remove_filename(), Util::ExePath().remove_filename() });
@@ -4209,9 +4216,38 @@ static void RenderPassesPage(Config* config, float menuResScale)
     };
 
     ImGui::TextWrapped("Settings apply when you release a slider.");
+    bool automatic = config->DlssNrMultiGpuAutoBalance.value_or_default();
+    if (ImGui::Checkbox("Automatically balance GPU passes", &automatic))
+    {
+        config->DlssNrMultiGpuAutoBalance = automatic;
+        if (automatic) config->DlssNrMultiGpu = true;
+    }
+    HelpMarker("Experimental: compares measured picture intervals for different GPU pass splits, including the game GPU alone. "
+               "Presets, runtime selection and appearance stay unchanged. Trials are at least 30 seconds apart; calibration "
+               "takes several minutes. Requires native DX12 Finished Picture, up to three passes, frame generation and "
+               "detail/edit reuse off. Manual pass checkboxes switch automatic balancing off. Use runtimes that support "
+               "every pass preset that may move to them.");
+    if (automatic)
+    {
+        using namespace DlssNr::Worker::AdaptiveStatus;
+        const auto currentPhase = phase.load(std::memory_order_relaxed);
+        const char* names[] = { "Off", "Waiting for a supported picture", "Warming up this split", "Measuring this split",
+                                "Keeping the measured best split", "Waiting before the next split trial" };
+        ImGui::TextWrapped("Automatic placement: %s", names[std::min(currentPhase, 5u)]);
+        const auto primary = primaryPasses.load(std::memory_order_relaxed);
+        const auto total = totalPasses.load(std::memory_order_relaxed);
+        if (currentPhase >= 2 && primary <= total)
+            ImGui::Text("Effective passes: %u game GPU / %u second GPU", primary, total - primary);
+        const auto median = medianFrameMs.load(std::memory_order_relaxed);
+        if (median > 0)
+            ImGui::Text("Measured picture interval: %.1f ms median / %.1f ms p95", median,
+                        p95FrameMs.load(std::memory_order_relaxed));
+    }
     ImGui::TextWrapped("Second GPU: %s", DlssNr::Worker::StatusText());
     if (DlssNr::Worker::currentStatus.load(std::memory_order_relaxed) == DlssNr::Worker::Status::Running)
-        ImGui::Text(config->DlssNrMultiGpuPipelined.value_or_default() ? "Remaining CPU wait: %.1f ms" : "CPU handoff wait: %.1f ms", DlssNr::Worker::handoffMilliseconds.load(std::memory_order_relaxed));
+        ImGui::Text(DlssNr::Worker::AdaptiveStatus::pipelineActive.load(std::memory_order_relaxed)
+                        ? "Remaining CPU wait: %.1f ms" : "CPU handoff wait: %.1f ms",
+                    DlssNr::Worker::handoffMilliseconds.load(std::memory_order_relaxed));
     if (config->DlssNrDetailReuse.value_or_default() || config->DlssNrEditCache.value_or_default())
         ImGui::TextWrapped("Detail reuse or edit cache can keep passes on the game GPU; turn them off to use the second GPU.");
     const auto gpuReadings = DlssNr::Worker::Telemetry().Readings();

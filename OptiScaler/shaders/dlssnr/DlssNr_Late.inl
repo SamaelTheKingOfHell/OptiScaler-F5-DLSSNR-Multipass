@@ -33,6 +33,7 @@ bool reset = true;
 uint64_t resetVersion = 0;
 void RequestReset() { reset = true; ++resetVersion; }
 void FinishReset(bool ran, uint64_t atStart) { reset = !ran || resetVersion != atStart; }
+#include "DlssNr_AdaptiveRun.inl"
 Slot* pendingPipeline = nullptr;
 std::unique_ptr<Worker::FinishedPicturePresenter> presenter;
 Slot* CompletePipeline();
@@ -517,12 +518,11 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
     // Complete the previous NR recording before shared state is touched by this one.
     auto* completedPipeline = Late::CompletePipeline();
     if (Late::pendingPipeline || g_dispatchQuarantined) return;
-    const bool pipelineMode = Config::Instance()->DlssNrMultiGpuPipelined.value_or_default() &&
-        Config::Instance()->DlssNrMultiGpu.value_or_default() && !gameFrameHandoff &&
-        Config::Instance()->DlssNrPasses.value_or_default() <= DlssNr::DefaultMaxPassCount &&
-        Config::Instance()->DlssNrMultiViewScreens.value_or_default() == 0 &&
-        !(State::Instance().currentFG && State::Instance().currentFG->IsActive() &&
-          !State::Instance().currentFG->IsPaused());
+    const bool supportedRoute = Late::Automatic::ConfiguredRoute(*Config::Instance(), gameFrameHandoff);
+    if (!supportedRoute || !Config::Instance()->DlssNrMultiGpuAutoBalance.value_or_default())
+        Late::Automatic::Configure(*Config::Instance(), desc, {}, false);
+    bool pipelineMode = Config::Instance()->DlssNrMultiGpuPipelined.value_or_default() && supportedRoute;
+    Worker::AdaptiveStatus::pipelineActive.store(false, std::memory_order_relaxed);
     const auto presentCompleted = [&] {
         if (pipelineMode) Late::PresentCompleted(completedPipeline, picture, queue, colorSpace);
     };
@@ -603,6 +603,18 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
     auto* cmd = slot.commands.Get();
     slot.workerContext = {};
     auto& workerContext = slot.workerContext;
+    workerContext.adaptivePrimaryPasses = Late::Automatic::Configure(*Config::Instance(), desc, slot.frame,
+                                                                   supportedRoute && !slot.residualOnly);
+    const auto balanceContext = Late::Automatic::controller.Context();
+    const auto balanceRevision = Late::Automatic::controller.Revision();
+    const auto balancePrimary = workerContext.adaptivePrimaryPasses;
+    const auto totalPasses = Config::Instance()->DlssNrPasses.value_or_default();
+    const auto configuredPlan = Config::Instance()->DlssNrSecondaryPassMask.has_value()
+        ? MultiGpu::MakePassPlanFromMask(totalPasses, Config::Instance()->DlssNrSecondaryPassMask.value(), MaxPassCount)
+        : MultiGpu::MakePassPlan(totalPasses, Config::Instance()->DlssNrPrimaryPasses.value_or_default(), MaxPassCount);
+    const bool hasSecondary = balancePrimary != ~0u ? balancePrimary < totalPasses
+        : configuredPlan && configuredPlan->HasSecondary();
+    pipelineMode = pipelineMode && hasSecondary;
     workerContext.pipelineRequested = pipelineMode && !slot.residualOnly;
     if (workerContext.pipelineRequested)
     {
@@ -732,7 +744,8 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
     }
     auto finish = [slotPointer = &slot, queueOwner = Late::ComPtr<ID3D12CommandQueue>(queue),
                    colorOwner = color, conversion, pq, colorReady, before, appliedResidual,
-                   gameFrameHandoff, desc, resetAtStart, apply = Config::Instance()->DlssNrApplyModel.value_or_default()]() mutable -> bool
+                   gameFrameHandoff, desc, resetAtStart, balanceContext, balanceRevision, balancePrimary,
+                   apply = Config::Instance()->DlssNrApplyModel.value_or_default()]() mutable -> bool
     {
         auto& slot = *slotPointer;
         auto& workerContext = slot.workerContext;
@@ -804,7 +817,9 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
         }
         const bool ran = slot.residualOnly ? appliedResidual : g_nr.successfulDispatches > before;
         Late::FinishReset(ran, resetAtStart);
+        Late::Automatic::Completed(balanceContext, balanceRevision, slot.serial, balancePrimary, ran, workerContext);
         Late::Say(!apply ? "NR changes are hidden."
+                  : ran && workerContext.deferredTask ? "Pipelined NR: rendering ahead while the second GPU processes the previous picture."
                   : ran ? (slot.residualOnly  ? "Applying the pre-SR changes to the finished picture."
                            : gameFrameHandoff ? "Applying NR before Streamline interpolation."
                                               : "Applying NR to the finished picture.")
@@ -823,6 +838,7 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
         slot.pending = false;
         slot.finishPipeline = std::move(finish);
         Late::pendingPipeline = &slot;
+        Worker::AdaptiveStatus::pipelineActive.store(true, std::memory_order_relaxed);
         Late::Say("Pipelined NR: rendering ahead while the second GPU processes the previous picture.");
         presentCompleted();
         return;

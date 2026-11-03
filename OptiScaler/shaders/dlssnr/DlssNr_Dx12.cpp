@@ -52,6 +52,8 @@
 #include <dlssnr/DlssNr_OwnedCommandChain.h>
 #include <dlssnr/DlssNr_CrossAdapterSelect.h>
 #include <dlssnr/DlssNr_MultiGpuPlan.h>
+#include <dlssnr/DlssNr_AdaptiveBalance.h>
+#include <dlssnr/worker/AdaptiveBalanceStatus.h>
 #include <dlssnr/worker/WorkerModelCatalog.h>
 #include <proxies/D3D12_Proxy.h>
 #include <proxies/DXGI_Proxy.h>
@@ -5711,7 +5713,9 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
     if (g_ngxTime != nullptr)
         g_ngxTime->Start(cmdList);
 
-    const auto placement = cfg.DlssNrSecondaryPassMask.has_value()
+    const auto placement = workerContext && workerContext->adaptivePrimaryPasses <= effectivePasses
+        ? DlssNr::MultiGpu::MakePassPlan(effectivePasses, workerContext->adaptivePrimaryPasses, DlssNr::MaxPassCount)
+        : cfg.DlssNrSecondaryPassMask.has_value()
         ? DlssNr::MultiGpu::MakePassPlanFromMask(effectivePasses, cfg.DlssNrSecondaryPassMask.value(),
                                                 DlssNr::MaxPassCount)
         : DlssNr::MultiGpu::MakePassPlan(effectivePasses, cfg.DlssNrPrimaryPasses.value_or_default(),
@@ -5723,6 +5727,8 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
         !g_multiRun && !superior && !spatial && !reusePlan.active && !cachePlan.runs && !fgActive;
     if (workerContext)
     {
+        workerContext->balanceEligible = !g_multiRun && !superior && !spatial && !reusePlan.active &&
+            !cachePlan.runs && !fgActive && !reused && !cached;
         if (!cfg.DlssNrMultiGpu.value_or_default()) MultiGpuRun::Disabled();
         else if (!multiEligible || reused || cached)
         {
