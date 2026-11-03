@@ -1,3 +1,9 @@
+## 2026-11-03 — Parallel frame-overlap prototype (WIP)
+
+- Added optional `MultiGpuPipelined` controls on the first secondary pass card. One owned picture may await secondary inference while the game renders ahead; the full completed picture returns to primary presentation. The cooperative recorder retains its settings and resources and releases its mutex and compute-state envelope while suspended. The initial mode adds buffering latency and supports up to three passes.
+- Added nonblocking worker submission and polling, exact-queue retirement acknowledgement, a bounded whole-picture presenter, deferred reset tracking and drain/quarantine handling. Legacy synchronous APIs and completed-fence reuse guards remain available.
+- OpenAI Codex, GPT-6.1 Sol (reasoning effort unavailable), implementation and independent review. Thirty real-model synchronous/asynchronous transport checksums matched; gated queue reuse, worker exit and invalid-guide cases passed. WARP/debug whole-picture presentation and Finished Picture regression checks passed. Release compilation passed during integration; complete game behavior, throughput and latency remain unverified. See `docs/Parallel-Multi-GPU.md`.
+
 ## 2026-11-02 — Independent secondary runtimes and worker reuse (WIP)
 
 - Added named, side-by-side secondary-GPU runtimes, selected inside the first secondary pass card and persisted as `SecondaryModel`. The primary runtime and per-pass presets remain separate. Runtime DLLs are supplied by the user; see `docs/Multi-GPU-runtimes.md` for the experimental Ampere Preset B candidate and its published identity.

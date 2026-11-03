@@ -25,15 +25,19 @@ struct HandoffResult
 // COPY_SOURCE. On failure after PrimarySubmitted, the caller must retain all referenced resources
 // and allocators until its own primary queue retirement fence completes. The caller must stop the
 // worker on failure, and must not consume or reuse the shared buffer until that cleanup is safe.
-inline HandoffResult SendFrameAndWait(FrameTransfer& transfer, WorkerClient& worker, MultiGpu::OwnedCommandChain& chain,
-                                      ID3D12CommandQueue* queue, const FrameCommand& frame, ID3D12Resource* color,
-                                      ID3D12Resource* depth, ID3D12Resource* motion, DWORD timeoutMs)
+// Success means outbound submission only; poll or wait for worker return before recording inbound reads.
+// ```cpp
+// auto sent = SendFrame(transfer, worker, chain, queue, frame, color, depth, motion);
+// ```
+inline HandoffResult SendFrame(FrameTransfer& transfer, WorkerClient& worker, MultiGpu::OwnedCommandChain& chain,
+                               ID3D12CommandQueue* queue, const FrameCommand& frame, ID3D12Resource* color,
+                               ID3D12Resource* depth, ID3D12Resource* motion)
 {
     HandoffResult result { E_INVALIDARG, HandoffPhase::Validate };
     auto* commands = chain.Current();
     if (!commands || !queue || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT ||
         !transfer.Buffer().PrimaryBuffer() || !transfer.Buffer().PrimaryReady() || !chain.UsesQueue(queue) ||
-        !worker.UsesTransfer(transfer.Buffer()) || timeoutMs == INFINITE)
+        !worker.UsesTransfer(transfer.Buffer()))
         return result;
     Microsoft::WRL::ComPtr<ID3D12Device> fromQueue, fromBuffer;
     Microsoft::WRL::ComPtr<IUnknown> a, b;
@@ -72,6 +76,22 @@ inline HandoffResult SendFrameAndWait(FrameTransfer& transfer, WorkerClient& wor
         return result;
     }
     result.phase = HandoffPhase::OutboundSignalled;
+    result.result = S_OK;
+    return result;
+}
+
+// Compatibility entry point: dispatch the same frame, then wait a finite time.
+// ```cpp
+// auto result = SendFrameAndWait(transfer, worker, chain, queue, frame, color, depth, motion, 10000);
+// ```
+inline HandoffResult SendFrameAndWait(FrameTransfer& transfer, WorkerClient& worker, MultiGpu::OwnedCommandChain& chain,
+                                      ID3D12CommandQueue* queue, const FrameCommand& frame, ID3D12Resource* color,
+                                      ID3D12Resource* depth, ID3D12Resource* motion, DWORD timeoutMs)
+{
+    if (timeoutMs == INFINITE)
+        return { E_INVALIDARG, HandoffPhase::Validate };
+    auto result = SendFrame(transfer, worker, chain, queue, frame, color, depth, motion);
+    if (FAILED(result.result)) return result;
     const auto waited = worker.WaitForReturn(frame.frameNumber, timeoutMs);
     if (waited != MultiGpu::WorkerFenceWaitResult::Ready)
     {

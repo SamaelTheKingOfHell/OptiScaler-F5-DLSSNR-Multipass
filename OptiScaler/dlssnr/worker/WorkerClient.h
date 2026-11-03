@@ -17,6 +17,7 @@ namespace DlssNr::Worker
 // resources. A worker failure never queues a GPU wait on its fence. Calls are externally serialized.
 class WorkerClient
 {
+    friend class WorkerGeneration;
     struct Handle
     {
         HANDLE value = nullptr;
@@ -92,6 +93,24 @@ class WorkerClient
         Microsoft::WRL::ComPtr<IUnknown> a, b;
         return SUCCEEDED(child->GetDevice(IID_PPV_ARGS(&owner))) && owner && SUCCEEDED(primary_.As(&a)) &&
                SUCCEEDED(owner.As(&b)) && a.Get() == b.Get();
+    }
+    // Only WorkerGeneration can authorize this ordered-queue fast path. It has
+    // verified that the submitted return and the next outbound share one queue.
+    HRESULT AcknowledgeQueuedReturn(uint64_t frame, ID3D12Fence* primaryRetirement, uint64_t value,
+                                    ID3D12CommandQueue* queue)
+    {
+        if (state_ != State::Returned || frame != nextFrame_ || !Owns(primaryRetirement) || !Owns(queue) ||
+            !value || value == (std::numeric_limits<uint64_t>::max)())
+            return E_INVALIDARG;
+        if (primaryRetirement->GetCompletedValue() == (std::numeric_limits<uint64_t>::max)() ||
+            FAILED(primary_->GetDeviceRemovedReason()))
+        {
+            state_ = State::Failed;
+            return DXGI_ERROR_DEVICE_REMOVED;
+        }
+        ++nextFrame_;
+        state_ = State::Idle;
+        return S_OK;
     }
     static HRESULT LastErrorResult()
     {
@@ -286,6 +305,21 @@ class WorkerClient
         }
         state_ = State::Pending;
         return S_OK;
+    }
+    // Polling a live worker leaves its pending state intact until the GPU returns.
+    // ```cpp
+    // if (client.PollReturn(frameNumber) == E_PENDING) RecordIndependentPrimaryWork();
+    // ```
+    HRESULT PollReturn(uint64_t frame)
+    {
+        if (frame != nextFrame_ || (state_ != State::Pending && state_ != State::Returned))
+            return state_ == State::Failed ? E_ABORT : E_INVALIDARG;
+        if (state_ == State::Returned) return S_OK;
+        const auto result = MultiGpu::WaitForFenceOrPeer(transfer_.PrimaryDone(), frame, process_.value, 0);
+        if (result == MultiGpu::WorkerFenceWaitResult::Timeout) return E_PENDING;
+        state_ = result == MultiGpu::WorkerFenceWaitResult::Ready ? State::Returned : State::Failed;
+        return result == MultiGpu::WorkerFenceWaitResult::Ready ? S_OK
+             : result == MultiGpu::WorkerFenceWaitResult::DeviceLost ? DXGI_ERROR_DEVICE_REMOVED : E_ABORT;
     }
     MultiGpu::WorkerFenceWaitResult WaitForReturn(uint64_t frame, DWORD timeoutMs)
     {

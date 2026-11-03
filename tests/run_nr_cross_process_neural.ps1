@@ -5,7 +5,8 @@ param([string]$VcVars, [string]$CoreDll, [string]$WorkerExe, [string]$ParentWork
       [ValidateRange(1,16384)][int]$Width = 256, [ValidateRange(1,16384)][int]$Height = 144,
       [switch]$NoPrimaryPass, [switch]$FailureTest, [switch]$ResetSecondFrame, [switch]$NoDepth,
       [switch]$HalfGuides, [switch]$Rgba8, [switch]$OffsetGuides, [switch]$InvalidGuides, [switch]$DepthStencil,
-      [switch]$Benchmark, [switch]$VerifyWorkerIsolation, [switch]$MainPreset, [switch]$SwapAdapters, [switch]$BuildOnly)
+      [switch]$Benchmark, [switch]$VerifyWorkerIsolation, [switch]$MainPreset, [switch]$SwapAdapters,
+      [switch]$AsyncHandoff, [switch]$BuildOnly)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 if (!$CoreDll) {
@@ -65,6 +66,7 @@ try {
     if ($VerifyWorkerIsolation) { $probeArgs += '--verify-isolation' }
     if ($MainPreset) { $probeArgs += '--main-preset' }
     if ($SwapAdapters) { $probeArgs += '--swap-adapters' }
+    if ($AsyncHandoff) { $probeArgs += '--async-handoff' }
     if ($SecondaryModelDll) { $probeArgs += @('--secondary-model', $SecondaryModelDll) }
     if (Test-Path -LiteralPath $log) { Set-Content -LiteralPath $log -Value '' }
     if ($ParentWorkingDirectory) {

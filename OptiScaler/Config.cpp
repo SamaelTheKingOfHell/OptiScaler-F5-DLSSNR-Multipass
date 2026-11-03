@@ -1239,6 +1239,7 @@ void Config::ReadDlssNr()
     DlssNrScanTrim.set_from_config(readFloat("DlssNr", "ScanTrim"));
     DlssNrPasses.set_from_config(readUInt("DlssNr", "Passes"));
     DlssNrMultiGpu.set_from_config(readBool("DlssNr", "MultiGpu"));
+    DlssNrMultiGpuPipelined.set_from_config(readBool("DlssNr", "MultiGpuPipelined"));
     DlssNrPrimaryPasses.set_from_config(readUInt("DlssNr", "PrimaryPasses"));
     DlssNrSecondaryPassMask.set_from_config(readUInt("DlssNr", "SecondaryPassMask"));
     DlssNrSecondaryModel.set_from_config(readString("DlssNr", "SecondaryModel"));
@@ -1488,6 +1489,7 @@ static void WriteDlssNr(Config& c, CSimpleIniA& out)
     out.SetValue("DlssNr", "ScanMeter", GetBoolValue(c.DlssNrScanMeter.value_for_config()).c_str());
     out.SetValue("DlssNr", "Passes", GetIntValue(c.DlssNrPasses.value_for_config()).c_str());
     out.SetValue("DlssNr", "MultiGpu", GetBoolValue(c.DlssNrMultiGpu.value_for_config()).c_str());
+    out.SetValue("DlssNr", "MultiGpuPipelined", GetBoolValue(c.DlssNrMultiGpuPipelined.value_for_config()).c_str());
     out.SetValue("DlssNr", "PrimaryPasses", GetIntValue(c.DlssNrPrimaryPasses.value_for_config()).c_str());
     out.SetValue("DlssNr", "SecondaryPassMask", GetIntValue(c.DlssNrSecondaryPassMask.value_for_config()).c_str());
     out.SetValue("DlssNr", "SecondaryModel", c.DlssNrSecondaryModel.value_for_config_or("").c_str());
@@ -1758,6 +1760,7 @@ size_t Config::ApplyDlssNrSection(const DlssNrProfiles::Section& section)
         NR_PROFILE_FIELD("ReversibleMode", DlssNrReversibleMode),
         NR_PROFILE_FIELD("Passes", DlssNrPasses),
         NR_PROFILE_FIELD("MultiGpu", DlssNrMultiGpu),
+        NR_PROFILE_FIELD("MultiGpuPipelined", DlssNrMultiGpuPipelined),
         NR_PROFILE_FIELD("PrimaryPasses", DlssNrPrimaryPasses),
         NR_PROFILE_FIELD("SecondaryPassMask", DlssNrSecondaryPassMask),
         NR_PROFILE_FIELD("SecondaryModel", DlssNrSecondaryModel),

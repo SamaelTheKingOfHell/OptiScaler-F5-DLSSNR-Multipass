@@ -197,12 +197,134 @@ static ComPtr<ID3D12GraphicsCommandList> Commands(ID3D12Device* device, ComPtr<I
         "Create neural command list");
     return commands;
 }
+static uint64_t ReturnedChecksum(ID3D12Resource* readback, const NrFixture::Surface& surface, unsigned width, bool rgba8)
+{
+    D3D12_RANGE range { 0, static_cast<SIZE_T>(surface.bytes) }, noWrite { 0, 0 };
+    uint8_t* mapped = nullptr;
+    Check(readback->Map(0, &range, reinterpret_cast<void**>(&mapped)), "Map returned checksum");
+    bool finite = true, nonzero = false;
+    uint64_t checksum = 1469598103934665603ull;
+    for (UINT y = 0; y < surface.rows; ++y)
+        for (unsigned x = 0; x < width; ++x)
+            for (unsigned c = 0; c < 3; ++c)
+            {
+                const auto* row = mapped + y * surface.footprint.Footprint.RowPitch;
+                const uint16_t value = rgba8 ? row[x * 4 + c] : reinterpret_cast<const uint16_t*>(row)[x * 4 + c];
+                if (!rgba8) finite = finite && (value & 0x7c00u) != 0x7c00u;
+                nonzero = nonzero || (rgba8 ? value != 0 : (value & 0x7fffu) != 0);
+                checksum = (checksum ^ value) * 1099511628211ull;
+            }
+    readback->Unmap(0, &noWrite);
+    if (!finite || !nonzero) throw std::runtime_error("Returned neural output was nonfinite or empty");
+    return checksum;
+}
+
+// Two additional real neural frames prove A's queued return is read before B
+// overwrites shared storage. A reference copy is taken before the local gate.
+static void CheckQueuedReturn(DlssNr::Worker::WorkerGeneration& generation, ID3D12Device* device,
+                              ID3D12CommandQueue* queue, Frame& frame, ID3D12Resource* color,
+                              unsigned width, unsigned height, bool rgba8)
+{
+    ComPtr<ID3D12CommandAllocator> firstAllocator, secondAllocator;
+    auto firstCommands = Commands(device, firstAllocator), secondCommands = Commands(device, secondAllocator);
+    DlssNr::MultiGpu::OwnedCommandChain first, second;
+    Check(first.Initialize(device, queue, firstCommands.Get()), "Initialize queued-return first chain");
+    Check(second.Initialize(device, queue, secondCommands.Get()), "Initialize queued-return second chain");
+    D3D12_COMMAND_QUEUE_DESC description {};
+    description.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ComPtr<ID3D12CommandQueue> wrongQueue;
+    Check(device->CreateCommandQueue(&description, IID_PPV_ARGS(&wrongQueue)), "Create wrong return queue");
+    ComPtr<ID3D12Fence> gate, firstRetirement, secondRetirement, foreignRetirement;
+    ComPtr<ID3D12Device> foreignDevice;
+    Check(generation.Transfer().Buffer().SecondaryBuffer()->GetDevice(IID_PPV_ARGS(&foreignDevice)),
+          "Get secondary fence device");
+    Check(foreignDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&foreignRetirement)),
+          "Create foreign return fence");
+    Check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)), "Create local queued-return gate");
+    Check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&firstRetirement)), "Create first return fence");
+    Check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&secondRetirement)), "Create second return fence");
+    std::array<NrFixture::Surface, 3> returned;
+    std::array<ComPtr<ID3D12Resource>, 3> readbacks;
+    for (size_t i = 0; i < returned.size(); ++i)
+    {
+        if (!NrFixture::MakeSurface(device, frame.colorFormat, false, returned[i], width, height))
+            throw std::runtime_error("Create queued-return texture failed");
+        readbacks[i] = Buffer(device, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, frame.color.bytes);
+    }
+    // Declared after the resources so cleanup releases the local gate and retires
+    // submitted primary commands before any referenced object is destroyed.
+    struct Cleanup
+    {
+        ID3D12Device* device;
+        ID3D12CommandQueue* queue;
+        ID3D12Fence* gate;
+        ~Cleanup() { gate->Signal(1); Retire(device, queue); }
+    } cleanup { device, queue, gate.Get() };
+    auto copy = [&](ID3D12GraphicsCommandList* commands, size_t i)
+    {
+        Transition(commands, returned[i].texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+        auto from = NrFixture::Texture(returned[i].texture.Get());
+        auto to = NrFixture::Buffer(readbacks[i].Get(), returned[i].footprint);
+        commands->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    };
+    DlssNr::Worker::FrameCommand command {};
+    command.guideWidth = command.motionWidth = frame.guideWidth;
+    command.guideHeight = command.motionHeight = frame.guideHeight;
+    command.depthX = command.motionX = frame.guideX;
+    command.depthY = command.motionY = frame.guideY;
+    Check(generation.SubmitAsync(first, queue, command, color, frame.depth.texture.Get(), frame.motion.texture.Get()).result,
+          "Submit queued-return first frame");
+    Check(generation.WaitReturn(60000), "Wait for queued-return first frame");
+    Check(generation.Transfer().RecordInbound(first.Current(), returned[0].texture.Get()), "Record reference return");
+    copy(first.Current(), 0);
+    Check(first.Split(), "Submit reference return");
+    Retire(device, queue);
+    Check(generation.RecordReturn(first.Current(), returned[1].texture.Get()), "Record queued actual return");
+    copy(first.Current(), 1);
+    Check(queue->Wait(gate.Get(), 1), "Gate queued actual return");
+    Check(first.SubmitFinal(), "Submit queued actual return");
+    Check(queue->Signal(firstRetirement.Get(), 1), "Signal queued actual return");
+    if (generation.TrackRetirement(firstRetirement.Get(), 1, wrongQueue.Get()) != E_INVALIDARG ||
+        generation.TrackRetirement(firstRetirement.Get(), 0, queue) != E_INVALIDARG ||
+        generation.TrackRetirement(firstRetirement.Get(), (std::numeric_limits<uint64_t>::max)(), queue) != E_INVALIDARG ||
+        generation.TrackRetirement(foreignRetirement.Get(), 1, queue) != E_INVALIDARG)
+        throw std::runtime_error("Accepted invalid queue-ordered retirement");
+    Check(generation.TrackRetirement(firstRetirement.Get(), 1, queue), "Track queued actual return");
+    if (generation.Poll() != E_PENDING || generation.PollForQueue(wrongQueue.Get()) != E_INVALIDARG)
+        throw std::runtime_error("Strict polling or queue identity guard failed");
+    Check(generation.PollForQueue(queue), "Acknowledge same-queue ordered return");
+    if (generation.SubmitAsync(second, wrongQueue.Get(), command, color, frame.depth.texture.Get(),
+                               frame.motion.texture.Get()).result != E_INVALIDARG)
+        throw std::runtime_error("Accepted another queue after ordered acknowledgment");
+    Check(generation.SubmitAsync(second, queue, command, color, frame.depth.texture.Get(), frame.motion.texture.Get()).result,
+          "Submit next frame before preceding return retires");
+    if (generation.PollReturn() != E_PENDING || firstRetirement->GetCompletedValue() != 0)
+        throw std::runtime_error("Next frame escaped local return gate");
+    Check(gate->Signal(1), "Release queued actual return");
+    Check(generation.WaitReturn(60000), "Wait for queued-return second frame");
+    Check(generation.RecordReturn(second.Current(), returned[2].texture.Get()), "Record queued-return second image");
+    copy(second.Current(), 2);
+    Check(generation.TrackRetirement(secondRetirement.Get(), 1), "Track strict second retirement");
+    Check(second.SubmitFinal(), "Submit queued-return second image");
+    Check(queue->Signal(secondRetirement.Get(), 1), "Signal strict second retirement");
+    Retire(device, queue);
+    Check(generation.Poll(), "Acknowledge strict second retirement");
+    const auto reference = ReturnedChecksum(readbacks[0].Get(), returned[0], width, rgba8);
+    const auto actual = ReturnedChecksum(readbacks[1].Get(), returned[1], width, rgba8);
+    const auto next = ReturnedChecksum(readbacks[2].Get(), returned[2], width, rgba8);
+    if (reference != actual) throw std::runtime_error("Next frame overwrote the queued return image");
+    CheckDebug(device);
+    std::cout << "Two additional queued-return frames preserved first-image checksum " << std::hex << actual
+              << "; next-image checksum " << next << std::dec << ".\n" << std::flush;
+}
+
 static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* model, const wchar_t* parentData,
                   const wchar_t* workerData, const wchar_t* log, const wchar_t* workerExe, bool primaryPass,
                   unsigned secondaryPasses, unsigned width, unsigned height, bool failureTest, bool resetSecondFrame,
                   bool noDepth, bool halfGuides, bool rgba8, bool offsetGuides, bool invalidGuides, bool depthStencil,
                   bool benchmark, bool verifyIsolation, bool mainPreset, bool swapAdapters,
-                  const wchar_t* secondaryModel)
+                  const wchar_t* secondaryModel, bool asyncHandoff)
 {
     MEMORYSTATUSEX memory { sizeof(memory) };
     if (!GlobalMemoryStatusEx(&memory) || memory.ullAvailPageFile < 8ull * 1024 * 1024 * 1024)
@@ -322,6 +444,8 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
         CheckWorkerDxgi(generation.ProcessHandle());
     auto& worker = generation.TestingClient();
     bool submitted = false;
+    ComPtr<ID3D12Fence> asyncGate;
+    ComPtr<ID3D12Resource> independentUpload, independentReadback;
     try
     {
         uint64_t previousChecksum = 0;
@@ -405,21 +529,75 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
                 rejectedHandoff.phase != DlssNr::Worker::HandoffPhase::Validate)
                 throw std::runtime_error("Accepted a different primary queue");
             submitted = true;
+            auto beginAsync = [&]()
+            {
+                auto require = [&](bool condition, const char* detail)
+                {
+                    if (condition) return;
+                    std::cerr << detail << '\n' << std::flush;
+                    // Release only this fixture's local queue gate before terminating.
+                    if (asyncGate) asyncGate->Signal(1);
+                    ExitProcess(3);
+                };
+                require(generation.PollReturn() == E_INVALIDARG && generation.WaitReturn(0) == E_INVALIDARG,
+                        "Accepted a return before a frame was submitted");
+                independentUpload = Buffer(primary.Get(), D3D12_HEAP_TYPE_UPLOAD,
+                                           D3D12_RESOURCE_STATE_GENERIC_READ, sizeof(uint32_t));
+                independentReadback = Buffer(primary.Get(), D3D12_HEAP_TYPE_READBACK,
+                                             D3D12_RESOURCE_STATE_COPY_DEST, sizeof(uint32_t));
+                const auto marker = static_cast<uint32_t>(frameNumber);
+                void* bytes = nullptr;
+                D3D12_RANGE noRead { 0, 0 };
+                Check(independentUpload->Map(0, &noRead, &bytes), "Map independent primary marker");
+                std::memcpy(bytes, &marker, sizeof(marker));
+                independentUpload->Unmap(0, nullptr);
+                Check(primary->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&asyncGate)), "Create local async gate");
+                // This fence is released by this CPU, never controlled by the worker.
+                // It makes the not-ready polling checks independent of GPU timing.
+                Check(session.Queue()->Wait(asyncGate.Get(), 1), "Gate async primary submission");
+                auto sent = generation.SubmitAsync(chain, session.Queue(), frameCommand, outboundColor,
+                                                   frame.depth.texture.Get(), frame.motion.texture.Get());
+                require(sent.result == S_OK && sent.phase == DlssNr::Worker::HandoffPhase::OutboundSignalled,
+                        "Async submission did not return before worker completion");
+                require((invalidGuides || (generation.PollReturn() == E_PENDING && generation.WaitReturn(0) == E_PENDING)) &&
+                            generation.WaitReturn(INFINITE) == E_INVALIDARG &&
+                            worker.PollReturn(frameNumber + 1) == E_INVALIDARG &&
+                            generation.Poll() == E_PENDING && generation.Stop(0) == E_PENDING,
+                        "Pending async polling changed or poisoned the frame state");
+                require(generation.RecordReturn(chain.Current(), frame.output.texture.Get()) == E_INVALIDARG,
+                        "Read worker output before completion");
+                const auto duplicate = generation.SubmitAsync(chain, session.Queue(), frameCommand, outboundColor,
+                                                              frame.depth.texture.Get(), frame.motion.texture.Get());
+                require(duplicate.result == E_PENDING && duplicate.phase == DlssNr::Worker::HandoffPhase::Validate,
+                        "Accepted a second async frame before return");
+                chain.Current()->CopyBufferRegion(independentReadback.Get(), 0, independentUpload.Get(), 0,
+                                                 sizeof(marker));
+                require(SUCCEEDED(chain.Split()) && chain.SubmittedCount() == 2,
+                        "Could not submit independent primary work before waiting");
+                require(SUCCEEDED(asyncGate->Signal(1)), "Could not release local async gate");
+                return sent;
+            };
             if (failureTest)
             {
-                Check(transferLayout.RecordOutbound(commands.Get(), outboundColor, frame.depth.texture.Get(),
-                                                    frame.motion.texture.Get()),
-                      "Record failure-test outbound");
-                Check(worker.SendFrame(frameCommand), "Send failure-test frame");
-                if (FAILED(chain.Split()) || FAILED(session.Queue()->Signal(transfer.PrimaryReady(), frameNumber)))
-                    ExitProcess(3);
+                if (asyncHandoff)
+                    beginAsync();
+                else
+                {
+                    Check(transferLayout.RecordOutbound(commands.Get(), outboundColor, frame.depth.texture.Get(),
+                                                        frame.motion.texture.Get()),
+                          "Record failure-test outbound");
+                    Check(worker.SendFrame(frameCommand), "Send failure-test frame");
+                    if (FAILED(chain.Split()) || FAILED(session.Queue()->Signal(transfer.PrimaryReady(), frameNumber)))
+                        ExitProcess(3);
+                }
                 Retire(primary.Get(), session.Queue());
                 submitted = false;
                 // Only this test's own child is terminated; the primary queue never waits on its fence.
                 if (!TerminateProcess(worker.ProcessHandle(), 42) ||
                     WaitForSingleObject(worker.ProcessHandle(), 30000) != WAIT_OBJECT_0)
                     throw std::runtime_error("Could not stop test worker");
-                if (worker.WaitForReturn(frameNumber, 1000) != DlssNr::MultiGpu::WorkerFenceWaitResult::PeerExited)
+                if (asyncHandoff ? generation.PollReturn() != E_ABORT || generation.WaitReturn(1000) != E_ABORT
+                                 : worker.WaitForReturn(frameNumber, 1000) != DlssNr::MultiGpu::WorkerFenceWaitResult::PeerExited)
                     throw std::runtime_error("Did not detect test worker exit");
                 Retire(primary.Get(), session.Queue());
                 Check(primary->GetDeviceRemovedReason(), "Primary device after worker exit");
@@ -428,8 +606,14 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
                 return 0;
             }
             const auto handoffStart = std::chrono::steady_clock::now();
-            const auto handoff = generation.Submit(chain, session.Queue(), frameCommand, outboundColor,
-                                                   frame.depth.texture.Get(), frame.motion.texture.Get(), 60000);
+            auto handoff = asyncHandoff ? beginAsync()
+                : generation.Submit(chain, session.Queue(), frameCommand, outboundColor,
+                                    frame.depth.texture.Get(), frame.motion.texture.Get(), 60000);
+            if (asyncHandoff && SUCCEEDED(handoff.result))
+            {
+                handoff.result = generation.WaitReturn(60000);
+                if (handoff.result == S_OK) handoff.phase = DlssNr::Worker::HandoffPhase::WorkerReturned;
+            }
             if (benchmark && frameNumber > 1)
                 handoffTimes.push_back(std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - handoffStart).count());
@@ -447,6 +631,14 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
             {
                 std::cerr << "Worker handoff failed; terminating isolated fixture.\n" << std::flush;
                 ExitProcess(3);
+            }
+            if (asyncHandoff)
+            {
+                const auto duplicate = generation.SubmitAsync(chain, session.Queue(), frameCommand, outboundColor,
+                                                              frame.depth.texture.Get(), frame.motion.texture.Get());
+                if (generation.PollReturn() != S_OK || generation.WaitReturn(0) != S_OK ||
+                    duplicate.result != E_PENDING || duplicate.phase != DlssNr::Worker::HandoffPhase::Validate)
+                    ExitProcess(3);
             }
             ComPtr<ID3D12Fence> pendingRetirement;
             Check(primary->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pendingRetirement)),
@@ -466,13 +658,27 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
             Check(generation.TrackRetirement(pendingRetirement.Get(), 1), "Track primary retirement");
             if (generation.Poll() != E_PENDING)
                 throw std::runtime_error("Reused a frame before primary retirement");
-            if (FAILED(chain.SubmitFinal()) || chain.SubmittedCount() != 2 || chain.Current() ||
+            if (asyncHandoff && (generation.PollReturn() != E_INVALIDARG ||
+                generation.SubmitAsync(chain, session.Queue(), frameCommand, outboundColor,
+                                      frame.depth.texture.Get(), frame.motion.texture.Get()).result != E_PENDING))
+                ExitProcess(3);
+            if (FAILED(chain.SubmitFinal()) || chain.SubmittedCount() != (asyncHandoff ? 3u : 2u) || chain.Current() ||
                 chain.Split() != E_ABORT || chain.SubmitFinal() != E_ABORT ||
                 FAILED(session.Queue()->Signal(pendingRetirement.Get(), 1)))
                 ExitProcess(3);
             Retire(primary.Get(), session.Queue());
             submitted = false;
             Check(generation.Poll(), "Acknowledge returned frame");
+            if (asyncHandoff)
+            {
+                D3D12_RANGE markerRange { 0, sizeof(uint32_t) }, markerNoWrite { 0, 0 };
+                uint32_t* marker = nullptr;
+                Check(independentReadback->Map(0, &markerRange, reinterpret_cast<void**>(&marker)),
+                      "Map independent primary result");
+                const bool matched = *marker == static_cast<uint32_t>(frameNumber);
+                independentReadback->Unmap(0, &markerNoWrite);
+                if (!matched) throw std::runtime_error("Independent primary work produced the wrong marker");
+            }
             CheckDebug(primary.Get());
             D3D12_RANGE range { 0, static_cast<SIZE_T>(frame.color.bytes) }, noWrite { 0, 0 };
             uint8_t* mapped = nullptr;
@@ -508,8 +714,16 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
             std::sort(handoffTimes.begin(), handoffTimes.end());
             std::cout << "Handoff latency median=" << handoffTimes[handoffTimes.size() / 2]
                       << " ms p95=" << handoffTimes[(handoffTimes.size() * 95) / 100] << " ms\n";
+            if (asyncHandoff)
+                std::cout << "Async fixture timings include local validation gates and independent copies.\n";
         }
+        if (asyncHandoff)
+            CheckQueuedReturn(generation, primary.Get(), session.Queue(), frame,
+                              primaryPass ? primaryClamped.texture.Get() : frame.color.texture.Get(),
+                              width, height, rgba8);
         Check(generation.Stop(30000), "Stop worker");
+        if (asyncHandoff)
+            std::cout << "Async polling, independent primary work and return-retirement guards passed.\n";
         std::cout << (primaryPass ? "One primary pass and " : "") << secondaryPasses
                   << " secondary passes evaluated " << frameCount << " sequential frames; worker exited cleanly.\n"
                   << std::flush;
@@ -517,7 +731,10 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
     catch (...)
     {
         if (submitted)
+        {
+            if (asyncGate) asyncGate->Signal(1);
             Retire(primary.Get(), session.Queue());
+        }
         throw;
     }
     return 0;
@@ -526,13 +743,13 @@ int wmain(int argc, wchar_t** argv)
 {
     try
     {
-        if (argc >= 11 && argc <= 26)
+        if (argc >= 11 && argc <= 27)
         {
             const wchar_t* secondaryModel = argv[3];
             bool secondaryModelSet = false;
             bool primaryPass = true, failureTest = false, resetSecondFrame = false, noDepth = false, halfGuides = false,
                  rgba8 = false, offsetGuides = false, invalidGuides = false, depthStencil = false, benchmark = false,
-                 verifyIsolation = false, mainPreset = false, swapAdapters = false;
+                 verifyIsolation = false, mainPreset = false, swapAdapters = false, asyncHandoff = false;
             for (int i = 11; i < argc; ++i)
             {
                 if (std::wcscmp(argv[i], L"--no-primary") == 0 && primaryPass)
@@ -561,6 +778,8 @@ int wmain(int argc, wchar_t** argv)
                     mainPreset = true;
                 else if (std::wcscmp(argv[i], L"--swap-adapters") == 0 && !swapAdapters)
                     swapAdapters = true;
+                else if (std::wcscmp(argv[i], L"--async-handoff") == 0 && !asyncHandoff)
+                    asyncHandoff = true;
                 else if (std::wcscmp(argv[i], L"--secondary-model") == 0 && !secondaryModelSet && i + 1 < argc)
                 {
                     secondaryModel = argv[++i];
@@ -580,7 +799,7 @@ int wmain(int argc, wchar_t** argv)
             return Parent(argv[1], argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], primaryPass,
                           static_cast<unsigned>(passes), static_cast<unsigned>(width), static_cast<unsigned>(height),
                           failureTest, resetSecondFrame, noDepth, halfGuides, rgba8, offsetGuides, invalidGuides,
-                          depthStencil, benchmark, verifyIsolation, mainPreset, swapAdapters, secondaryModel);
+                          depthStencil, benchmark, verifyIsolation, mainPreset, swapAdapters, secondaryModel, asyncHandoff);
         }
         std::cerr << "Expected core, forwarder, model, primary data, worker data, worker log, executable, pass count "
                      "and dimensions.\n";

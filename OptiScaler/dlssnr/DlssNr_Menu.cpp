@@ -4195,15 +4195,23 @@ static void RenderPassesPage(Config* config, float menuResScale)
         else if (pass >= visiblePasses)
             ImGui::TextDisabled("This pass is not active at the current pass count.");
         if (plan && plan->HasSecondary() && pass == plan->primaryPasses)
+        {
             DlssNr::Worker::SecondaryModelMenu::Render(*config,
                 { Util::DllPath().remove_filename(), Util::ExePath().remove_filename() });
+            bool pipelined = config->DlssNrMultiGpuPipelined.value_or_default();
+            if (ImGui::Checkbox("Overlap rendering with second GPU", &pipelined))
+                config->DlssNrMultiGpuPipelined = pipelined;
+            HelpMarker("Experimental: buffers one complete picture so the game can render while the second GPU "
+                       "finishes the previous picture. Adds approximately one frame of presentation latency. "
+                       "Requires native DirectX 12 Finished Picture, up to three passes, and frame generation off.");
+        }
         ImGui::PopID();
     };
 
     ImGui::TextWrapped("Settings apply when you release a slider.");
     ImGui::TextWrapped("Second GPU: %s", DlssNr::Worker::StatusText());
     if (DlssNr::Worker::currentStatus.load(std::memory_order_relaxed) == DlssNr::Worker::Status::Running)
-        ImGui::Text("CPU handoff wait: %.1f ms", DlssNr::Worker::handoffMilliseconds.load(std::memory_order_relaxed));
+        ImGui::Text(config->DlssNrMultiGpuPipelined.value_or_default() ? "Remaining CPU wait: %.1f ms" : "CPU handoff wait: %.1f ms", DlssNr::Worker::handoffMilliseconds.load(std::memory_order_relaxed));
     if (config->DlssNrDetailReuse.value_or_default() || config->DlssNrEditCache.value_or_default())
         ImGui::TextWrapped("Detail reuse or edit cache can keep passes on the game GPU; turn them off to use the second GPU.");
     const auto gpuReadings = DlssNr::Worker::Telemetry().Readings();

@@ -30,6 +30,7 @@ $cases = @(
     @{ Source = 'tests/nr_gpu/nr_finished_native.cpp'; Libs = 'd3d12.lib dxgi.lib' },
     @{ Source = 'tests/nr_gpu/nr_finished_production.cpp'; Libs = 'd3d12.lib dxgi.lib d3dcompiler.lib' },
     @{ Source = 'tests/nr_gpu/nr_finished_performance.cpp'; Libs = 'd3d12.lib dxgi.lib' },
+    @{ Source = 'tests/nr_gpu/nr_finished_pipeline_presenter.cpp'; Libs = 'd3d12.lib dxgi.lib' },
     @{ Source = 'tests/nr_finished_queue_smoke.cpp'; Libs = 'd3d12.lib dxgi.lib' },
     @{ Source = 'tests/nr_finished_color_smoke.cpp'; Libs = 'd3d11.lib d3dcompiler.lib dxgi.lib' },
     @{ Source = 'tests/nr_profiles_smoke.cpp'; Libs = ''; Args = @('OptiScaler/Config.cpp') },

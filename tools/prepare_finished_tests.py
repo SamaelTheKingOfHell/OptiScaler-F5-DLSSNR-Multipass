@@ -43,6 +43,7 @@ example = r'''void sample() { // }
 assert function(example + "\nvoid after() {}", "void sample(").strip() == example
 
 late = read("OptiScaler/shaders/dlssnr/DlssNr_Late.inl")
+write("FinishedReset.inl", function(late, "void RequestReset(") + function(late, "void FinishReset("))
 shader = read("OptiScaler/shaders/Shader_Dx12.cpp")
 compose = read("OptiScaler/shaders/dlssnr/DlssNr_Dx12.cpp")
 hooks = read("OptiScaler/hooks/Streamline_Hooks.cpp")

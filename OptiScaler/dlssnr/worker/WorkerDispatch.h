@@ -9,6 +9,7 @@ class OwnedCommandChain;
 namespace DlssNr::Worker
 {
 class WorkerGeneration;
+class DispatchTask;
 // Only a finished-picture caller that owns its list may supply this context.
 struct DispatchContext
 {
@@ -17,5 +18,7 @@ struct DispatchContext
     std::shared_ptr<WorkerGeneration> generation;
     bool needsRetirement = false;
     bool unusable = false;
+    bool pipelineRequested = false;
+    std::shared_ptr<DispatchTask> deferredTask;
 };
 } // namespace DlssNr::Worker

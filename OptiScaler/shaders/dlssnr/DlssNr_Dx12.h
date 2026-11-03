@@ -62,11 +62,14 @@ static_assert(sizeof(DlssNrDetailReuseConstants) == sizeof(DlssNrConstants));
 static_assert(sizeof(DlssNrEditCacheConstants) == sizeof(DlssNrConstants));
 static_assert(sizeof(DlssNr::Spatial::Constants) == sizeof(DlssNrConstants));
 
-namespace DlssNr::Worker { struct DispatchContext; }
+namespace DlssNr::Worker { struct DispatchContext; class DispatchTask; }
 
 class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
 {
   private:
+    DlssNr::Worker::DispatchTask DispatchResumable(ID3D12GraphicsCommandList* commands, ID3D12Resource* colour,
+        ID3D12Resource* depth, ID3D12Resource* motion, ID3D12Resource* output, DlssNrFrameInfo frame,
+        ID3D12CommandQueue* queue, DlssNr::Worker::DispatchContext* context);
     FrameDescriptorHeap _frameHeaps[DLSSNR_NUM_OF_HEAPS];
 
     // One constant buffer per heap, not one for the class.

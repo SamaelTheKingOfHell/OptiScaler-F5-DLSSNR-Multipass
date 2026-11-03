@@ -97,10 +97,12 @@ struct Slot
 };
 std::array<Slot, 4> slots;
 bool reset = false;
+uint64_t resetVersion = 0;
+#include "FinishedReset.inl"
 uint64_t successes = 0, lastApplicationSuccesses = 0;
 std::string status;
 void Say(const char* message) { status = message; }
-void Cancel() { reset = true; for (auto& slot : slots) { slot.expired = true; if (slot.submitted) slot.pending = false; } }
+void Cancel() { RequestReset(); for (auto& slot : slots) { slot.expired = true; if (slot.submitted) slot.pending = false; } }
 ID3D12CommandQueue* RealQueue(ID3D12CommandQueue* queue) { return queue; }
 #include "FinishedSubmit.inl"
 inline constexpr GUID colorSpaceKey = {
@@ -126,6 +128,18 @@ void FinishedPictureUnavailable(const char* message);
 int main()
 try
 {
+    // A reset requested after recording starts belongs to the following frame.
+    {
+        const auto started = DlssNr::Late::resetVersion;
+        DlssNr::Late::RequestReset();
+        DlssNr::Late::FinishReset(true, started);
+        Expect(DlssNr::Late::reset, "Older completion erased a newer frame's reset");
+        DlssNr::Late::FinishReset(true, DlssNr::Late::resetVersion);
+        Expect(!DlssNr::Late::reset, "Consumed reset remained latched after a successful frame");
+        DlssNr::Late::FinishReset(false, DlssNr::Late::resetVersion);
+        Expect(DlssNr::Late::reset, "Failed recording did not reset the next frame");
+        DlssNr::Late::reset = false;
+    }
     ComPtr<IDXGIFactory4> factory;
     ComPtr<IDXGIAdapter> adapter;
     ComPtr<ID3D12Device> device;

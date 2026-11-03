@@ -49,7 +49,8 @@ std::wstring Key(ID3D12Device* primary, ID3D12Resource* color, ID3D12Resource* d
     out << reinterpret_cast<uintptr_t>(g_nr.feature) << L':' << primary->GetAdapterLuid().HighPart << L':'
         << primary->GetAdapterLuid().LowPart << L':' << first << L':' << total << L':' << std::hexfloat
         << std::clamp(cfg.DlssNrPassFeedback.value_or_default(), 0.0f, 1.0f)
-        << L':' << string_to_wstring(cfg.DlssNrSecondaryModel.value_or_default());
+        << L':' << string_to_wstring(cfg.DlssNrSecondaryModel.value_or_default())
+        << L':' << cfg.DlssNrMultiGpuPipelined.value_or_default();
     for (auto* resource : { color, depth, motion })
     {
         if (!resource)
@@ -73,7 +74,8 @@ std::wstring Key(ID3D12Device* primary, ID3D12Resource* color, ID3D12Resource* d
 // Creates a generation once and polls its startup/retirement without blocking the render path.
 // A failure is latched for this exact configuration so it does not spawn a worker every frame.
 std::shared_ptr<WorkerGeneration> Prepare(ID3D12Device* primary, ID3D12Resource* color, ID3D12Resource* depth,
-                                          ID3D12Resource* motion, const Config& cfg, unsigned first, unsigned total)
+                                          ID3D12Resource* motion, const Config& cfg, unsigned first, unsigned total,
+                                          ID3D12CommandQueue* orderedQueue = nullptr)
 {
     if (!primary || !color || !motion || first >= total || total > DlssNr::MaxPassCount || g_nr.isPort)
         return nullptr;
@@ -90,7 +92,7 @@ std::shared_ptr<WorkerGeneration> Prepare(ID3D12Device* primary, ID3D12Resource*
     }
     if (current)
     {
-        const HRESULT status = current->Poll();
+        const HRESULT status = orderedQueue ? current->PollForQueue(orderedQueue) : current->Poll();
         if (status == S_OK)
             return current;
         if (status == E_PENDING)

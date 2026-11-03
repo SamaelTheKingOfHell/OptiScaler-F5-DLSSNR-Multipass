@@ -56,6 +56,8 @@
 #include <proxies/D3D12_Proxy.h>
 #include <proxies/DXGI_Proxy.h>
 #include <dlssnr/worker/WorkerDispatch.h>
+#include <dlssnr/worker/WorkerDispatchTask.h>
+#include <dlssnr/worker/FinishedPicturePresenter.h>
 #include <dlssnr/worker/WorkerGeneration.h>
 #include <dlssnr/worker/WorkerStatus.h>
 #include <dlssnr/worker/WorkerGpuTelemetry.h>
@@ -2128,6 +2130,8 @@ void RecordBuiltPrimaryTuning(const Config& cfg)
 // holding two threads apart -- but the D3D11-on-D3D12 bridge enters from its own call site, and the
 // cost is a CPU-side lock on a path that already records command lists.
 std::recursive_mutex g_nrMutex;
+bool g_dispatchSuspended = false;
+bool g_dispatchQuarantined = false;
 
 // Runs the pass inside the same state envelope every other OptiScaler compute pass runs in.
 //
@@ -2145,18 +2149,31 @@ std::recursive_mutex g_nrMutex;
 struct ScopedNrStateEnvelope
 {
     ID3D12GraphicsCommandList* cmd;
-    ScopedSkipHeapCapture skipHeap;
+    std::optional<ScopedSkipHeapCapture> skipHeap;
 
     explicit ScopedNrStateEnvelope(ID3D12GraphicsCommandList* c) : cmd(c)
     {
+        skipHeap.emplace();
+        D3D12Hooks::SetRootSignatureTracking(false);
+    }
+
+    void Pause()
+    {
+        if (!skipHeap) return;
+        if (cmd) D3D12Hooks::RestoreRoot(cmd);
+        D3D12Hooks::SetRootSignatureTracking(true);
+        skipHeap.reset();
+    }
+    void Resume(ID3D12GraphicsCommandList* commands)
+    {
+        cmd = commands;
+        skipHeap.emplace();
         D3D12Hooks::SetRootSignatureTracking(false);
     }
 
     ~ScopedNrStateEnvelope()
     {
-        if (cmd)
-            D3D12Hooks::RestoreRoot(cmd);
-        D3D12Hooks::SetRootSignatureTracking(true);
+        Pause();
     }
 };
 
@@ -3472,8 +3489,33 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                            const DlssNrFrameInfo& frame, ID3D12CommandQueue* timingQueue,
                            DlssNr::Worker::DispatchContext* workerContext)
 {
-    std::lock_guard<std::recursive_mutex> nrLock(g_nrMutex);
-    const Config& cfg = *Config::Instance();
+    std::lock_guard<std::recursive_mutex> lock(g_nrMutex);
+    if (g_dispatchSuspended || g_dispatchQuarantined) return;
+    auto task = DispatchResumable(cmdList, colour, depth, motion, output, frame, timingQueue, workerContext);
+    if (task.Pending() && workerContext)
+        workerContext->deferredTask = std::make_shared<DlssNr::Worker::DispatchTask>(std::move(task));
+    else if (task.Failed())
+    {
+        LOG_ERROR("DLSS-NR recording failed; retaining the frame resources.");
+        g_dispatchQuarantined = true;
+        if (workerContext) workerContext->unusable = true;
+    }
+}
+
+DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
+    ID3D12GraphicsCommandList* cmdList, ID3D12Resource* colour, ID3D12Resource* depth,
+    ID3D12Resource* motion, ID3D12Resource* output, DlssNrFrameInfo frame,
+    ID3D12CommandQueue* timingQueue, DlssNr::Worker::DispatchContext* workerContext)
+{
+    std::unique_lock<std::recursive_mutex> nrLock(g_nrMutex);
+    // A suspended picture keeps the settings with which its prefix was recorded.
+    std::unique_ptr<Config> configSnapshot;
+    if (workerContext && workerContext->pipelineRequested)
+        configSnapshot = std::make_unique<Config>(*Config::Instance());
+    const Config& cfg = configSnapshot ? *configSnapshot : *Config::Instance();
+    Microsoft::WRL::ComPtr<ID3D12Resource> keepColour = colour, keepDepth = depth, keepMotion = motion,
+                                           keepOutput = output;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> keepQueue = timingQueue;
 
     // Parked features and scratch textures are released 32 frames after they were parked. This used to tick only where an
     // evaluate completed, after the return for a feature just created and the one for a feature still waiting for its first
@@ -3512,7 +3554,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     if (g_nr.failed || cmdList == nullptr || colour == nullptr || motion == nullptr || output == nullptr)
     {
         ReportSkipOnce(g_nr.failed ? "it already failed this session" : "a resource was missing");
-        return;
+        co_return;
     }
 
     ID3D12Resource* target = output;
@@ -3526,7 +3568,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     if (restoreRequired && !frame.IndependentCommands && !D3D12Hooks::CanRestoreRootSignature(cmdList))
     {
         ReportSkipOnce("the upscaler could not restore state this frame");
-        return;
+        co_return;
     }
     ScopedNrStateEnvelope stateEnvelope(cmdList);
 
@@ -3553,7 +3595,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     if (FAILED(target->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr)
     {
         ReportSkipOnce("the output texture belongs to no D3D12 device");
-        return;
+        co_return;
     }
 
     const D3D12_RESOURCE_DESC desc = target->GetDesc();
@@ -3584,7 +3626,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     {
         ReportSkipOnce("the pre-SR active colour size is invalid");
         device->Release();
-        return;
+        co_return;
     }
     const auto width = active->width;
     const auto height = active->height;
@@ -3605,7 +3647,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     {
         ReportSkipOnce("the motion-vector subrect is empty");
         device->Release();
-        return;
+        co_return;
     }
     // Depth with an empty subrect is no depth.
     if (!guides.depth.valid())
@@ -3710,7 +3752,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         g_nr.failed = true;
         LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
         device->Release();
-        return;
+        co_return;
     }
 
     // What the model works at. The frame and its edit stay full resolution; only the model's input and
@@ -3918,7 +3960,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         g_nr.reason = "the pre-SR active colour staging texture could not be allocated";
         LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
         device->Release();
-        return;
+        co_return;
     }
 
     if (requestedPasses == 1)
@@ -4074,7 +4116,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             g_nr.reason = "nvngx_dlssnr.dll was not found beside OptiScaler or the game";
             LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
             device->Release();
-            return;
+            co_return;
         }
 
         version_t nrVersion {};
@@ -4122,7 +4164,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             LOG_ERROR("DLSS-NR create failed: init 0x{:X} ({}), create 0x{:X} ({})", initResult,
                       NgxResultName(initResult), createResult, NgxResultName(createResult));
             device->Release();
-            return;
+            co_return;
         }
 
         g_nr.width = width;
@@ -4146,13 +4188,13 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         // GPU (every crash died on a creation frame). The creation goes through the game's own submit
         // first; the first evaluate happens next frame. One frame without the model is invisible.
         device->Release();
-        return;
+        co_return;
     }
 
     if (g_nr.feature == nullptr)
     {
         device->Release();
-        return;
+        co_return;
     }
 
     // A later function call is not proof that the command list containing CreateFeature was
@@ -4164,7 +4206,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         if (frame.SubmissionEpoch == g_nr.featureCreateEpoch)
         {
             device->Release();
-            return;
+            co_return;
         }
 
         g_nr.featurePendingSubmission = false;
@@ -4195,7 +4237,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         if (frame.SubmissionEpoch == g_nr.passCreateEpoch[pass])
         {
             device->Release();
-            return;
+            co_return;
         }
 
         g_nr.passPendingSubmission[pass] = false;
@@ -4266,7 +4308,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             }
 
             device->Release();
-            return;
+            co_return;
         }
     }
 
@@ -4284,7 +4326,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                                superiorPacked ? &EdgeCompression::Layout() : nullptr) != SuperiorRun::Began::Run)
         {
             device->Release();
-            return;
+            co_return;
         }
     }
 
@@ -4332,7 +4374,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         g_nr.reason = "the colour codec would not compile";
         LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
         device->Release();
-        return;
+        co_return;
     }
 
     // What the upscaler produces is linear HDR with an open-ended range; the model was trained on
@@ -5124,7 +5166,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
         FinishColor(false);
         device->Release();
-        return;
+        co_return;
     }
 
     // Compress screen edges: pack the proxy, the depth and the motion into the smaller picture the model works on. The
@@ -5191,7 +5233,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                         D3D12_RESOURCE_STATE_COPY_DEST);
 
             device->Release();
-            return;
+            co_return;
         }
 
         for (ID3D12Resource* packed : { EdgeCompression::color, EdgeCompression::depth, EdgeCompression::motion })
@@ -5361,7 +5403,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
         FinishColor(false);
         device->Release();
-        return;
+        co_return;
     }
 
     // Count only a contiguous set of ready, separate feature histories. A failed extra creation never
@@ -5698,7 +5740,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         if (multiEligible && pass == placement->primaryPasses)
         {
             auto generation = MultiGpuRun::Prepare(device, passInput, modelDepth, evalMotion, cfg,
-                                                    placement->primaryPasses, effectivePasses);
+                                                    placement->primaryPasses, effectivePasses,
+                                                    workerContext->pipelineRequested ? workerContext->queue : nullptr);
             if (generation)
             {
                 DlssNr::Worker::FrameCommand command {};
@@ -5733,8 +5776,30 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                 if (g_ngxTime) g_ngxTime->Abandon();
                 workerContext->generation = generation; // keep transport and worker alive through the slot fence
                 const auto handoffStarted = std::chrono::steady_clock::now();
-                const auto handoff = generation->Submit(*workerContext->chain, workerContext->queue, command,
-                                                         passInput, modelDepth, evalMotion, 10000);
+                DlssNr::Worker::HandoffResult handoff;
+                auto waitStarted = handoffStarted;
+                if (workerContext->pipelineRequested)
+                {
+                    handoff = generation->SubmitAsync(*workerContext->chain, workerContext->queue, command,
+                                                       passInput, modelDepth, evalMotion);
+                    if (SUCCEEDED(handoff.result))
+                    {
+                        stateEnvelope.cmd = workerContext->chain->Current();
+                        stateEnvelope.Pause();
+                        g_dispatchSuspended = true;
+                        nrLock.unlock();
+                        co_await std::suspend_always {};
+                        nrLock.lock();
+                        g_dispatchSuspended = false;
+                        stateEnvelope.Resume(workerContext->chain->Current());
+                        waitStarted = std::chrono::steady_clock::now();
+                        handoff.result = generation->WaitReturn(10000);
+                        if (SUCCEEDED(handoff.result)) handoff.phase = DlssNr::Worker::HandoffPhase::WorkerReturned;
+                    }
+                }
+                else
+                    handoff = generation->Submit(*workerContext->chain, workerContext->queue, command,
+                                                  passInput, modelDepth, evalMotion, 10000);
                 cmdList = workerContext->chain->Current();
                 stateEnvelope.cmd = cmdList;
                 if (!cmdList)
@@ -5742,7 +5807,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                     workerContext->unusable = true;
                     MultiGpuRun::FailCurrent();
                     device->Release();
-                    return;
+                    co_return;
                 }
                 for (size_t i = 0; i < sourceCount; ++i)
                     Barrier(cmdList, sources[i], D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -5761,7 +5826,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                         DlssNr::Worker::currentStatus.store(DlssNr::Worker::Status::Running,
                                                             std::memory_order_relaxed);
                         const auto elapsed = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - handoffStarted).count();
+                            std::chrono::steady_clock::now() - waitStarted).count();
                         const float previousMs = DlssNr::Worker::handoffMilliseconds.load(std::memory_order_relaxed);
                         DlssNr::Worker::handoffMilliseconds.store(previousMs > 0.0f
                             ? previousMs * 0.9f + static_cast<float>(elapsed) * 0.1f
@@ -5770,15 +5835,17 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                         MultiGpuRun::handoffMax = std::max(MultiGpuRun::handoffMax, elapsed);
                         if (++MultiGpuRun::handoffSamples == 300)
                         {
-                            LOG_INFO("DLSS-NR multi-GPU: 300 CPU handoff waits averaged {:.1f} ms; slowest {:.1f} ms",
+                            LOG_INFO("DLSS-NR multi-GPU: 300 {} CPU waits averaged {:.1f} ms; slowest {:.1f} ms",
+                                     workerContext->pipelineRequested ? "remaining pipeline" : "handoff",
                                      MultiGpuRun::handoffSum / MultiGpuRun::handoffSamples, MultiGpuRun::handoffMax);
                             MultiGpuRun::handoffSum = MultiGpuRun::handoffMax = 0.0;
                             MultiGpuRun::handoffSamples = 0;
                         }
                         if (++MultiGpuRun::successfulFrames == 1 || MultiGpuRun::successfulFrames % 1800 == 0)
                         {
-                            LOG_INFO("DLSS-NR multi-GPU: {} primary passes, {} secondary passes, {}x{}, handoff {:.1f} ms",
-                                     pass, effectivePasses - pass, modelWidth, modelHeight, elapsed);
+                            LOG_INFO("DLSS-NR multi-GPU: {} primary passes, {} secondary passes, {}x{}, {} wait {:.1f} ms",
+                                     pass, effectivePasses - pass, modelWidth, modelHeight,
+                                     workerContext->pipelineRequested ? "remaining pipeline" : "handoff", elapsed);
                         }
                         for (unsigned skipped = pass; skipped < effectivePasses; ++skipped)
                             if (skipped > 0) g_nr.passNeedsReset[skipped] = true;
@@ -6658,16 +6725,22 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     device->Release();
+    co_return;
 }
 
 namespace DlssNr
 {
-namespace Late { bool CaptureResidual(ID3D12GraphicsCommandList*, ID3D12Resource*, ID3D12Resource*, float, bool); }
+namespace Late {
+bool CaptureResidual(ID3D12GraphicsCommandList*, ID3D12Resource*, ID3D12Resource*, float, bool);
+bool DrainPipeline();
+}
 #include "DlssNr_DeferredSr.inl"
 std::string DeferredDlssStatus() { return SynchronousDeferredDlssStatus(); }
 
 void RetryAfterFailure()
 {
+    std::lock_guard<std::recursive_mutex> lock(g_nrMutex);
+    if (!Late::DrainPipeline()) return;
     g_nr.failed = false;
     g_nr.reason = "";
     g_nr.reset = true;
@@ -6688,6 +6761,19 @@ void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* p
 {
     std::lock_guard<std::recursive_mutex> nrLock(g_nrMutex);
     const Config& cfg = *Config::Instance();
+    if (g_dispatchQuarantined) return;
+    // Capture new guides without changing the older suspended picture's state.
+    if (g_dispatchSuspended)
+    {
+        if (cfg.DlssNrEnabled.value_or_default() && cfg.DlssNrFinishedPicture.value_or_default() &&
+            !cfg.DlssNrRunBeforeSr.value_or_default() && !cfg.DlssNrDeferredDlss.value_or_default() &&
+            !timingQueue && State::Instance().swapchainInteropApi == SwapchainInteropApi::None)
+        {
+            if (beforeUpscale && cmdList && params) Late::Capture(cmdList, params, rayReconstruction);
+            return;
+        }
+        if (!Late::DrainPipeline()) return;
+    }
     static unsigned lastPrecision=0;
     const unsigned precision=cfg.DlssNrPrecision.value_or_default();
     if(lastPrecision!=precision)
@@ -7441,6 +7527,12 @@ bool CaptureInProgress() { return g_capture.isActive(); }
 void Shutdown()
 {
     std::lock_guard<std::recursive_mutex> nrLock(g_nrMutex);
+    if (!Late::DrainPipeline())
+    {
+        LOG_WARN("DLSS-NR pipeline could not drain; retaining in-flight resources until process teardown.");
+        return;
+    }
+    Late::presenter.reset();
     // Every view's model into the retired list, which is emptied below
     LeaveMultiView(true);
     g_views.Reset();
