@@ -2,7 +2,8 @@
 
 - Added `nr_band_split_benchmark`, which measures one neural pass per band height on a chosen NVIDIA adapter. With `--subset`, it evaluates fewer rows than the feature was built with. The worker model session exposes that unchecked evaluate only in test builds.
 - RTX 3060 results: Preset A costs at least about 14 ms per 1280-wide pass for any band height (9.3 ms at 320x96); 1280x720 costs 27.1 ms. The Ampere Preset B runtime has a floor of about 4.4 ms; 1280x720 costs 7.4 ms. Subset evaluation succeeded. Splitting a Preset A picture into bands therefore cannot make the 3060 help. See `docs/Split-frame-measurements.md`.
-- Anthropic Claude Opus 5.5. RTX 5070 Ti measurements are pending: device creation failed after a driver reset. Split-frame rendering is not implemented yet.
+- RTX 5070 Ti results: Preset A costs 2.93 ms per 1280x720 pass (floor 2.25 ms) and 15.27 ms at 3840x2160. Preset B costs 1.64 ms at 720p and 8.79 ms at 4K. The best band split saves about 2 ms at 720p, below transfer costs, and at most about 10 percent at 4K with Preset B and an extra frame of latency. Split-frame rendering was therefore not added. For this pair, primary-only placement is recommended.
+- Anthropic Claude Opus 5.5. Synthetic-input timing only; no in-game measurements.
 
 ## 2026-11-03 — Experimental automatic GPU pass balancing (WIP)
 

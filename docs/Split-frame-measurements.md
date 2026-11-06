@@ -1,6 +1,6 @@
 # Split-frame (band) multi-GPU: measurements
 
-Status: measurement only. Split-frame scheduling has not been added to the renderer yet.
+Status: measured on both GPUs. Split-frame scheduling was not added: the measured best case does not justify it (see Decision).
 
 The idea: instead of moving whole passes between GPUs, divide each picture into
 horizontal bands. Each GPU runs every pass on its own band, with a small overlap
@@ -62,10 +62,45 @@ Subset evaluation (feature built at 1280x720, Preset A): 720 rows 27.12 ms,
   for example converting weights or running fixed-size stages. Reducing it makes
   both pass placement and band splitting useful.
 
-## Not measured yet
+## RTX 5070 Ti, 2026-11-06 (game runtime, median GPU ms per pass)
 
-- RTX 5070 Ti numbers. On 2026-11-06 the 5070 Ti refused new D3D12 devices
-  (`E_OUTOFMEMORY`) after an `nvlddmkm` event 153 GPU reset during the previous
-  game session. Rerun the tool with adapter index 0 after a reboot.
-- Transfer cost for a band, seam visibility and temporal stability when the
-  split line moves.
+| Size | Preset A | Preset B |
+|---|---|---|
+| 1280x720 | 2.93 | 1.64 |
+| 1280x544 | 2.58 | |
+| 1280x368 | 2.33 | |
+| 1280x272 | 2.27 | |
+| 1280x192 | 2.26 | |
+| 1280x96 | 2.25 | |
+| 1920x1088 | 4.24 | |
+| 3840x2160 | 15.27 | 8.79 |
+| 3840x1888 | | 7.69 |
+| 3840x1088 | 7.86 | |
+| 3840x544 | 4.50 | |
+
+RTX 3060 at 3840-wide bands: Preset A 272 rows 34.81 ms. Ampere Preset B: 544
+rows 15.35 ms and 272 rows 9.60 ms.
+
+## Decision
+
+The 5070 Ti does a whole 1280x720 Preset A pass in 2.93 ms. The 3060 needs
+14 ms or more for any band of the same picture, and the 5070 Ti's own floor is
+2.25 ms. At the current 1280x720 model size, removing rows from the 5070 Ti
+saves at most about 0.7 ms per pass, or 2 ms for three passes. That is less
+than the transfer and synchronization cost.
+
+At a 3840x2160 model size, Preset A on the 3060 costs more for 272 rows than
+the 5070 Ti costs for the whole picture. The best Preset B case gives the 3060
+272 rows: three passes take about 28.8 ms. That saves the 5070 Ti about 3.3 ms
+of its 26.4 ms. A same-frame split would be slower. An across-frame pipeline
+could gain at most about 10 percent. It would add a frame of latency and the
+risk of a visible seam.
+
+The two GPUs differ by roughly 5 to 10 times in this model's throughput. The
+remaining 3060 gap is mostly hardware: it has no FP8 tensor cores, and the
+Ampere Preset B runtime is already about 4.5 times slower than the 5070 Ti at
+720p. Better Ampere kernels would mainly reduce the fixed per-pass cost, which
+is still worth investigating for 3060-only users. They would not make the 3060
+a large share of this pair. For this GPU pair, the best setting for neural
+rendering is the game GPU alone (`MultiGpu=false`). That means
+primary-only placement.
