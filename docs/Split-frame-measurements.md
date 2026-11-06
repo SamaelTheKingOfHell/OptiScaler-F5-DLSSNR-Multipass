@@ -104,3 +104,22 @@ is still worth investigating for 3060-only users. They would not make the 3060
 a large share of this pair. For this GPU pair, the best setting for neural
 rendering is the game GPU alone (`MultiGpu=false`). That means
 primary-only placement.
+
+## Real two-GPU handoff: one pass on each GPU, 2026-11-06
+
+`run_nr_cross_process_neural.ps1 -SecondaryPasses 1 -Width 1280 -Height 720 -Benchmark -DepthStencil`.
+The 5070 Ti ran the primary pass with the game runtime. The 3060 ran its pass
+with the Ampere v0.4.0 runtime. Thirty frames returned, and the worker exited
+cleanly.
+
+```text
+Handoff latency median 13.00 ms, p95 13.25 ms
+3060: input copies 1.15 ms, neural pass 7.61 ms, return copy 0.56 ms, queue completion 9.58 ms
+```
+
+With pipelining, the 3060 can keep up to roughly 100 pictures per second when
+it takes the last pass. The 5070 Ti stops running that pass: 1.64 ms with
+Preset B or 2.93 ms with Preset A. It still records the outbound and return
+copies and the pipelined picture copy, so expect a small net gain at 1280x720
+and one extra picture of latency. Compare the in-game results with the same
+pass presets and multi-GPU off.
