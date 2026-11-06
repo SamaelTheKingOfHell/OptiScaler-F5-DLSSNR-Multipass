@@ -873,6 +873,12 @@ class Config
     CustomOptional<uint32_t> DlssNrMultiGpuHelperShare { 0 };
     // Order the helper's return on the game GPU's queue instead of blocking the CPU (watchdog-guarded).
     CustomOptional<bool> DlssNrMultiGpuQueueWait { true };
+    // Network split (DlssNr_NetworkSplit.h): the helper GPU evaluates the middle of one pass's network.
+    CustomOptional<bool> DlssNrNetworkSplit { false };
+    // The pass that is split, 1-based.
+    CustomOptional<uint32_t> DlssNrNetworkSplitPass { 1 };
+    // Calibrated plan file; relative paths are under OptiScaler/NR-Split/. Empty picks <width>x<height>-<preset>.txt.
+    CustomOptional<std::string> DlssNrNetworkSplitPlan { std::string() };
     CustomOptional<uint32_t> DlssNrPrimaryPasses { 1 };
     // Bit i requests the secondary GPU beginning with pass i + 1. The first set bit wins.
     CustomOptional<uint32_t, NoDefault> DlssNrSecondaryPassMask;

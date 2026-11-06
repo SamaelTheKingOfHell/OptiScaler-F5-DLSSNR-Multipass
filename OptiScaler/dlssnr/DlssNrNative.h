@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 struct ID3D12GraphicsCommandList;
+namespace DlssNr::NetworkSplit { struct Plan; }
 namespace DlssNrNative {
 void* WrapNvapi(unsigned id,void* original);
 void SetEnabled(bool enabled);
@@ -14,6 +15,11 @@ std::string Status();
 void BeginEvaluate(const void* feature, bool reset, unsigned every, unsigned everyPlain, long long slot, ID3D12GraphicsCommandList* cmd, bool profile, unsigned copySets);
 // True when this evaluation turned Reuse off for the session (unexpected launch order, or a copy that could not be recorded); VitStatus says why. Log it once.
 bool EndEvaluate(ID3D12GraphicsCommandList* cmd);
+// Network split (DlssNr_NetworkSplit.h): the evaluate recorded next on `cmd` launches only the kernels of `role`
+// (a NetworkSplit::Role) and records its transfers between `workspace` and the staging buffers. `plan` must outlive it.
+// EndSplitEvaluate is true when every transfer of the role was recorded and every launch succeeded.
+void BeginSplitEvaluate(ID3D12GraphicsCommandList* cmd, int role, const DlssNr::NetworkSplit::Plan* plan, uint64_t workspace, uint64_t forwardStaging, uint64_t backwardStaging);
+bool EndSplitEvaluate();
 // Kernel census / per-group GPU timing lines finished since the last call (ini [DlssNr] KernelProfile), for the log.
 std::vector<std::string> TakeProfileReports();
 std::string VitStatus();

@@ -10,6 +10,7 @@ struct Slot
     ComPtr<ID3D12GraphicsCommandList> commands;
     std::unique_ptr<MultiGpu::OwnedCommandChain> ownedChain;
     std::shared_ptr<Worker::WorkerGeneration> workerGeneration;
+    std::shared_ptr<void> workerKeepAlive;
     ComPtr<ID3D12CommandQueue> producerQueue; // real queue that signals `ready`; held so its identity stays valid
     ID3D12CommandList* producer = nullptr; // identity only; never dereferenced
     DlssNrFrameInfo frame {};
@@ -189,6 +190,7 @@ Slot* Acquire(ID3D12GraphicsCommandList* cmd)
     slot.displayFence.Reset();
     slot.ownedChain.reset();
     slot.workerGeneration.reset();
+    slot.workerKeepAlive.reset();
     if (!slot.commands)
     {
         if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&slot.fence))) ||
@@ -731,6 +733,7 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
         {
             g_compose->Dispatch(cmd, nrColor, slot.depth.Get(), slot.motion.Get(), nrColor, frame, queue, &workerContext);
             slot.workerGeneration = std::move(workerContext.generation);
+            slot.workerKeepAlive = std::move(workerContext.keepAlive);
             if (workerContext.unusable || (slot.ownedChain && !(cmd = slot.ownedChain->Current())))
             {
                 Late::Say("The graphics submission could not continue. Restart the game to retry.");

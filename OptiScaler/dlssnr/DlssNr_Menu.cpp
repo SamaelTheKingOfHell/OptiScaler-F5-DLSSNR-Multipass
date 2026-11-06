@@ -4234,6 +4234,19 @@ static void RenderPassesPage(Config* config, float menuResScale)
             HelpMarker("The game GPU waits for the second GPU's result in its own queue, so the CPU keeps preparing "
                        "frames. A watchdog releases the wait if the second GPU's worker stops.");
         }
+        bool networkSplit = config->DlssNrNetworkSplit.value_or_default();
+        if (ImGui::Checkbox("Split the network with the second GPU (experimental)", &networkSplit))
+            config->DlssNrNetworkSplit = networkSplit;
+        HelpMarker("The second GPU evaluates the middle of one pass's network while the game GPU evaluates its start "
+                   "and end. Needs a plan calibrated for the model size and preset (OptiScaler/NR-Split) and takes "
+                   "the place of the pass handoff above. Features built before turning it on keep running on the "
+                   "game GPU until they are rebuilt.");
+        if (networkSplit)
+        {
+            int splitPass = static_cast<int>(std::max(config->DlssNrNetworkSplitPass.value_or_default(), 1u));
+            if (ImGui::SliderInt("Split pass", &splitPass, 1, static_cast<int>(DlssNr::MaxPassCount)))
+                config->DlssNrNetworkSplitPass = static_cast<uint32_t>(splitPass);
+        }
         ImGui::PopID();
     };
 

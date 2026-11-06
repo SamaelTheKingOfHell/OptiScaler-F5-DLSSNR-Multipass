@@ -1243,6 +1243,9 @@ void Config::ReadDlssNr()
     DlssNrMultiGpuAutoBalance.set_from_config(readBool("DlssNr", "MultiGpuAutoBalance"));
     DlssNrMultiGpuHelperShare.set_from_config(readUInt("DlssNr", "MultiGpuHelperShare"));
     DlssNrMultiGpuQueueWait.set_from_config(readBool("DlssNr", "MultiGpuQueueWait"));
+    DlssNrNetworkSplit.set_from_config(readBool("DlssNr", "NetworkSplit"));
+    DlssNrNetworkSplitPass.set_from_config(readUInt("DlssNr", "NetworkSplitPass"));
+    DlssNrNetworkSplitPlan.set_from_config(readString("DlssNr", "NetworkSplitPlan"));
     DlssNrPrimaryPasses.set_from_config(readUInt("DlssNr", "PrimaryPasses"));
     DlssNrSecondaryPassMask.set_from_config(readUInt("DlssNr", "SecondaryPassMask"));
     DlssNrSecondaryModel.set_from_config(readString("DlssNr", "SecondaryModel"));
@@ -1496,6 +1499,9 @@ static void WriteDlssNr(Config& c, CSimpleIniA& out)
     out.SetValue("DlssNr", "MultiGpuAutoBalance", GetBoolValue(c.DlssNrMultiGpuAutoBalance.value_for_config()).c_str());
     out.SetValue("DlssNr", "MultiGpuHelperShare", GetIntValue(c.DlssNrMultiGpuHelperShare.value_for_config()).c_str());
     out.SetValue("DlssNr", "MultiGpuQueueWait", GetBoolValue(c.DlssNrMultiGpuQueueWait.value_for_config()).c_str());
+    out.SetValue("DlssNr", "NetworkSplit", GetBoolValue(c.DlssNrNetworkSplit.value_for_config()).c_str());
+    out.SetValue("DlssNr", "NetworkSplitPass", GetIntValue(c.DlssNrNetworkSplitPass.value_for_config()).c_str());
+    out.SetValue("DlssNr", "NetworkSplitPlan", c.DlssNrNetworkSplitPlan.value_for_config_or("").c_str());
     out.SetValue("DlssNr", "PrimaryPasses", GetIntValue(c.DlssNrPrimaryPasses.value_for_config()).c_str());
     out.SetValue("DlssNr", "SecondaryPassMask", GetIntValue(c.DlssNrSecondaryPassMask.value_for_config()).c_str());
     out.SetValue("DlssNr", "SecondaryModel", c.DlssNrSecondaryModel.value_for_config_or("").c_str());
@@ -1770,6 +1776,9 @@ size_t Config::ApplyDlssNrSection(const DlssNrProfiles::Section& section)
         NR_PROFILE_FIELD("MultiGpuAutoBalance", DlssNrMultiGpuAutoBalance),
         NR_PROFILE_FIELD("MultiGpuHelperShare", DlssNrMultiGpuHelperShare),
         NR_PROFILE_FIELD("MultiGpuQueueWait", DlssNrMultiGpuQueueWait),
+        NR_PROFILE_FIELD("NetworkSplit", DlssNrNetworkSplit),
+        NR_PROFILE_FIELD("NetworkSplitPass", DlssNrNetworkSplitPass),
+        NR_PROFILE_FIELD("NetworkSplitPlan", DlssNrNetworkSplitPlan),
         NR_PROFILE_FIELD("PrimaryPasses", DlssNrPrimaryPasses),
         NR_PROFILE_FIELD("SecondaryPassMask", DlssNrSecondaryPassMask),
         NR_PROFILE_FIELD("SecondaryModel", DlssNrSecondaryModel),

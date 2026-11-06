@@ -334,3 +334,36 @@ Remaining for a game build:
    capability parameters.
 4. Running the role probe once per model, preset and resolution, cached.
 5. An in-game visual check of the two-evaluate residue.
+
+## In OptiScaler: `NetworkSplit` (2026-11-06, not yet tested in a game)
+
+The two-evaluate design is now built into the renderer and the worker. It is off by default.
+
+- `[DlssNr] NetworkSplit=true` turns it on, `NetworkSplitPass` picks the pass (1-based) and `NetworkSplitPlan`
+  picks the plan file (relative names under `OptiScaler/NR-Split/`; auto tries `<w>x<h>-<preset>.txt`, then
+  `<w>x<h>.txt`). It replaces the pass handoff (`MultiGpu`) while on and has the same eligibility limits (no
+  Superior, spatial, detail reuse, edit cache or frame generation). The menu has a checkbox and a pass slider beside
+  the second-GPU options.
+- A plan for a 1280x720 model with Preset B ships as `NR-Split/1280x720.txt` (cut 9, resume 78, from
+  `computed-9-78`). Its `W` line holds the calibrated workspace size; a model whose workspace differs (another
+  resolution, preset or runtime) refuses the plan and stays on the game GPU.
+- Shared core: `OptiScaler/dlssnr/DlssNr_NetworkSplit.h` (plan file, handshake form, per-evaluate launch filter),
+  checked by `tests/nr_network_split.cpp`.
+- Game side: `DlssNr_ModelAllocations.h` installs NGX's allocation callbacks while the option is on and records each
+  feature's workspace (its smallest writable buffer). Features built before the option was turned on have no known
+  workspace and stay whole on the game GPU until rebuilt. `DlssNrNative` routes the launches of a split evaluate on its
+  command list through the filter and copies with the existing 16-byte copy kernel; ViT reuse and the hybrid FFN path
+  are bypassed for those evaluates. `worker/WorkerSplitGeneration.h` owns the helper process, the cross-adapter
+  buffer, the copy queue, the staging buffers and the fences, and starts a `WorkerWatch` before the first picture.
+  `DlssNr_NetworkSplitRun.inl` finds the plan, the helper adapter and the helper runtime (`SecondaryModel`) and latches
+  failures per configuration.
+- Per picture, in `DispatchResumable`: Head evaluate, split of the command chain, copy-queue upload and frame command,
+  (with `MultiGpuPipelined`, suspension until the next continuation), queue-ordered wait for the return, End evaluate.
+  Any failure before the End evaluate runs the whole pass on the game GPU for that picture and stops the split for the
+  configuration.
+- Worker: protocol 9 adds the plan to the handshake. With `split.cut > 0` the worker runs `WorkerSplitMain.h`: one
+  feature, its workspace from the allocation callback, the Segment filter installed by a Detours hook on
+  `nvapi_QueryInterface`.
+
+Not verified yet: anything in a game (frame rate, image, the pipelined resume), plans for other model sizes, and the
+behaviour when the game rebuilds features mid-session.

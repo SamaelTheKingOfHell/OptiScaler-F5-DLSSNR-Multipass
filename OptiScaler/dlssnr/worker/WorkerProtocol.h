@@ -2,12 +2,13 @@
 #include <windows.h>
 #include <dxgiformat.h>
 #include <cstdint>
+#include "../DlssNr_NetworkSplit.h"
 
 namespace DlssNr::Worker
 {
 // Private inherited pipe only. Handles below are duplicated directly into the intended child process.
 inline constexpr uint32_t ProtocolMagic = 0x4E524D47; // NRMG
-inline constexpr uint32_t ProtocolVersion = 8;
+inline constexpr uint32_t ProtocolVersion = 9;
 inline constexpr uint32_t MaxWorkerPasses = 30;
 struct PassSettings
 {
@@ -29,6 +30,8 @@ struct InitialFrameWire
     uint64_t depthOffset = 0, motionOffset = 0;
     uint32_t colorPitch = 0, depthPitch = 0, motionPitch = 0;
     LUID primary {}, secondary {};
+    // Network split (protocol 9): cut > 0 runs this worker as the helper of a split evaluate, see WorkerSplitMain.h.
+    DlssNr::NetworkSplit::WirePlan split {};
 };
 enum class CommandKind : uint32_t
 {

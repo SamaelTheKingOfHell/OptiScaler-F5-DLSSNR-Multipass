@@ -63,6 +63,10 @@
 #include <dlssnr/worker/WorkerDispatchTask.h>
 #include <dlssnr/worker/FinishedPicturePresenter.h>
 #include <dlssnr/worker/WorkerGeneration.h>
+#include <dlssnr/worker/WorkerSplitGeneration.h>
+#include <dlssnr/DlssNr_ModelAllocations.h>
+#include <fstream>
+#include <map>
 #include <dlssnr/worker/WorkerStatus.h>
 #include <dlssnr/worker/WorkerGpuTelemetry.h>
 
@@ -2555,6 +2559,7 @@ void ParkIdleViews()
 }
 
 #include "DlssNr_MultiGpuRun.inl"
+#include "DlssNr_NetworkSplitRun.inl"
 
 } // namespace
 
@@ -4139,6 +4144,7 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
         const auto tuning = PassTuning(cfg, 0);
         // Not at the same moment as a game's vkCreateDevice (native/DriverInitGate.h)
         native::DriverInitScope driverInit;
+        NetworkSplitRun::BeforeCreate(cfg, device);
         g_nr.feature =
             g_nr.create(snippet->wstring().c_str(), State::Instance().NVNGX_ApplicationDataPath.c_str(),
                         device, cmdList, g_nr.capabilityParams, modelWidth, modelHeight,
@@ -4149,6 +4155,7 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                         // UI correction at the model's own default: with no UI layer fed to it there
                         // is nothing for it to correct.
                         1);
+        NetworkSplitRun::AfterCreate(cfg, g_nr.feature);
 
         if (g_nr.feature == nullptr)
         {
@@ -4281,6 +4288,7 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                 SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
                 const auto tuning = PassTuning(cfg, pass);
                 native::DriverInitScope driverInit;
+                NetworkSplitRun::BeforeCreate(cfg, device);
                 g_nr.passFeature[pass] = g_nr.create(
                     snippet->wstring().c_str(), State::Instance().NVNGX_ApplicationDataPath.c_str(),
                     device, cmdList, g_nr.capabilityParams, modelWidth, modelHeight,
@@ -4288,6 +4296,7 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                     (int) PassStyle(cfg, pass),
                     tuning.structure, tuning.tone, tuning.skin,
                     tuning.autoMask ? 1 : 0, 1);
+                NetworkSplitRun::AfterCreate(cfg, g_nr.passFeature[pass]);
 
                 if (g_nr.passFeature[pass] != nullptr)
                 {
@@ -5726,7 +5735,14 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                           !State::Instance().currentFG->IsPaused();
     const bool multiEligible = workerContext && workerContext->chain && workerContext->queue &&
         cfg.DlssNrMultiGpu.value_or_default() && placement && placement->HasSecondary() &&
-        !g_multiRun && !superior && !spatial && !reusePlan.active && !cachePlan.runs && !fgActive;
+        !g_multiRun && !superior && !spatial && !reusePlan.active && !cachePlan.runs && !fgActive &&
+        !cfg.DlssNrNetworkSplit.value_or_default();
+    // Network split (DlssNr_NetworkSplitRun.inl): one pass's network is shared with the helper GPU. It takes the place
+    // of the pass handoff above, under the same conditions.
+    const unsigned splitPass = std::max(cfg.DlssNrNetworkSplitPass.value_or_default(), 1u) - 1u;
+    const bool splitEligible = workerContext && workerContext->chain && workerContext->queue &&
+        cfg.DlssNrNetworkSplit.value_or_default() && splitPass < effectivePasses && !g_multiRun && !superior &&
+        !spatial && !reusePlan.active && !cachePlan.runs && !fgActive && !reused && !cached;
     if (workerContext)
     {
         workerContext->balanceEligible = !g_multiRun && !superior && !spatial && !reusePlan.active &&
@@ -5956,23 +5972,123 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
         const bool vitEveryFrame = reusePlan.active || cachePlan.runs;
         const unsigned copySets =
             DlssNrVitReuse::kCopyPlain | (State::Instance().api == Vulkan ? DlssNrVitReuse::kCopyFp8 : 0u);
-        DlssNrNative::BeginEvaluate(passFeature, passReset,
-                                    vitEveryFrame ? 1u : std::clamp(cfg.DlssNrVitEvery.value_or_default(), 1u, 2u),
-                                    vitEveryFrame ? 1u : std::clamp(cfg.DlssNrVitEveryPlain.value_or_default(), 1u, 2u),
-                                    (long long) (g_nr.successfulDispatches & 0x3FFFFFFFFFFFFFFFull), cmdList,
-                                    cfg.DlssNrKernelProfile.value_or_default(), copySets);
-        result = g_nr.evaluate(
-            cmdList, passFeature, g_nr.capabilityParams, passInput, modelDepth, spatial ? modelMotion : evalMotion,
-            passOutput, modelWidth, bandRows, evalGuideW, BandGuide(evalGuideH), evalMotionW, BandGuide(evalMotionH),
-            evalDepthX, evalDepthY, spatial ? 0u : evalMotionBaseX, spatial ? 0u : evalMotionBaseY,
-            g_nr.guideDepthInverted ? 1 : 0,
-            passReset ? 1 : 0, tuning.intensity,
-            (int) PassStyle(cfg, pass), tuning.structure,
-            tuning.tone, tuning.skin,
-            tuning.autoMask ? 1 : 0, evalMvScaleX,
-            evalMvScaleY);
-        if (DlssNrNative::EndEvaluate(cmdList))
-            LOG_WARN("DLSS-NR: Reuse bottleneck is {}", DlssNrNative::VitStatus());
+        const auto EvaluatePass = [&](ID3D12GraphicsCommandList* list, bool reset)
+        {
+            return g_nr.evaluate(
+                list, passFeature, g_nr.capabilityParams, passInput, modelDepth, spatial ? modelMotion : evalMotion,
+                passOutput, modelWidth, bandRows, evalGuideW, BandGuide(evalGuideH), evalMotionW, BandGuide(evalMotionH),
+                evalDepthX, evalDepthY, spatial ? 0u : evalMotionBaseX, spatial ? 0u : evalMotionBaseY,
+                g_nr.guideDepthInverted ? 1 : 0,
+                reset ? 1 : 0, tuning.intensity,
+                (int) PassStyle(cfg, pass), tuning.structure,
+                tuning.tone, tuning.skin,
+                tuning.autoMask ? 1 : 0, evalMvScaleX,
+                evalMvScaleY);
+        };
+        // Network split of this pass: Head here, the middle on the helper, End here once its tensors are back.
+        const auto splitWorkspace = splitEligible && pass == splitPass ? NetworkSplitRun::WorkspaceOf(passFeature)
+                                                                       : DlssNr::ModelAllocations::Workspace {};
+        std::shared_ptr<DlssNr::Worker::SplitGeneration> splitGeneration;
+        if (splitWorkspace.address)
+            splitGeneration = NetworkSplitRun::Prepare(device, cfg, pass, modelWidth, modelHeight,
+                                                       splitWorkspace.bytes);
+        else if (splitEligible && pass == splitPass)
+        {
+            static bool told = false;
+            if (!told)
+                LOG_WARN("DLSS-NR network split: pass {} has no known workspace (built before the split was "
+                         "enabled?); it runs on the game GPU until its model is rebuilt.", pass + 1);
+            told = true;
+        }
+        bool splitDone = false;
+        if (splitGeneration)
+        {
+            using DlssNr::NetworkSplit::Role;
+            const auto* plan = &splitGeneration->GetPlan();
+            const auto BeginSplit = [&](Role role)
+            {
+                DlssNrNative::BeginSplitEvaluate(cmdList, static_cast<int>(role), plan, splitWorkspace.address,
+                                                 splitGeneration->ForwardStaging(),
+                                                 splitGeneration->BackwardStaging());
+            };
+            splitGeneration->BeforeHead(cmdList);
+            BeginSplit(Role::Head);
+            result = EvaluatePass(cmdList, passReset);
+            const bool headRecorded = DlssNrNative::EndSplitEvaluate();
+            splitGeneration->AfterHead(cmdList);
+            HRESULT handoff = E_FAIL;
+            if (headRecorded && result == NVSDK_NGX_Result_Success)
+            {
+                DlssNr::Worker::FrameCommand command {};
+                command.guideWidth = evalGuideW; command.guideHeight = evalGuideH;
+                command.motionWidth = evalMotionW; command.motionHeight = evalMotionH;
+                command.depthX = evalDepthX; command.depthY = evalDepthY;
+                command.motionX = evalMotionBaseX; command.motionY = evalMotionBaseY;
+                command.invertedDepth = g_nr.guideDepthInverted ? 1u : 0u;
+                command.motionScaleX = evalMvScaleX; command.motionScaleY = evalMvScaleY;
+                command.resetMask = passReset ? 1u : 0u;
+                auto& p = command.passes[0];
+                p.intensity = tuning.intensity; p.structure = tuning.structure; p.tone = tuning.tone;
+                p.skin = tuning.skin; p.style = static_cast<int>(PassStyle(cfg, pass));
+                p.autoMask = tuning.autoMask ? 1 : 0;
+                // The chain is split here: queries begun on the original list cannot end on the continuation.
+                if (g_gpuTime) g_gpuTime->Abandon();
+                if (g_ngxTime) g_ngxTime->Abandon();
+                workerContext->keepAlive = splitGeneration; // copy lists and staging live until the slot retires
+                handoff = splitGeneration->Submit(*workerContext->chain, workerContext->queue, command);
+                cmdList = workerContext->chain->Current();
+                stateEnvelope.cmd = cmdList;
+                if (!cmdList)
+                {
+                    workerContext->unusable = true;
+                    device->Release();
+                    co_return;
+                }
+                if (SUCCEEDED(handoff) && workerContext->pipelineRequested)
+                {
+                    // The End half is recorded on the next continuation, so the game GPU's queue does not wait on
+                    // the helper behind this frame's own work.
+                    stateEnvelope.Pause();
+                    g_dispatchSuspended = true;
+                    nrLock.unlock();
+                    co_await std::suspend_always {};
+                    nrLock.lock();
+                    g_dispatchSuspended = false;
+                    cmdList = workerContext->chain->Current();
+                    stateEnvelope.Resume(cmdList);
+                }
+                if (SUCCEEDED(handoff))
+                    handoff = splitGeneration->AwaitReturn(workerContext->queue);
+            }
+            if (SUCCEEDED(handoff))
+            {
+                splitGeneration->BeforeEnd(cmdList);
+                BeginSplit(Role::End);
+                result = EvaluatePass(cmdList, false);
+                splitDone = DlssNrNative::EndSplitEvaluate();
+                splitGeneration->AfterEnd(cmdList);
+                if (!splitDone)
+                    LOG_WARN("DLSS-NR network split: the end of pass {} did not run as calibrated; the pass runs "
+                             "whole on the game GPU and the split stops.", pass + 1);
+                splitDone = splitDone || result != NVSDK_NGX_Result_Success;
+            }
+            else
+                LOG_WARN("DLSS-NR network split: handoff of pass {} failed (0x{:08X}); it runs whole on the game GPU.",
+                         pass + 1, static_cast<unsigned>(handoff));
+            if (!splitDone || splitGeneration->Failed())
+                NetworkSplitRun::failedKey = NetworkSplitRun::currentKey;
+        }
+        if (!splitDone)
+        {
+            DlssNrNative::BeginEvaluate(passFeature, passReset,
+                                        vitEveryFrame ? 1u : std::clamp(cfg.DlssNrVitEvery.value_or_default(), 1u, 2u),
+                                        vitEveryFrame ? 1u : std::clamp(cfg.DlssNrVitEveryPlain.value_or_default(), 1u, 2u),
+                                        (long long) (g_nr.successfulDispatches & 0x3FFFFFFFFFFFFFFFull), cmdList,
+                                        cfg.DlssNrKernelProfile.value_or_default(), copySets);
+            result = EvaluatePass(cmdList, passReset);
+            if (DlssNrNative::EndEvaluate(cmdList))
+                LOG_WARN("DLSS-NR: Reuse bottleneck is {}", DlssNrNative::VitStatus());
+        }
 
         for (const std::string& report : DlssNrNative::TakeProfileReports())
             LOG_INFO("{}", report);

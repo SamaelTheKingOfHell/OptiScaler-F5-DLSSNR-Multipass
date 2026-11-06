@@ -1,3 +1,9 @@
+## 2026-11-06 — DLSS-NR network split in OptiScaler (WIP, off by default)
+
+- New `[DlssNr] NetworkSplit`, `NetworkSplitPass` and `NetworkSplitPlan`, with a menu checkbox and pass slider. The second GPU evaluates the middle of one pass's network (kernels between a calibrated cut and resume) while the game GPU evaluates the start and the end. The tensors cross as calibrated workspace byte ranges on a copy queue, and every cross-GPU wait is a queue fence wait guarded by the worker watchdog. Any failure before the end runs that pass whole on the game GPU.
+- Worker protocol 9 carries the plan; the worker gains a split mode (`WorkerSplitMain.h`). The game captures each feature's workspace through NGX's allocation callbacks while the option is on. A 1280x720 Preset B plan ships in `OptiScaler/NR-Split/`.
+- Anthropic Claude Opus 5.5. Release build and the split, profile, helper-share and helper-strip unit tests pass. Not tested in a game. See `docs/NR-network-trace.md`.
+
 ## 2026-11-06 — DLSS-NR network split research (WIP, test tools only)
 
 - Added NvAPI kernel-chain research tools under `tests/nr_gpu/`: `nr_cuda_trace`, `nr_split_splice`, `nr_split_owner` / `nr_split_helper` and the `nr_nvapi_harness.h` harness. They trace the model's 156 (Preset A) / 80 (Preset B) kernels, own its buffers through NGX's `ResourceAllocCallback`, and run a middle segment of one evaluate on a second GPU.

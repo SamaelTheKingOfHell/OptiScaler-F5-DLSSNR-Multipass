@@ -18,6 +18,7 @@ namespace DlssNr::Worker
 class WorkerClient
 {
     friend class WorkerGeneration;
+    friend class SplitGeneration;
     struct Handle
     {
         HANDLE value = nullptr;

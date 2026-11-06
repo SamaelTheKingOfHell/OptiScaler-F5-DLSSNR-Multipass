@@ -141,6 +141,8 @@ static Evaluation MakeEvaluation(Frame& frame, unsigned width, unsigned height, 
     request.reset = reset ? 1 : 0;
     return request;
 }
+#include "WorkerSplitMain.h"
+
 static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, const wchar_t* model, const wchar_t* data,
                   const wchar_t* log)
 {
@@ -197,6 +199,10 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
     Check(DlssNr::MultiGpu::CrossAdapterPeer::Open(device.Get(), wire.primary, wire.secondary, wire.bytes, heap.value,
                                                    ready.value, done.value, peer),
           "Worker open handles");
+    if (wire.split.cut > 0)
+        return SplitWorker::Run(device.Get(), peer, wire,
+                                [&](void* buffer, DWORD bytes) { return readExact(buffer, bytes); }, parent.value,
+                                initialized.value, core, forwarder, model, data);
     Frame frame(device.Get(), wire);
     if (frame.Bytes() != wire.bytes || frame.color.bytes != wire.colorBytes || frame.depth.bytes != wire.depthBytes ||
         frame.motion.bytes != wire.motionBytes || frame.DepthOffset() != wire.depthOffset ||

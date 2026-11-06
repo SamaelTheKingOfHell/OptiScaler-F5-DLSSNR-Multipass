@@ -29,6 +29,7 @@
 #include "DlssNrVitReuse.h"
 #include "DlssNrVitCopyKernel.h"
 #include "DlssNrKernelProfile.h"
+#include "DlssNr_NetworkSplit.h"
 #pragma comment(lib,"bcrypt.lib")
 namespace DlssNrNative {namespace {
 namespace fs=std::filesystem;using Microsoft::WRL::ComPtr;void Check(HRESULT r){if(FAILED(r))throw std::runtime_error("D3D12 status "+std::to_string((unsigned)r));}void NvCheck(NvAPI_Status r){if(r!=NVAPI_OK)throw std::runtime_error("NVAPI status "+std::to_string(r));}
@@ -71,6 +72,8 @@ struct State{std::recursive_mutex mutex;bool enabled=false,candidate=false,resta
  // so its address is not reused; failed = its load failed, not retried). Replaced buffers are retired, never freed.
  struct VitCopy{Buffer buf;uint64_t dst=0,bytes=0;};std::map<std::pair<ID3D12Device*,const void*>,VitCopy>vitCopies;
  struct VitCopyKernel{ComPtr<ID3D12Device>device;NVDX_ObjectHandle fn=nullptr;bool failed=false;};std::map<ID3D12Device*,VitCopyKernel>vitCopyFn;std::vector<Buffer>vitRetired;
+ // Network split: the role of the evaluate being recorded on splitList (other lists, e.g. the game's own DLSS, pass untouched).
+ DlssNr::NetworkSplit::Filter split;ID3D12GraphicsCommandList*splitList=nullptr;bool splitFailed=false;
  decltype(&NvAPI_D3D12_CreateCuModule) createModule=nullptr;decltype(&NvAPI_D3D12_CreateCuFunction)createFunction=nullptr;decltype(&NvAPI_D3D12_LaunchCuKernelChain)launch=nullptr;
  decltype(&NvAPI_D3D12_DestroyCuModule)destroyModule=nullptr;decltype(&NvAPI_D3D12_DestroyCuFunction)destroyFunction=nullptr;};
 // Deliberately retain resources until process exit, never free under recorded GPU work.
@@ -152,12 +155,25 @@ bool VitDrop(State&s,const NVAPI_CU_KERNEL_LAUNCH_PARAMS*k,NvU32 count,std::vect
  const auto sigOf=[](const NVAPI_CU_KERNEL_LAUNCH_PARAMS&l){uint64_t h=1469598103934665603ull;const auto mix=[&](const void*p,size_t n){for(size_t i=0;i<n;++i){h^=((const unsigned char*)p)[i];h*=1099511628211ull;}};if(l.pParams)mix(l.pParams,l.paramSize);mix(&l.gridDim,sizeof l.gridDim);mix(&l.blockDim,sizeof l.blockDim);return h;};
  return s.vit.Split(k,count,[&](const NVAPI_CU_KERNEL_LAUNCH_PARAMS&l){auto it=s.vitRole.find(l.hFunction);return it==s.vitRole.end()?std::pair{DlssNrVitReuse::Role::None,DlssNrVitReuse::KernelSet::Unknown}:it->second;},sigOf,kept,gap,copy,copyAt,copyFrom);}
 // ViT reuse copy mode: record the save (the run's 2-D output into our buffer) or the restore (back into it). `end` is the run's last launch;
+// The 16-byte copy kernel on `dev`, loaded on first use (nullptr if it cannot be; not retried).
+NVDX_ObjectHandle CopyKernel(State&s,ID3D12Device*dev){auto&k=s.vitCopyFn[dev];if(k.failed)return nullptr;
+ if(!k.fn){k.device=dev;NVDX_ObjectHandle m=nullptr;if(!s.createModule||!s.createFunction||s.createModule(dev,DlssNrVitCopyKernel::fatbin,(NvU32)sizeof DlssNrVitCopyKernel::fatbin,&m)!=NVAPI_OK||s.createFunction(dev,m,"nr_vit_copy16",&k.fn)!=NVAPI_OK){if(m&&s.destroyModule)s.destroyModule(dev,m);k.fn=nullptr;k.failed=true;return nullptr;}s.fnInfo[k.fn]=DlssNrKernelProfile::Classify("nr_vit_copy16");}
+ return k.fn;}
+// Network split: each kernel of the chain through the filter, one launch at a time; transfers use the copy kernel.
+NvAPI_Status SplitLaunch(State&s,ID3D12GraphicsCommandList*c,const NVAPI_CU_KERNEL_LAUNCH_PARAMS*k,NvU32 count){
+ ComPtr<ID3D12Device>dev;if(FAILED(c->GetDevice(IID_PPV_ARGS(&dev)))){s.splitFailed=true;return NVAPI_ERROR;}
+ for(NvU32 i=0;i<count;++i){const int rc=s.split.Kernel([&]{return (int)RealLaunch(s,c,&k[i],1);},
+   [&](uint64_t dst,uint64_t src,uint64_t bytes){const NVDX_ObjectHandle fn=CopyKernel(s,dev.Get());if(!fn){s.splitFailed=true;return (int)NVAPI_ERROR;}
+    const uint64_t n=bytes/16;struct Params{uint64_t dst,src,n;}p{dst,src,n};NVAPI_CU_KERNEL_LAUNCH_PARAMS l{};l.hFunction=fn;l.gridDim={(unsigned)std::min<uint64_t>((n+255)/256,1024),1,1};l.blockDim={256,1,1};l.pParams=&p;l.paramSize=sizeof p;return (int)RealLaunch(s,c,&l,1);},
+   [&]{Barrier(c);});
+  if(rc){s.splitFailed=true;return (NvAPI_Status)rc;}}
+ return NVAPI_OK;}
 // DlssNrVitReuse::CheckOutput says where its 2-D output is and how big. Returns why it could not, or nullptr.
 const char* VitCopyRecord(State&s,ID3D12GraphicsCommandList*c,DlssNrVitReuse::Copy kind,const NVAPI_CU_KERNEL_LAUNCH_PARAMS&end){
  struct{uint64_t dst;}e{};uint64_t bytes=0;const uint64_t threads=(uint64_t)end.gridDim.x*end.gridDim.y*end.gridDim.z*end.blockDim.x*end.blockDim.y*end.blockDim.z;
  if(const char*why=DlssNrVitReuse::CheckOutput(end.pParams,end.paramSize,threads,s.vit.LastSet(),e.dst,bytes))return why;
  try{ComPtr<ID3D12Device>dev;Check(c->GetDevice(IID_PPV_ARGS(&dev)));auto&k=s.vitCopyFn[dev.Get()];if(k.failed)return "the copy kernel could not be loaded";
-  if(!k.fn){k.device=dev;NVDX_ObjectHandle m=nullptr;if(!s.createModule||!s.createFunction||s.createModule(dev.Get(),DlssNrVitCopyKernel::fatbin,(NvU32)sizeof DlssNrVitCopyKernel::fatbin,&m)!=NVAPI_OK||s.createFunction(dev.Get(),m,"nr_vit_copy16",&k.fn)!=NVAPI_OK){if(m&&s.destroyModule)s.destroyModule(dev.Get(),m);k.fn=nullptr;k.failed=true;return "the copy kernel could not be loaded";}s.fnInfo[k.fn]=DlssNrKernelProfile::Classify("nr_vit_copy16");}
+  if(!CopyKernel(s,dev.Get()))return "the copy kernel could not be loaded";
   const NVDX_ObjectHandle fn=k.fn;auto&v=s.vitCopies[{dev.Get(),s.vit.Feature()}];
   if(kind==DlssNrVitReuse::Copy::Save){if(v.buf.bytes<bytes){if(v.buf.gpu)s.vitRetired.push_back(v.buf);v.buf=Allocate(dev.Get(),bytes);}v.dst=e.dst;v.bytes=bytes;}
   else if(!v.buf.gpu||v.dst!=e.dst||v.bytes!=bytes)return "the saved ViT output does not match the network";
@@ -166,6 +182,7 @@ const char* VitCopyRecord(State&s,ID3D12GraphicsCommandList*c,DlssNrVitReuse::Co
  catch(const std::exception&){return "the copy could not be recorded";}
  return nullptr;}
 NvAPI_Status __cdecl Launch(ID3D12GraphicsCommandList*c,const NVAPI_CU_KERNEL_LAUNCH_PARAMS*k,NvU32 count){auto&s=S();std::lock_guard<std::recursive_mutex>g(s.mutex);
+ if(c&&c==s.splitList&&s.split.Active()!=DlssNr::NetworkSplit::Role::Off)return SplitLaunch(s,c,k,count);
  // A UAV barrier where the skipped run would have been: without it the kernel before the gap and the one after it can overlap on the
  // GPU. The run's own kernels kept them apart. On the plain set the kernel after it is the run's kept last kernel (see DlssNrVitReuse.h).
  {std::vector<NVAPI_CU_KERNEL_LAUNCH_PARAMS>kept;ptrdiff_t gap=-1,copyAt=-1,copyFrom=-1;DlssNrVitReuse::Copy copy=DlssNrVitReuse::Copy::None;if(VitDrop(s,k,count,kept,gap,copy,copyAt,copyFrom)){
@@ -245,6 +262,8 @@ void SetEnabled(bool on){SetPrecision(on?4u:0u);}
 bool IsActive(){auto&s=S();std::lock_guard<std::recursive_mutex>g(s.mutex);return s.enabled&&s.active&&!s.restartRequired;}
 void BeginEvaluate(const void*feature,bool reset,unsigned every,unsigned everyPlain,long long slot,ID3D12GraphicsCommandList*cmd,bool profile,unsigned copySets){auto&s=S();std::lock_guard<std::recursive_mutex>g(s.mutex);s.vit.Begin(feature,reset,every,slot,everyPlain,copySets);s.prof.Begin(cmd,profile);}
 bool EndEvaluate(ID3D12GraphicsCommandList*cmd){auto&s=S();std::lock_guard<std::recursive_mutex>g(s.mutex);s.prof.End(cmd);const bool wasOff=s.vit.Disabled();const bool wellFormed=s.vit.End();return (!wellFormed||s.vit.Disabled())&&!wasOff;}
+void BeginSplitEvaluate(ID3D12GraphicsCommandList*cmd,int role,const DlssNr::NetworkSplit::Plan*plan,uint64_t workspace,uint64_t forwardStaging,uint64_t backwardStaging){auto&s=S();std::lock_guard<std::recursive_mutex>g(s.mutex);s.splitList=cmd;s.splitFailed=false;s.split.Begin((DlssNr::NetworkSplit::Role)role,plan,workspace,forwardStaging,backwardStaging);}
+bool EndSplitEvaluate(){auto&s=S();std::lock_guard<std::recursive_mutex>g(s.mutex);const bool complete=s.split.End();s.splitList=nullptr;return complete&&!s.splitFailed;}
 std::vector<std::string> TakeProfileReports(){auto&s=S();std::lock_guard<std::recursive_mutex>g(s.mutex);return s.prof.TakeReports();}
 std::string VitStatus(){auto&s=S();std::lock_guard<std::recursive_mutex>g(s.mutex);return s.vit.Status();}
 bool VitPlainKernels(){return S().vit.LastSet()==DlssNrVitReuse::KernelSet::Plain;}

@@ -16,6 +16,8 @@ struct DispatchContext
     MultiGpu::OwnedCommandChain* chain = nullptr;
     ID3D12CommandQueue* queue = nullptr;
     std::shared_ptr<WorkerGeneration> generation;
+    // Anything else the recorded lists use (a network split generation): released with the slot, after its fence.
+    std::shared_ptr<void> keepAlive;
     bool needsRetirement = false;
     bool unusable = false;
     bool pipelineRequested = false;
