@@ -188,6 +188,76 @@ int ReplayDeferred(ID3D12GraphicsCommandList* list)
     g_deferred.clear();
     return 0;
 }
+// SPLICE_LOGCMD: the model's own non-kernel commands on our list (copies, barriers, clears, dispatches), with the
+// kernel index they precede, so a second evaluate per picture can be checked for repeated history work.
+struct CommandEvent
+{
+    const char* what;
+    void* dst;
+    void* src;
+    int kernel;
+    Role role;
+};
+std::vector<CommandEvent> g_commands;
+bool g_logCommands = false;
+using PFN_Slot = void(STDMETHODCALLTYPE*)(void*, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+PFN_Slot g_listOriginal[64] {};
+template<int Slot, int Dst, int Src>
+void STDMETHODCALLTYPE ListHook(void* self, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6,
+                                uint64_t a7)
+{
+    if (g_logCommands)
+    {
+        static const char* names[64] {};
+        names[14] = "Dispatch";
+        names[15] = "CopyBufferRegion";
+        names[16] = "CopyTextureRegion";
+        names[17] = "CopyResource";
+        names[26] = "ResourceBarrier";
+        names[49] = "ClearUavUint";
+        names[50] = "ClearUavFloat";
+        const uint64_t args[] = { 0, a1, a2, a3, a4, a5, a6, a7 };
+        void* dst = Dst ? reinterpret_cast<void*>(args[Dst]) : nullptr;
+        void* src = Src ? reinterpret_cast<void*>(args[Src]) : nullptr;
+        if (Slot == 16) // copy locations: pResource is the first member
+        {
+            dst = dst ? *reinterpret_cast<void**>(dst) : nullptr;
+            src = src ? *reinterpret_cast<void**>(src) : nullptr;
+        }
+        if (Slot == 26 && a1 && a2) // first barrier's resource
+        {
+            const auto* b = reinterpret_cast<const D3D12_RESOURCE_BARRIER*>(a2);
+            dst = b->Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ? b->Transition.pResource
+                : b->Type == D3D12_RESOURCE_BARRIER_TYPE_UAV       ? b->UAV.pResource
+                                                                   : b->Aliasing.pResourceAfter;
+        }
+        g_commands.push_back({ names[Slot], dst, src, g_index, g_role });
+    }
+    g_listOriginal[Slot](self, a1, a2, a3, a4, a5, a6, a7);
+}
+void HookList(ID3D12GraphicsCommandList* list)
+{
+    void** vtable = *reinterpret_cast<void***>(list);
+    struct Entry
+    {
+        int slot;
+        PVOID hook;
+    } entries[] = {
+        { 14, reinterpret_cast<PVOID>(&ListHook<14, 0, 0>) }, { 15, reinterpret_cast<PVOID>(&ListHook<15, 1, 3>) },
+        { 16, reinterpret_cast<PVOID>(&ListHook<16, 1, 5>) }, { 17, reinterpret_cast<PVOID>(&ListHook<17, 1, 2>) },
+        { 26, reinterpret_cast<PVOID>(&ListHook<26, 0, 0>) }, { 49, reinterpret_cast<PVOID>(&ListHook<49, 3, 0>) },
+        { 50, reinterpret_cast<PVOID>(&ListHook<50, 3, 0>) },
+    };
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+    for (const auto& e : entries)
+    {
+        g_listOriginal[e.slot] = reinterpret_cast<PFN_Slot>(vtable[e.slot]);
+        DetourAttach(reinterpret_cast<PVOID*>(&g_listOriginal[e.slot]), e.hook);
+    }
+    DetourTransactionCommit();
+}
+
 void* Wrap(unsigned id, void* raw)
 {
     return id == kLaunchChain ? reinterpret_cast<void*>(&Launch) : raw;
@@ -263,6 +333,8 @@ int wmain(int argc, wchar_t** argv)
         Must(device->CreateCommandAllocator(qd.Type, IID_PPV_ARGS(&alloc)), "alloc");
         Must(device->CreateCommandList(0, qd.Type, alloc.Get(), nullptr, IID_PPV_ARGS(&list)), "list");
         ID3D12CommandList* lists[] = { list.Get() };
+        if (_wgetenv(L"SPLICE_LOGCMD"))
+            HookList(list.Get());
         auto begin = [&]()
         {
             Must(alloc->Reset(), "reset");
@@ -453,6 +525,10 @@ int wmain(int argc, wchar_t** argv)
                 }
             }
         }
+        std::vector<uint8_t> dHead, dMid;
+        const Allocation* dOwner = nullptr;
+        const Allocation* dHelper = nullptr;
+        uint64_t dBytes = 0;
         if (discover && !baseline)
         {
             // Workspace of each instance: its smallest writable buffer (the activation arena).
@@ -563,7 +639,7 @@ int wmain(int argc, wchar_t** argv)
                         t.ownerVa = wsOwner->va + k * block;
                         t.helperVa = wsHelper->va + k * block;
                         t.bytes = (e - k) * block;
-                        t.offset = total;
+                        t.offset = k * block; // staging mirrors the workspace layout
                         total += t.bytes;
                         out.push_back(t);
                     }
@@ -579,6 +655,14 @@ int wmain(int argc, wchar_t** argv)
                 headTotal += headWrites[k];
                 midTotal += midWrites[k];
             }
+            dHead = headWrites;
+            dMid = midWrites;
+            dOwner = wsOwner;
+            dHelper = wsHelper;
+            dBytes = bytes;
+            std::printf("Selected: forward %.2f MiB, backward %.2f MiB\n", forwardBytes / 1048576.0,
+                        backwardBytes / 1048576.0);
+            forwardBytes = backwardBytes = bytes;
             std::printf("Discovered writes: head %.2f MiB in %zu runs, segment %.2f MiB in %zu runs\n",
                         headTotal * block / 1048576.0, headRuns, midTotal * block / 1048576.0, midRuns);
         }
@@ -589,12 +673,169 @@ int wmain(int argc, wchar_t** argv)
                                          true);
         g_forwardVa = forwardBuffer->GetGPUVirtualAddress();
         g_backwardVa = backwardBuffer->GetGPUVirtualAddress();
+        if (discover && !baseline && !tailMode && _wgetenv(L"SPLICE_MINIMIZE"))
+        {
+            // Empirical minimization: drop a chunk from a set when the owner's output over a reset frame and a normal
+            // frame stays bit-identical to the output with every written block transferred. The block range kernel 0
+            // (the counter clear) references is pinned in both directions: dropping the model's synchronization
+            // counters would leave the receiving side's wait kernels waiting forever.
+            constexpr uint64_t block = 256;
+            const size_t blocks = static_cast<size_t>(dBytes / block);
+            std::vector<uint8_t> pinned(blocks, 0), fwd = dHead, bwd = dMid;
+            for (uint64_t v : traceOwner[0])
+                if (v >= dOwner->va && v < dOwner->va + dBytes)
+                    for (size_t k = static_cast<size_t>((v - dOwner->va) / block);
+                         k < std::min(blocks, static_cast<size_t>((v - dOwner->va) / block) + 256); ++k)
+                        pinned[k] = 1;
+            auto build = [&](const std::vector<uint8_t>& m, std::vector<Transfer>& out)
+            {
+                out.clear();
+                for (size_t k = 0; k < blocks;)
+                {
+                    if (!m[k])
+                    {
+                        ++k;
+                        continue;
+                    }
+                    size_t e = k;
+                    while (e < blocks && m[e])
+                        ++e;
+                    Transfer t;
+                    t.ownerVa = dOwner->va + k * block;
+                    t.helperVa = dHelper->va + k * block;
+                    t.bytes = (e - k) * block;
+                    t.offset = k * block;
+                    out.push_back(t);
+                    k = e;
+                }
+            };
+            auto run = [&]()
+            {
+                std::vector<std::pair<double, double>> outs;
+                // Same starting memory for every candidate: one full evaluate of both instances first.
+                begin();
+                for (void* feature : { owner, helper })
+                {
+                    g_role = Role::Full;
+                    g_index = 0;
+                    if (model.Run(list.Get(), feature, color, depth, motion, outHelper, w, h, true) != 1)
+                        throw std::runtime_error("normalize evaluate failed");
+                }
+                submit();
+                for (int f = 1; f <= 2; ++f)
+                {
+                    begin();
+                    Barrier(list.Get(), color.texture.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_COPY_DEST);
+                    Upload(list.Get(), color, 0, 700 + f);
+                    Barrier(list.Get(), color.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    for (auto [role, feature, reset] : { std::tuple { Role::Full, ref, f == 1 },
+                                                         { Role::Owner, owner, f == 1 },
+                                                         { Role::Helper, helper, f == 1 },
+                                                         { Role::OwnerEnd, owner, false } })
+                    {
+                        g_role = role;
+                        g_index = 0;
+                        g_injected = false;
+                        if (model.Run(list.Get(), feature, color, depth, motion,
+                                      role == Role::Full ? outRef : role == Role::Helper ? outHelper : outOwner, w, h,
+                                      reset) != 1)
+                            throw std::runtime_error("minimize evaluate failed");
+                    }
+                    g_role = Role::Full;
+                    submit();
+                    // error against the reference: max and mean absolute difference (half-float RGB)
+                    const auto a = Readback(device.Get(), queue.Get(), outRef);
+                    const auto b = Readback(device.Get(), queue.Get(), outOwner);
+                    double mx = 0, sum = 0;
+                    size_t n = 0;
+                    for (size_t i = 0; i < a.size(); ++i)
+                        if (i % 4 != 3)
+                        {
+                            const double d = std::fabs(double(Half(a[i])) - double(Half(b[i])));
+                            mx = std::max(mx, d);
+                            sum += d;
+                            ++n;
+                        }
+                    outs.push_back({ mx, sum / n });
+                }
+                return outs;
+            };
+            auto mib = [&](const std::vector<uint8_t>& m)
+            {
+                size_t c = 0;
+                for (uint8_t x : m)
+                    c += x;
+                return c * block / 1048576.0;
+            };
+            build(fwd, g_forward);
+            build(bwd, g_backward);
+            const auto base = run();
+            // Missing data shows up as large errors (0.37 max, 0.13 mean); the two-call residue is about 0.004.
+            auto acceptable = [&](const std::vector<std::pair<double, double>>& r)
+            {
+                for (size_t f = 0; f < r.size(); ++f)
+                    if (r[f].first > base[f].first * 1.5 + 1e-4 || r[f].second > base[f].second * 1.5 + 1e-6)
+                        return false;
+                return true;
+            };
+            std::printf("Baseline error: frame 1 max %.5f mean %.7f, frame 2 max %.5f mean %.7f%c", base[0].first,
+                        base[0].second, base[1].first, base[1].second, 10);
+            auto shrink = [&](std::vector<uint8_t>& m, const char* label, size_t chunk)
+            {
+                size_t tried = 0, dropped = 0;
+                for (size_t c0 = 0; c0 < blocks; c0 += chunk)
+                {
+                    const size_t c1 = std::min(blocks, c0 + chunk);
+                    bool any = false;
+                    for (size_t k = c0; k < c1; ++k)
+                        any |= m[k] && !pinned[k];
+                    if (!any)
+                        continue;
+                    const auto saved = m;
+                    for (size_t k = c0; k < c1; ++k)
+                        if (!pinned[k])
+                            m[k] = 0;
+                    build(fwd, g_forward);
+                    build(bwd, g_backward);
+                    ++tried;
+                    if (acceptable(run()))
+                        ++dropped;
+                    else
+                        m = saved;
+                }
+                build(fwd, g_forward);
+                build(bwd, g_backward);
+                std::printf("  %s, %zu KiB chunks: dropped %zu of %zu, now %.2f MiB\n", label,
+                            static_cast<size_t>(chunk * block / 1024), dropped, tried, mib(m));
+                std::fflush(stdout);
+            };
+            std::printf("Minimizing from forward %.2f MiB, backward %.2f MiB (pinned %.2f MiB)\n", mib(fwd), mib(bwd),
+                        mib(pinned));
+            shrink(fwd, "forward", 4096);
+            shrink(bwd, "backward", 4096);
+            shrink(fwd, "forward", 256);
+            shrink(bwd, "backward", 256);
+            std::printf("Minimal sets: forward %.2f MiB in %zu ranges, backward %.2f MiB in %zu ranges\n", mib(fwd),
+                        g_forward.size(), mib(bwd), g_backward.size());
+            if (FILE* out = _wfopen(L"split-sets.txt", L"w"))
+            {
+                for (const auto& t : g_forward)
+                    std::fprintf(out, "F %llu %llu\n", (unsigned long long) t.offset, (unsigned long long) t.bytes);
+                for (const auto& t : g_backward)
+                    std::fprintf(out, "B %llu %llu\n", (unsigned long long) t.offset, (unsigned long long) t.bytes);
+                std::fclose(out);
+            }
+        }
         std::printf("Adapter %ls, %ux%u preset %d: %d kernels; owner [0..%d] + [%d..%d], helper [%d..%d]\n",
                     name.c_str(), w, h, preset, kernels, g_cut, g_resume, kernels - 1, g_cut + 1, g_resume - 1);
         std::printf("Forward %zu tensors %.2f MiB, backward %zu tensors %.2f MiB per evaluate\n", g_forward.size(),
                     forwardBytes / 1048576.0, g_backward.size(), backwardBytes / 1048576.0);
 
         int failures = 0;
+        g_logCommands = _wgetenv(L"SPLICE_LOGCMD") != nullptr;
+        g_commands.clear();
         for (int f = 1; f <= frames; ++f)
         {
             begin();
@@ -627,6 +868,36 @@ int wmain(int argc, wchar_t** argv)
             if (!baseline && (tailMode || !g_twoCalls) && ReplayDeferred(list.Get()) != 0)
                 throw std::runtime_error("replay failed");
             submit();
+            if (g_logCommands)
+            {
+                auto label = [&](void* r) -> std::string
+                {
+                    if (!r)
+                        return "-";
+                    for (const auto& al : Allocations().items)
+                        if (al.resource.Get() == r)
+                        {
+                            const char* kind = al.desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ? "history-tex"
+                                             : al.desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                                                 ? (al.desc.Width < 80000000 ? "workspace" : "weights")
+                                                 : "readonly-buf";
+                            return std::string(kind) + "#" + std::to_string(al.tag);
+                        }
+                    for (auto [sf, n] : { std::pair { &color, "color" }, { &depth, "depth" }, { &motion, "motion" },
+                                          { &outRef, "out-ref" }, { &outOwner, "out-owner" }, { &outHelper, "out-helper" } })
+                        if (sf->texture.Get() == r)
+                            return n;
+                    return "other";
+                };
+                const char* roles[] = { "full", "trace", "owner", "helper", "owner-end", "probe" };
+                std::printf("  model commands, frame %d:\n", f);
+                for (const auto& e : g_commands)
+                    if (std::string(e.what) != "ResourceBarrier" || label(e.dst).find("history") != std::string::npos)
+                        std::printf("    %-9s before kernel %2d: %-17s dst %-14s src %s\n", roles[int(e.role)], e.kernel,
+                                    e.what, label(e.dst).c_str(), label(e.src).c_str());
+                g_commands.clear();
+                g_logCommands = f < 2;
+            }
             const auto a = Readback(device.Get(), queue.Get(), outRef);
             const auto b = Readback(device.Get(), queue.Get(), baseline || tailMode ? outHelper : outOwner);
             double maxDiff = 0, sum = 0;
