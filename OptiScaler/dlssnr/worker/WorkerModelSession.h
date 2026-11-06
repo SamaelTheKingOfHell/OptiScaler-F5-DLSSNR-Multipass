@@ -218,6 +218,18 @@ class ModelSession
                          request.structure, request.tone, request.skin, request.autoMask, request.motionScaleX,
                          request.motionScaleY);
     }
+#ifdef DLSSNR_WORKER_TESTING
+    // Benchmarks only: evaluates a height other than the feature's creation height.
+    int RecordUnchecked(ID3D12GraphicsCommandList* commands, const Evaluation& request, unsigned featureIndex)
+    {
+        return evaluate_(commands, features_[featureIndex], params_, request.color, request.depth, request.motion,
+                         request.output, request.width, request.height, request.guideWidth, request.guideHeight,
+                         request.motionWidth, request.motionHeight, request.depthX, request.depthY, request.motionX,
+                         request.motionY, request.invertedDepth, request.reset, request.intensity, request.style,
+                         request.structure, request.tone, request.skin, request.autoMask, request.motionScaleX,
+                         request.motionScaleY);
+    }
+#endif
     const char* LastError() const { return error_ ? error_() : "no detail"; }
 };
 } // namespace DlssNr::Worker

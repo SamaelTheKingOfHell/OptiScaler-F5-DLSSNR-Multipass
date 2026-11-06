@@ -1,3 +1,9 @@
+## 2026-11-06 — Split-frame secondary GPU measurements (WIP)
+
+- Added `nr_band_split_benchmark`, which measures one neural pass per band height on a chosen NVIDIA adapter. With `--subset`, it evaluates fewer rows than the feature was built with. The worker model session exposes that unchecked evaluate only in test builds.
+- RTX 3060 results: Preset A costs at least about 14 ms per 1280-wide pass for any band height (9.3 ms at 320x96); 1280x720 costs 27.1 ms. The Ampere Preset B runtime has a floor of about 4.4 ms; 1280x720 costs 7.4 ms. Subset evaluation succeeded. Splitting a Preset A picture into bands therefore cannot make the 3060 help. See `docs/Split-frame-measurements.md`.
+- Anthropic Claude Opus 5.5. RTX 5070 Ti measurements are pending: device creation failed after a driver reset. Split-frame rendering is not implemented yet.
+
 ## 2026-11-03 — Experimental automatic GPU pass balancing (WIP)
 
 - Added optional `MultiGpuAutoBalance` on the pass page, persisted in settings and named profiles. Measured native-picture intervals drive bounded split trials, including primary-only placement, with warmup exclusion, median/p95 comparisons, hysteresis and cooldown. Presets, runtimes, pass count, appearance and saved manual masks remain unchanged.
