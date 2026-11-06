@@ -219,3 +219,43 @@ Open items:
 3. Cross-GPU: the worker filters its launches and receives the sets through
    the cross-adapter buffer. The game GPU's queue waits between the owner's
    two evaluates.
+
+## Cross-GPU prototype (2026-11-06)
+
+`nr_split_owner.exe` runs on the game GPU (RTX 5070 Ti, game runtime) and
+`nr_split_helper.exe` on the second GPU (RTX 3060, Ampere v0.4.0 runtime). The
+helper is a separate process started through the production `WorkerClient`.
+It uses the same cross-adapter heap and fences. Preset B, 1280x720, cut 66,
+resume 78. Ranges from the single-GPU minimizer: 15.79 MiB forward (64
+ranges), 7.50 MiB back (5 ranges).
+
+| Measurement | Value |
+|---|---|
+| Error vs single-GPU reference, 12 pictures | max 0.0037 to 0.0046, mean 0.00049 |
+| Game GPU, single-GPU evaluate | 1.639 ms |
+| Game GPU direct queue with the split (PCIe copies on a copy queue) | 1.402 ms (head 1.205 + end 0.196) |
+| Helper GPU: copy in, its segment, copy out | 1.233, 1.745, 0.597 ms |
+| Head end to end start (copies + helper + IPC), to be hidden by pipelining | 6.05 ms |
+
+The game GPU saves 0.24 ms (14.5%) of direct-queue NR time per pass with the
+helper taking 27% of the network. Earlier cuts give the helper more. At about
+4x the game GPU's time, the 3060 fits most of the network into a 60 fps frame
+when pictures overlap.
+
+**What the minimized ranges are.** The workspace starts with about 60 KiB of
+tiny slots (0.2 to 0.8 KiB), each referenced by a consecutive kernel pair.
+These are the model's kernel-to-kernel synchronization flags, and they must
+always cross. The data is a few large sub-ranges inside bigger tensors: 6.0,
+1.1, 7.6 and 1.1 MiB forward and 2 x 3.75 MiB back. These are the U-Net skips.
+No kernel parameter points at their starts.
+
+**The two-call residue is not the split.** Evaluating an unsplit instance one
+extra time per picture (`SPLICE_EXTRA=1`) gives the same signature: frame 1
+exact, then max 0.004 and mean 0.0005. The second evaluate per picture
+advances per-evaluate internal state.
+
+**GPU resets caused by these experiments.** Four on the RTX 5070 Ti, at 13:37,
+13:53, 14:09 and once earlier. The causes were a 4 GiB copy beyond the
+workspace, sentinel-filling the workspace, and a minimizer trial at cut 9 that
+left out data a `wait` kernel depended on. Trial-and-error minimization can
+starve the model's wait kernels. It must not run on the display GPU.

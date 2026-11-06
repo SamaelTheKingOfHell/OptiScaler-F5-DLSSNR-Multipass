@@ -1,3 +1,9 @@
+## 2026-11-06 — DLSS-NR network split research (WIP, test tools only)
+
+- Added NvAPI kernel-chain research tools under `tests/nr_gpu/`: `nr_cuda_trace`, `nr_split_splice`, `nr_split_owner` / `nr_split_helper` and the `nr_nvapi_harness.h` harness. They trace the model's 156 (Preset A) / 80 (Preset B) kernels, own its buffers through NGX's `ResourceAllocCallback`, and run a middle segment of one evaluate on a second GPU.
+- RTX 5070 Ti + RTX 3060, Preset B, 1280x720: the split's output stays within max 0.0046 of a single-GPU evaluate. The same residue appears from evaluating an instance twice per picture. The game GPU's direct queue drops from 1.64 to 1.40 ms per pass with the helper taking 27% of the network. About 23 MiB per pass crosses PCIe on a copy queue. No renderer or worker code changed. Details and the open problems (safe derivation of transfer sets, pipelining, the two-call residue) are in `docs/NR-network-trace.md`.
+- Anthropic Claude Opus 5.5. These experiments caused several GPU resets on the RTX 5070 Ti. Destructive experiments are now confined to the helper GPU.
+
 ## 2026-11-06 — Helper GPU share and GPU-side wait (WIP)
 
 - The helper GPU can take part of a pass instead of the whole pass. With `MultiGpuHelperShare=0` (automatic), the helper starts with whole passes. If its turnaround exceeds 85 percent of the GPU frame period, it shrinks to a strip of bottom rows, down to 64 rows. If it has clear headroom again, it grows back. The game GPU evaluates the top band of the same passes alongside it, with a 32-row overlap at the seam. Only the strip's colour rows are transferred, each way. 1..100 fixes the share as a percentage. Worker protocol 8.

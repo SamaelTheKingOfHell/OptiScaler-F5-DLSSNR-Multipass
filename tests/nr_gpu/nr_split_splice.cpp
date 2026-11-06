@@ -849,6 +849,15 @@ int wmain(int argc, wchar_t** argv)
                                                { baseline ? Role::Full : Role::Owner, owner, &outOwner },
                                                { baseline ? Role::Full : Role::Helper, helper, &outHelper } })
             {
+                // SPLICE_EXTRA (baseline only): the helper instance is evaluated one extra time per picture first, to test
+                // whether output depends on how many evaluates an instance has had (the two-call residue).
+                if (baseline && feature == helper && _wgetenv(L"SPLICE_EXTRA"))
+                {
+                    g_role = Role::Full;
+                    g_index = 0;
+                    if (model.Run(list.Get(), feature, color, depth, motion, *out, w, h, f == 1) != 1)
+                        throw std::runtime_error("extra evaluate failed");
+                }
                 g_role = role;
                 g_index = 0;
                 g_injected = false;

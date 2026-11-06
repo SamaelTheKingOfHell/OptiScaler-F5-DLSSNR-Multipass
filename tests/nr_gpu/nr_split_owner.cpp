@@ -172,6 +172,22 @@ int wmain(int argc, wchar_t** argv)
         Must(device->CreateCommandAllocator(qd.Type, IID_PPV_ARGS(&alloc)), "alloc");
         Must(device->CreateCommandList(0, qd.Type, alloc.Get(), nullptr, IID_PPV_ARGS(&list)), "list");
         ID3D12CommandList* lists[] = { list.Get() };
+        // PCIe transfers run on a copy queue so the direct queue only carries network work. xfer orders the queues:
+        // odd values = head finished (direct -> copy), even values = backward data landed (copy -> direct).
+        D3D12_COMMAND_QUEUE_DESC cd {};
+        cd.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+        ComPtr<ID3D12CommandQueue> copyQueue;
+        Must(device->CreateCommandQueue(&cd, IID_PPV_ARGS(&copyQueue)), "copy queue");
+        ComPtr<ID3D12CommandAllocator> copyAllocOut, copyAllocIn;
+        ComPtr<ID3D12GraphicsCommandList> copyOut, copyIn;
+        Must(device->CreateCommandAllocator(cd.Type, IID_PPV_ARGS(&copyAllocOut)), "copy alloc");
+        Must(device->CreateCommandAllocator(cd.Type, IID_PPV_ARGS(&copyAllocIn)), "copy alloc");
+        Must(device->CreateCommandList(0, cd.Type, copyAllocOut.Get(), nullptr, IID_PPV_ARGS(&copyOut)), "copy list");
+        Must(device->CreateCommandList(0, cd.Type, copyAllocIn.Get(), nullptr, IID_PPV_ARGS(&copyIn)), "copy list");
+        Must(copyOut->Close(), "close");
+        Must(copyIn->Close(), "close");
+        ComPtr<ID3D12Fence> xfer;
+        Must(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&xfer)), "xfer fence");
         ComPtr<ID3D12Fence> retire;
         Must(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&retire)), "fence");
         HANDLE retireEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -220,8 +236,8 @@ int wmain(int argc, wchar_t** argv)
                                 &module) != 0 ||
             Real().createFunction(device.Get(), module, "nr_vit_copy16", &g_copy) != 0)
             throw std::runtime_error("copy kernel");
-        auto fwd = MakeBuffer(device.Get(), D3D12_HEAP_TYPE_DEFAULT, fwdBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
-        auto bwd = MakeBuffer(device.Get(), D3D12_HEAP_TYPE_DEFAULT, bwdBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+        auto fwd = MakeBuffer(device.Get(), D3D12_HEAP_TYPE_DEFAULT, fwdBytes, D3D12_RESOURCE_STATE_COMMON, true);
+        auto bwd = MakeBuffer(device.Get(), D3D12_HEAP_TYPE_DEFAULT, bwdBytes, D3D12_RESOURCE_STATE_COMMON, true);
         g_fwdVa = fwd->GetGPUVirtualAddress();
         g_bwdVa = bwd->GetGPUVirtualAddress();
 
@@ -276,38 +292,49 @@ int wmain(int argc, wchar_t** argv)
             if (model.Run(list.Get(), ref, color, depth, motion, outRef, w, h, f == 1) != 1)
                 throw std::runtime_error("reference evaluate failed");
             list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            if (f == 1)
+                Barrier(list.Get(), fwd.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             g_role = Role::Head;
             g_index = 0;
             g_injected = false;
             if (model.Run(list.Get(), owner, color, depth, motion, outOwner, w, h, f == 1) != 1)
                 throw std::runtime_error("owner head evaluate failed");
-            Barrier(list.Get(), fwd.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            Barrier(list.Get(), shared, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-            list->CopyBufferRegion(shared, 0, fwd.Get(), 0, fwdBytes);
-            Barrier(list.Get(), shared, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-            Barrier(list.Get(), fwd.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
+            Barrier(list.Get(), fwd.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
             Must(list->Close(), "close A");
             queue->ExecuteCommandLists(1, lists);
-            Must(queue->Signal(transfer.PrimaryReady(), f), "ready");
+            Must(queue->Signal(xfer.Get(), 2ull * f - 1), "head done");
+            // Copy queue: forward data to the helper's shared buffer, then "ready".
+            Must(copyAllocOut->Reset(), "copy reset");
+            Must(copyOut->Reset(copyAllocOut.Get(), nullptr), "copy list reset");
+            copyOut->CopyBufferRegion(shared, 0, fwd.Get(), 0, fwdBytes);
+            Must(copyOut->Close(), "copy close");
+            Must(copyQueue->Wait(xfer.Get(), 2ull * f - 1), "copy wait head");
+            ID3D12CommandList* outLists[] = { copyOut.Get() };
+            copyQueue->ExecuteCommandLists(1, outLists);
+            Must(copyQueue->Signal(transfer.PrimaryReady(), f), "ready");
             DlssNr::Worker::FrameCommand command {};
             command.frameNumber = static_cast<uint64_t>(f);
             command.resetMask = f == 1 ? 1u : 0u;
             command.guideWidth = command.motionWidth = w;
             command.guideHeight = command.motionHeight = h;
             Must(client.SendFrame(command), "send frame");
-            // Queue-level wait for the helper: no CPU block, no GPU spin.
-            Must(queue->Wait(transfer.PrimaryDone(), f), "queue wait");
-            // List B: backward ranges in, owner end (output kernels, history update).
-            Must(retire->GetCompletedValue() == retireValue ? S_OK : E_FAIL, "previous list retired");
-            WaitQueue(device.Get(), queue.Get()); // list A retired: the allocator can be reset
+            // Copy queue waits for the helper (queue-level, no CPU block, no GPU spin) and pulls the backward data.
+            Must(copyAllocIn->Reset(), "copy reset");
+            Must(copyIn->Reset(copyAllocIn.Get(), nullptr), "copy list reset");
+            copyIn->CopyBufferRegion(bwd.Get(), 0, shared, fwdBytes, bwdBytes);
+            Must(copyIn->Close(), "copy close");
+            Must(copyQueue->Wait(transfer.PrimaryDone(), f), "copy wait helper");
+            ID3D12CommandList* inLists[] = { copyIn.Get() };
+            copyQueue->ExecuteCommandLists(1, inLists);
+            Must(copyQueue->Signal(xfer.Get(), 2ull * f), "backward landed");
+            Must(queue->Wait(xfer.Get(), 2ull * f), "direct wait backward");
+            // List B: owner end (output kernels, history update) after the backward data landed.
+            WaitQueue(device.Get(), queue.Get()); // list A and the copies retired: the allocator can be reset
             begin();
             list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 3);
-            Barrier(list.Get(), shared, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            Barrier(list.Get(), bwd.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-            list->CopyBufferRegion(bwd.Get(), 0, shared, fwdBytes, bwdBytes);
-            Barrier(list.Get(), bwd.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            Barrier(list.Get(), shared, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            Barrier(list.Get(), bwd.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            Barrier(list.Get(), fwd.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4);
             g_role = Role::End;
             g_index = 0;
@@ -316,6 +343,7 @@ int wmain(int argc, wchar_t** argv)
                 throw std::runtime_error("owner end evaluate failed");
             g_role = Role::Full;
             list->EndQuery(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 5);
+            Barrier(list.Get(), bwd.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
             list->ResolveQueryData(queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 6, stamps.Get(), 0);
             Must(list->Close(), "close B");
             queue->ExecuteCommandLists(1, lists);
@@ -385,9 +413,11 @@ int wmain(int argc, wchar_t** argv)
                         wallMs.back());
             failures += mx > 0.05;
         }
-        std::printf("Owner GPU median: full reference %.3f ms; head %.3f ms (incl. forward copy); waiting for helper "
-                    "%.3f ms; backward copy %.3f ms; end %.3f ms\n",
-                    Median(refMs), Median(headMs), Median(waitMs), Median(inMs), Median(endMs));
+        std::printf("Owner direct queue median: full reference %.3f ms; head %.3f ms; end %.3f ms (+%.3f ms barriers); "
+                    "head-to-end gap %.3f ms (copies on the copy queue + helper)\n",
+                    Median(refMs), Median(headMs), Median(endMs), Median(inMs), Median(waitMs));
+        std::printf("Direct-queue NR time per picture: split %.3f ms vs single GPU %.3f ms\n",
+                    Median(headMs) + Median(endMs) + Median(inMs), Median(refMs));
         std::printf("Picture wall time median %.2f ms (sequential prototype: no overlap between pictures)\n",
                     Median(wallMs));
         client.Stop(5000);
