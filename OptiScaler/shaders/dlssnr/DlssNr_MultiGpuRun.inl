@@ -10,6 +10,36 @@ std::shared_ptr<WorkerGeneration> current;
 std::weak_ptr<WorkerGeneration> retired;
 std::wstring currentKey, failedKey;
 bool primaryFeatureSkipped = false;
+// Helper share of its passes' rows (DlssNr_HelperShare.h); sentRevision tracks the share last sent to the worker.
+DlssNr::MultiGpu::HelperShare share;
+uint64_t sentRevision = ~0ull;
+
+// GPU-ordered return when requested and the watchdog runs; otherwise a bounded CPU wait.
+HRESULT AwaitReturn(WorkerGeneration& generation, ID3D12CommandQueue* queue, bool queueWait)
+{
+    if (queueWait)
+    {
+        const HRESULT hr = generation.QueueWaitReturn(queue);
+        if (hr != E_NOTIMPL)
+            return hr;
+    }
+    return generation.WaitReturn(10000);
+}
+
+// Feeds the newest measured helper turnaround to the share controller and publishes it for the menu.
+void ObserveTiming(WorkerGeneration& generation)
+{
+    DlssNr::Worker::WorkerWatch::Sample sample;
+    if (generation.TakeTiming(sample))
+        share.Observe(sample.latencyMs, sample.periodMs,
+                      std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    using namespace DlssNr::Worker::HelperShareStatus;
+    rows.store(share.Rows(), std::memory_order_relaxed);
+    height.store(share.Whole() ? share.Rows() : share.Seam() + share.Rows(), std::memory_order_relaxed);
+    turnaroundMs.store(static_cast<float>(share.LatencyMs()), std::memory_order_relaxed);
+    periodMs.store(static_cast<float>(share.PeriodMs()), std::memory_order_relaxed);
+    saturated.store(share.Saturated(), std::memory_order_relaxed);
+}
 uint64_t successfulFrames = 0;
 double handoffSum = 0.0, handoffMax = 0.0;
 unsigned handoffSamples = 0;

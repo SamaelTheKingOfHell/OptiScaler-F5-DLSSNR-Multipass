@@ -179,9 +179,12 @@ class FrameTransfer
         return wire;
     }
     // Present textures must be in COPY_SOURCE and the shared buffer must be in COMMON.
+    // rows != 0 copies only colour rows [rowOffset, rowOffset + rows), at the same rows of the shared region.
     HRESULT RecordOutbound(ID3D12GraphicsCommandList* commands, ID3D12Resource* color, ID3D12Resource* depth,
-                           ID3D12Resource* motion) const
+                           ID3D12Resource* motion, UINT rowOffset = 0, UINT rows = 0) const
     {
+        if (rows && (static_cast<uint64_t>(rowOffset) + rows > color_.desc.Height))
+            return E_INVALIDARG;
         const bool hasDepth = depth_.desc.Format != DXGI_FORMAT_UNKNOWN;
         if (!buffer_.PrimaryBuffer() || !SameIdentity(commands, primary_.Get()) ||
             !SameIdentity(color, primary_.Get()) || !SameIdentity(motion, primary_.Get()) ||
@@ -195,7 +198,15 @@ class FrameTransfer
             auto dst = Shared(layout);
             commands->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         };
-        copy(color, color_);
+        if (rows)
+        {
+            auto src = Texture(color);
+            auto dst = Shared(color_);
+            const D3D12_BOX box { 0, rowOffset, 0, static_cast<UINT>(color_.desc.Width), rowOffset + rows, 1 };
+            commands->CopyTextureRegion(&dst, 0, rowOffset, 0, &src, &box);
+        }
+        else
+            copy(color, color_);
         if (hasDepth)
             copy(depth, depth_);
         copy(motion, motion_);
@@ -203,15 +214,24 @@ class FrameTransfer
         return S_OK;
     }
     // The destination texture must be in COPY_DEST and the shared buffer must be in COMMON.
-    HRESULT RecordInbound(ID3D12GraphicsCommandList* commands, ID3D12Resource* output) const
+    // rows != 0 copies only rows [rowOffset, rowOffset + rows) to the same rows of the output.
+    HRESULT RecordInbound(ID3D12GraphicsCommandList* commands, ID3D12Resource* output, UINT rowOffset = 0,
+                          UINT rows = 0) const
     {
         if (!buffer_.PrimaryBuffer() || !SameIdentity(commands, primary_.Get()) ||
-            !SameIdentity(output, primary_.Get()) || !Compatible(output, color_.desc))
+            !SameIdentity(output, primary_.Get()) || !Compatible(output, color_.desc) ||
+            (rows && static_cast<uint64_t>(rowOffset) + rows > color_.desc.Height))
             return E_INVALIDARG;
         Barrier(commands, buffer_.PrimaryBuffer(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
         auto src = Shared(color_);
         auto dst = Texture(output);
-        commands->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        if (rows)
+        {
+            const D3D12_BOX box { 0, rowOffset, 0, static_cast<UINT>(color_.desc.Width), rowOffset + rows, 1 };
+            commands->CopyTextureRegion(&dst, 0, rowOffset, 0, &src, &box);
+        }
+        else
+            commands->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         Barrier(commands, buffer_.PrimaryBuffer(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
         return S_OK;
     }

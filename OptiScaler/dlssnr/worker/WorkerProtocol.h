@@ -7,7 +7,7 @@ namespace DlssNr::Worker
 {
 // Private inherited pipe only. Handles below are duplicated directly into the intended child process.
 inline constexpr uint32_t ProtocolMagic = 0x4E524D47; // NRMG
-inline constexpr uint32_t ProtocolVersion = 7;
+inline constexpr uint32_t ProtocolVersion = 8;
 inline constexpr uint32_t MaxWorkerPasses = 30;
 struct PassSettings
 {
@@ -49,6 +49,9 @@ struct FrameCommand
     uint32_t guideWidth = 256, guideHeight = 144, motionWidth = 256, motionHeight = 144;
     uint32_t depthX = 0, depthY = 0, motionX = 0, motionY = 0;
     float motionScaleX = 1.0f, motionScaleY = 1.0f;
+    // Strip mode: evaluate colour rows [rowOffset, rowOffset + rows) only and return them at the same rows.
+    // rows == 0 evaluates the whole picture. Guide extents/offsets above already describe the strip.
+    uint32_t rowOffset = 0, rows = 0;
     RuntimeTuning passes[MaxWorkerPasses] {};
 };
 } // namespace DlssNr::Worker

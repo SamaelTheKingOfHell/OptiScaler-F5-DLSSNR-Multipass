@@ -7,6 +7,8 @@ on:
       - 'OptiScaler/dlssnr/DlssNr_MultiGpuPlan.h'
       - 'OptiScaler/dlssnr/DlssNr_AdaptiveBalance.h'
       - 'tests/nr_adaptive_balance.cpp'
+      - 'OptiScaler/dlssnr/DlssNr_HelperShare.h'
+      - 'tests/nr_helper_share.cpp'
       - 'OptiScaler/dlssnr/DlssNr_WorkerFenceWait.h'
       - 'OptiScaler/dlssnr/worker/WorkerModelCatalog.h'
       - 'tests/nr_worker_model_catalog_smoke.cpp'
@@ -20,6 +22,8 @@ on:
       - 'OptiScaler/dlssnr/DlssNr_MultiGpuPlan.h'
       - 'OptiScaler/dlssnr/DlssNr_AdaptiveBalance.h'
       - 'tests/nr_adaptive_balance.cpp'
+      - 'OptiScaler/dlssnr/DlssNr_HelperShare.h'
+      - 'tests/nr_helper_share.cpp'
       - 'OptiScaler/dlssnr/DlssNr_WorkerFenceWait.h'
       - 'OptiScaler/dlssnr/worker/WorkerModelCatalog.h'
       - 'tests/nr_worker_model_catalog_smoke.cpp'
@@ -56,6 +60,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Adaptive placement test compilation failed.' }
           & "$env:RUNNER_TEMP/nr_adaptive_balance.exe"
           if ($LASTEXITCODE -ne 0) { throw 'Adaptive placement test failed.' }
+          & cmd /d /c "`"$vcvars`" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX tests/nr_helper_share.cpp /Fe:`"$env:RUNNER_TEMP/nr_helper_share.exe`" /Fo:`"$env:RUNNER_TEMP/nr_helper_share.obj`""
+          if ($LASTEXITCODE -ne 0) { throw 'Helper share test compilation failed.' }
+          & "$env:RUNNER_TEMP/nr_helper_share.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Helper share test failed.' }
           & cmd /d /c "`"$vcvars`" >nul && cl /nologo /std:c++17 /EHsc /W4 /WX tests/nr_worker_model_catalog_smoke.cpp /Fe:`"$env:RUNNER_TEMP/nr_worker_model_catalog_smoke.exe`" /Fo:`"$env:RUNNER_TEMP/nr_worker_model_catalog_smoke.obj`""
           if ($LASTEXITCODE -ne 0) { throw 'Runtime catalog test compilation failed.' }
           & "$env:RUNNER_TEMP/nr_worker_model_catalog_smoke.exe"

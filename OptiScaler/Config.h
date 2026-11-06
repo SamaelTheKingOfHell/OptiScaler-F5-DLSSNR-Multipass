@@ -869,6 +869,10 @@ class Config
     CustomOptional<bool> DlssNrMultiGpu { false };
     CustomOptional<bool> DlssNrMultiGpuPipelined { false };
     CustomOptional<bool> DlssNrMultiGpuAutoBalance { false };
+    // Share of the helper GPU's passes it evaluates, as bottom rows: 0 automatic (measured), 1..100 fixed percent.
+    CustomOptional<uint32_t> DlssNrMultiGpuHelperShare { 0 };
+    // Order the helper's return on the game GPU's queue instead of blocking the CPU (watchdog-guarded).
+    CustomOptional<bool> DlssNrMultiGpuQueueWait { true };
     CustomOptional<uint32_t> DlssNrPrimaryPasses { 1 };
     // Bit i requests the secondary GPU beginning with pass i + 1. The first set bit wins.
     CustomOptional<uint32_t, NoDefault> DlssNrSecondaryPassMask;

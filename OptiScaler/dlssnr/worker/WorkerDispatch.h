@@ -19,6 +19,8 @@ struct DispatchContext
     bool needsRetirement = false;
     bool unusable = false;
     bool pipelineRequested = false;
+    // The return was ordered on the GPU: retire the generation in queue order (TrackRetirement with the queue).
+    bool queueOrdered = false;
     unsigned adaptivePrimaryPasses = ~0u;
     bool balanceEligible = false;
     std::shared_ptr<DispatchTask> deferredTask;

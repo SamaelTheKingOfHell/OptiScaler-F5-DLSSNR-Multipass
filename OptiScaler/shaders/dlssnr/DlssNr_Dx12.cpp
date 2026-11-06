@@ -52,6 +52,8 @@
 #include <dlssnr/DlssNr_OwnedCommandChain.h>
 #include <dlssnr/DlssNr_CrossAdapterSelect.h>
 #include <dlssnr/DlssNr_MultiGpuPlan.h>
+#include <dlssnr/DlssNr_HelperShare.h>
+#include <dlssnr/worker/HelperShareStatus.h>
 #include <dlssnr/DlssNr_AdaptiveBalance.h>
 #include <dlssnr/worker/AdaptiveBalanceStatus.h>
 #include <dlssnr/worker/WorkerModelCatalog.h>
@@ -5740,6 +5742,18 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
         }
     }
 
+    // Helper strip (DlssNr_HelperShare.h): when the helper's passes are too slow whole, it evaluates only their
+    // bottom rows while the game GPU evaluates the top band of the same passes alongside it. The return is ordered
+    // on the GPU (QueueWaitReturn) instead of blocking the CPU, guarded by the worker watchdog.
+    const bool queueWait = cfg.DlssNrMultiGpuQueueWait.value_or_default();
+    if (multiEligible)
+        MultiGpuRun::share.Configure(modelHeight, cfg.DlssNrMultiGpuHelperShare.value_or_default());
+    const bool helperStrip = multiEligible && !MultiGpuRun::share.Whole();
+    const unsigned helperFirstRow = helperStrip ? MultiGpuRun::share.HelperFirstRow() : 0u;
+    const unsigned helperSeam = helperStrip ? MultiGpuRun::share.Seam() : modelHeight;
+    const unsigned primaryBandRows = helperStrip ? MultiGpuRun::share.PrimaryRows() : modelHeight;
+    std::shared_ptr<DlssNr::Worker::WorkerGeneration> stripGeneration;
+
     for (unsigned int pass = 0; !reused && !cached && pass < effectivePasses && result == NVSDK_NGX_Result_Success;
          ++pass)
     {
@@ -5747,7 +5761,8 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
         {
             auto generation = MultiGpuRun::Prepare(device, passInput, modelDepth, evalMotion, cfg,
                                                     placement->primaryPasses, effectivePasses,
-                                                    workerContext->pipelineRequested ? workerContext->queue : nullptr);
+                                                    workerContext->pipelineRequested || queueWait
+                                                        ? workerContext->queue : nullptr);
             if (generation)
             {
                 DlssNr::Worker::FrameCommand command {};
@@ -5759,6 +5774,24 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                 command.motionScaleX = evalMvScaleX; command.motionScaleY = evalMvScaleY;
                 if (g_nr.reset || frame.Reset)
                     command.resetMask = (1u << (effectivePasses - pass)) - 1u;
+                if (helperStrip)
+                {
+                    // The guides cover the same rows of the picture as the colour strip.
+                    const auto depthSkip = (unsigned) ((uint64_t) helperFirstRow * evalGuideH / modelHeight);
+                    const auto motionSkip = (unsigned) ((uint64_t) helperFirstRow * evalMotionH / modelHeight);
+                    command.rowOffset = helperFirstRow;
+                    command.rows = modelHeight - helperFirstRow;
+                    command.depthY = evalDepthY + depthSkip;
+                    command.guideHeight = evalGuideH - depthSkip;
+                    command.motionY = evalMotionBaseY + motionSkip;
+                    command.motionHeight = evalMotionH - motionSkip;
+                }
+                if (MultiGpuRun::sentRevision != MultiGpuRun::share.Revision())
+                {
+                    // The strip's first row moved: the helper's history no longer lines up with its input.
+                    command.resetMask = (1u << (effectivePasses - pass)) - 1u;
+                    MultiGpuRun::sentRevision = MultiGpuRun::share.Revision();
+                }
                 for (unsigned i = pass; i < effectivePasses; ++i)
                 {
                     const auto t = PassTuning(cfg, i);
@@ -5784,7 +5817,10 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                 const auto handoffStarted = std::chrono::steady_clock::now();
                 DlssNr::Worker::HandoffResult handoff;
                 auto waitStarted = handoffStarted;
-                if (workerContext->pipelineRequested)
+                if (helperStrip)
+                    handoff = generation->SubmitAsync(*workerContext->chain, workerContext->queue, command,
+                                                       passInput, modelDepth, evalMotion);
+                else if (workerContext->pipelineRequested)
                 {
                     handoff = generation->SubmitAsync(*workerContext->chain, workerContext->queue, command,
                                                        passInput, modelDepth, evalMotion);
@@ -5799,7 +5835,18 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                         g_dispatchSuspended = false;
                         stateEnvelope.Resume(workerContext->chain->Current());
                         waitStarted = std::chrono::steady_clock::now();
-                        handoff.result = generation->WaitReturn(10000);
+                        handoff.result = MultiGpuRun::AwaitReturn(*generation, workerContext->queue, queueWait);
+                        if (SUCCEEDED(handoff.result)) handoff.phase = DlssNr::Worker::HandoffPhase::WorkerReturned;
+                    }
+                }
+                else if (queueWait)
+                {
+                    handoff = generation->SubmitAsync(*workerContext->chain, workerContext->queue, command,
+                                                       passInput, modelDepth, evalMotion);
+                    if (SUCCEEDED(handoff.result))
+                    {
+                        waitStarted = std::chrono::steady_clock::now();
+                        handoff.result = MultiGpuRun::AwaitReturn(*generation, workerContext->queue, queueWait);
                         if (SUCCEEDED(handoff.result)) handoff.phase = DlssNr::Worker::HandoffPhase::WorkerReturned;
                     }
                 }
@@ -5818,52 +5865,63 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                 for (size_t i = 0; i < sourceCount; ++i)
                     Barrier(cmdList, sources[i], D3D12_RESOURCE_STATE_COPY_SOURCE,
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                if (SUCCEEDED(handoff.result))
+                if (helperStrip && SUCCEEDED(handoff.result))
                 {
-                    MakeModelWritable(passOutput);
-                    Barrier(cmdList, passOutput, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
-                    if (SUCCEEDED(generation->RecordReturn(cmdList, passOutput)))
-                    {
-                        Barrier(cmdList, passOutput, D3D12_RESOURCE_STATE_COPY_DEST,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                        ReadableFlag(passOutput) = true;
-                        finalAnswer = passOutput;
-                        workerContext->needsRetirement = true;
-                        DlssNr::Worker::currentStatus.store(DlssNr::Worker::Status::Running,
-                                                            std::memory_order_relaxed);
-                        const auto elapsed = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - waitStarted).count();
-                        const float previousMs = DlssNr::Worker::handoffMilliseconds.load(std::memory_order_relaxed);
-                        DlssNr::Worker::handoffMilliseconds.store(previousMs > 0.0f
-                            ? previousMs * 0.9f + static_cast<float>(elapsed) * 0.1f
-                            : static_cast<float>(elapsed), std::memory_order_relaxed);
-                        MultiGpuRun::handoffSum += elapsed;
-                        MultiGpuRun::handoffMax = std::max(MultiGpuRun::handoffMax, elapsed);
-                        if (++MultiGpuRun::handoffSamples == 300)
-                        {
-                            LOG_INFO("DLSS-NR multi-GPU: 300 {} CPU waits averaged {:.1f} ms; slowest {:.1f} ms",
-                                     workerContext->pipelineRequested ? "remaining pipeline" : "handoff",
-                                     MultiGpuRun::handoffSum / MultiGpuRun::handoffSamples, MultiGpuRun::handoffMax);
-                            MultiGpuRun::handoffSum = MultiGpuRun::handoffMax = 0.0;
-                            MultiGpuRun::handoffSamples = 0;
-                        }
-                        if (++MultiGpuRun::successfulFrames == 1 || MultiGpuRun::successfulFrames % 1800 == 0)
-                        {
-                            LOG_INFO("DLSS-NR multi-GPU: {} primary passes, {} secondary passes, {}x{}, {} wait {:.1f} ms",
-                                     pass, effectivePasses - pass, modelWidth, modelHeight,
-                                     workerContext->pipelineRequested ? "remaining pipeline" : "handoff", elapsed);
-                        }
-                        for (unsigned skipped = pass; skipped < effectivePasses; ++skipped)
-                            if (skipped > 0) g_nr.passNeedsReset[skipped] = true;
-                        if (pass == 0) MultiGpuRun::primaryFeatureSkipped = true;
-                        superiorCompleted = effectivePasses;
-                        break;
-                    }
-                    Barrier(cmdList, passOutput, D3D12_RESOURCE_STATE_COPY_DEST,
-                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    // The helper has its strip. This pass and the rest evaluate their top band here, beside it;
+                    // the strip's rows are copied under the seam after the loop.
+                    stripGeneration = generation;
                 }
-                LOG_WARN("DLSS-NR multi-GPU: worker handoff failed; remaining passes use the game GPU.");
-                MultiGpuRun::FailCurrent();
+                else
+                {
+                    if (SUCCEEDED(handoff.result))
+                    {
+                        MakeModelWritable(passOutput);
+                        Barrier(cmdList, passOutput, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                        if (SUCCEEDED(generation->RecordReturn(cmdList, passOutput)))
+                        {
+                            Barrier(cmdList, passOutput, D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                            ReadableFlag(passOutput) = true;
+                            finalAnswer = passOutput;
+                            workerContext->needsRetirement = true;
+                            workerContext->queueOrdered = queueWait;
+                            MultiGpuRun::ObserveTiming(*generation);
+                            DlssNr::Worker::currentStatus.store(DlssNr::Worker::Status::Running,
+                                                                std::memory_order_relaxed);
+                            const auto elapsed = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - waitStarted).count();
+                            const float previousMs = DlssNr::Worker::handoffMilliseconds.load(std::memory_order_relaxed);
+                            DlssNr::Worker::handoffMilliseconds.store(previousMs > 0.0f
+                                ? previousMs * 0.9f + static_cast<float>(elapsed) * 0.1f
+                                : static_cast<float>(elapsed), std::memory_order_relaxed);
+                            MultiGpuRun::handoffSum += elapsed;
+                            MultiGpuRun::handoffMax = std::max(MultiGpuRun::handoffMax, elapsed);
+                            if (++MultiGpuRun::handoffSamples == 300)
+                            {
+                                LOG_INFO("DLSS-NR multi-GPU: 300 {} CPU waits averaged {:.1f} ms; slowest {:.1f} ms",
+                                         workerContext->pipelineRequested ? "remaining pipeline" : "handoff",
+                                         MultiGpuRun::handoffSum / MultiGpuRun::handoffSamples, MultiGpuRun::handoffMax);
+                                MultiGpuRun::handoffSum = MultiGpuRun::handoffMax = 0.0;
+                                MultiGpuRun::handoffSamples = 0;
+                            }
+                            if (++MultiGpuRun::successfulFrames == 1 || MultiGpuRun::successfulFrames % 1800 == 0)
+                            {
+                                LOG_INFO("DLSS-NR multi-GPU: {} primary passes, {} secondary passes, {}x{}, {} wait {:.1f} ms",
+                                         pass, effectivePasses - pass, modelWidth, modelHeight,
+                                         workerContext->pipelineRequested ? "remaining pipeline" : "handoff", elapsed);
+                            }
+                            for (unsigned skipped = pass; skipped < effectivePasses; ++skipped)
+                                if (skipped > 0) g_nr.passNeedsReset[skipped] = true;
+                            if (pass == 0) MultiGpuRun::primaryFeatureSkipped = true;
+                            superiorCompleted = effectivePasses;
+                            break;
+                        }
+                        Barrier(cmdList, passOutput, D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    }
+                    LOG_WARN("DLSS-NR multi-GPU: worker handoff failed; remaining passes use the game GPU.");
+                    MultiGpuRun::FailCurrent();
+                }
             }
             else
                 MultiGpuRun::Skipped();
@@ -5874,6 +5932,14 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
             MultiGpuRun::primaryFeatureSkipped = false;
         }
         void* const passFeature = pass == 0 ? g_nr.feature : g_nr.passFeature[pass];
+        // Top band only while the helper evaluates the strip of these passes; guides cover the same rows.
+        const unsigned bandRows = stripGeneration ? primaryBandRows : modelHeight;
+        const auto BandGuide = [&](unsigned extent)
+        {
+            return stripGeneration
+                ? std::min(extent, (unsigned) (((uint64_t) bandRows * extent + modelHeight - 1) / modelHeight))
+                : extent;
+        };
         const bool passReset = g_nr.reset || (pass > 0 && g_nr.passNeedsReset[pass]);
         const auto tuning = PassTuning(cfg, pass);
 
@@ -5897,7 +5963,7 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                                     cfg.DlssNrKernelProfile.value_or_default(), copySets);
         result = g_nr.evaluate(
             cmdList, passFeature, g_nr.capabilityParams, passInput, modelDepth, spatial ? modelMotion : evalMotion,
-            passOutput, modelWidth, modelHeight, evalGuideW, evalGuideH, evalMotionW, evalMotionH,
+            passOutput, modelWidth, bandRows, evalGuideW, BandGuide(evalGuideH), evalMotionW, BandGuide(evalMotionH),
             evalDepthX, evalDepthY, spatial ? 0u : evalMotionBaseX, spatial ? 0u : evalMotionBaseY,
             g_nr.guideDepthInverted ? 1 : 0,
             passReset ? 1 : 0, tuning.intensity,
@@ -6021,7 +6087,7 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
             DlssNrConstants clampParams {};
             clampParams.Mode = DlssNrMode_ClampProxy;
             clampParams.Width = modelWidth;
-            clampParams.Height = modelHeight;
+            clampParams.Height = bandRows;
             // Clamped here, not trusted from the ini: the shader treats PassFeedback as a convex
             // blend weight between two values it has already guaranteed are in the unit cube, and
             // that guarantee only holds for a weight in [0,1]. A hand-edited value outside it would
@@ -6050,6 +6116,70 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
             passClampTarget =
                 passClampTarget == g_nr.passClampScratch ? g_nr.passClampScratch2 : g_nr.passClampScratch;
             passOutput = passOutput == g_nr.output ? g_nr.passScratch : g_nr.output;
+        }
+    }
+
+    if (stripGeneration)
+    {
+        // Submit the game GPU's band now so it runs beside the helper, order the helper's rows behind it on the
+        // GPU, and copy them under the seam. With overlap enabled the copy is recorded when this recording resumes.
+        auto* chain = workerContext->chain;
+        HRESULT stripResult = result == NVSDK_NGX_Result_Success ? chain->Split() : E_ABORT;
+        cmdList = chain->Current();
+        stateEnvelope.cmd = cmdList;
+        auto waitStarted = std::chrono::steady_clock::now();
+        if (SUCCEEDED(stripResult) && cmdList && workerContext->pipelineRequested)
+        {
+            stateEnvelope.Pause();
+            g_dispatchSuspended = true;
+            nrLock.unlock();
+            co_await std::suspend_always {};
+            nrLock.lock();
+            g_dispatchSuspended = false;
+            stateEnvelope.Resume(chain->Current());
+            cmdList = chain->Current();
+            stateEnvelope.cmd = cmdList;
+            waitStarted = std::chrono::steady_clock::now();
+        }
+        if (!cmdList)
+        {
+            workerContext->unusable = true;
+            MultiGpuRun::FailCurrent();
+            device->Release();
+            co_return;
+        }
+        if (SUCCEEDED(stripResult))
+            stripResult = MultiGpuRun::AwaitReturn(*stripGeneration, workerContext->queue, queueWait);
+        if (SUCCEEDED(stripResult) && finalAnswer)
+        {
+            Barrier(cmdList, finalAnswer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST);
+            stripResult = stripGeneration->RecordReturn(cmdList, finalAnswer, helperSeam, modelHeight - helperSeam);
+            Barrier(cmdList, finalAnswer, D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        if (SUCCEEDED(stripResult) && finalAnswer)
+        {
+            workerContext->needsRetirement = true;
+            workerContext->queueOrdered = queueWait;
+            MultiGpuRun::ObserveTiming(*stripGeneration);
+            DlssNr::Worker::currentStatus.store(DlssNr::Worker::Status::Running, std::memory_order_relaxed);
+            const auto elapsed = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - waitStarted).count();
+            DlssNr::Worker::handoffMilliseconds.store(static_cast<float>(elapsed), std::memory_order_relaxed);
+            if (++MultiGpuRun::successfulFrames == 1 || MultiGpuRun::successfulFrames % 600 == 0)
+                LOG_INFO("DLSS-NR multi-GPU strip: helper rows {}-{} of {}x{}, game GPU rows 0-{}, helper "
+                         "turnaround {:.1f} ms, frame period {:.1f} ms, CPU wait {:.1f} ms",
+                         helperFirstRow, modelHeight, modelWidth, modelHeight, primaryBandRows,
+                         MultiGpuRun::share.LatencyMs(), MultiGpuRun::share.PeriodMs(), elapsed);
+        }
+        else
+        {
+            LOG_WARN("DLSS-NR multi-GPU: helper strip failed (0x{:08X}); this picture is not composed.",
+                     (unsigned) stripResult);
+            MultiGpuRun::FailCurrent();
+            result = NVSDK_NGX_Result_Fail;
+            g_nr.reset = true;
         }
     }
 

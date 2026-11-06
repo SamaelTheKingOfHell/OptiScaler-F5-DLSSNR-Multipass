@@ -77,7 +77,9 @@ class InterpassClamp
         std::memcpy(mapped, &constants, sizeof(constants));
         constants_->Unmap(0, nullptr);
     }
-    void Record(ID3D12GraphicsCommandList* commands, ID3D12Resource* raw, ID3D12Resource* proxy, ID3D12Resource* output)
+    // rows limits the dispatch to the top rows (strip evaluation); 0 covers the whole surface.
+    void Record(ID3D12GraphicsCommandList* commands, ID3D12Resource* raw, ID3D12Resource* proxy, ID3D12Resource* output,
+                UINT rows = 0)
     {
         auto cpu = heap_->GetCPUDescriptorHandleForHeapStart();
         for (UINT i = 0; i < 6; ++i)
@@ -101,7 +103,7 @@ class InterpassClamp
         commands->SetPipelineState(pipeline_.Get());
         commands->SetComputeRootDescriptorTable(0, heap_->GetGPUDescriptorHandleForHeapStart());
         commands->SetComputeRootConstantBufferView(1, constants_->GetGPUVirtualAddress());
-        commands->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
+        commands->Dispatch((width_ + 7) / 8, ((rows && rows < height_ ? rows : height_) + 7) / 8, 1);
     }
 };
 

@@ -1,3 +1,10 @@
+## 2026-11-06 — Helper GPU share and GPU-side wait (WIP)
+
+- The helper GPU can take part of a pass instead of the whole pass. With `MultiGpuHelperShare=0` (automatic), the helper starts with whole passes. If its turnaround exceeds 85 percent of the GPU frame period, it shrinks to a strip of bottom rows, down to 64 rows. If it has clear headroom again, it grows back. The game GPU evaluates the top band of the same passes alongside it, with a 32-row overlap at the seam. Only the strip's colour rows are transferred, each way. 1..100 fixes the share as a percentage. Worker protocol 8.
+- `MultiGpuQueueWait=true` (default) orders the helper's return on the game GPU's queue instead of blocking the CPU. A watchdog thread terminates a worker that exits or stalls for 3 seconds, and signals the return fence from the CPU so the game queue cannot hang. Generation reuse is queue-ordered in this mode, so a frame no longer waits for the previous one to retire.
+- Real two-GPU fixture (`tests/nr_gpu/nr_helper_strip.cpp`, RTX 5070 Ti + RTX 3060, Ampere Preset B, synthetic input): helper turnaround at 1280x720 was 9.3 ms whole, 5.8 ms at 352 rows and 5.1 ms at 64 rows. At 2560x1440 it was 30.0 ms whole, 17.8 ms at 720 rows, 10.9 ms at 352 rows and 9.2 ms at 64 rows. In 160 of 160 frames, retirement followed the helper's return. Killing the worker after the GPU wait was queued released the queue, and the failure was reported. Whole-pass sync/async regression fixtures, the controller test and the profile coverage test passed.
+- Anthropic Claude Opus 5.5. Not yet verified: in-game frame rate, seam visibility, temporal behavior when the share moves, and pipelined coroutine resume for strip frames. See `docs/Helper-GPU-share.md`.
+
 ## 2026-11-06 — Split-frame secondary GPU measurements (WIP)
 
 - Added `nr_band_split_benchmark`, which measures one neural pass per band height on a chosen NVIDIA adapter. With `--subset`, it evaluates fewer rows than the feature was built with. The worker model session exposes that unchecked evaluate only in test builds.

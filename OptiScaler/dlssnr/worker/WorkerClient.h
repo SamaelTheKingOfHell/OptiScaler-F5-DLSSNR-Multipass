@@ -112,6 +112,15 @@ class WorkerClient
         state_ = State::Idle;
         return S_OK;
     }
+    // Only WorkerGeneration may call this, after queueing a GPU wait on the done fence for this frame
+    // (guarded by its WorkerWatch). Return reads are then ordered by the queue, not by a CPU wait.
+    HRESULT MarkQueuedWait(uint64_t frame)
+    {
+        if (state_ != State::Pending || frame != nextFrame_)
+            return E_INVALIDARG;
+        state_ = State::Returned;
+        return S_OK;
+    }
     static HRESULT LastErrorResult()
     {
         const DWORD error = GetLastError();

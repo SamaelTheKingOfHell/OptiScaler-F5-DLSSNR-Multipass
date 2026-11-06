@@ -208,7 +208,7 @@ class ModelSession
     {
         if (featureIndex >= features_.size() || !Owns(commands) || !Owns(request.color) || !Owns(request.output) ||
             (request.depth && !Owns(request.depth)) || (request.motion && !Owns(request.motion)) ||
-            request.width != width_ || request.height != height_ || !request.guideWidth || !request.guideHeight ||
+            request.width != width_ || !request.height || request.height > height_ || !request.guideWidth || !request.guideHeight ||
             !request.motionWidth || !request.motionHeight || request.color == request.output)
             throw std::runtime_error("Invalid worker evaluation inputs");
         return evaluate_(commands, features_[featureIndex], params_, request.color, request.depth, request.motion,

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "WorkerFrameHandoff.h"
+#include "WorkerWatch.h"
 #include <algorithm>
 #include <iterator>
 #include <utility>
@@ -31,6 +32,8 @@ class WorkerGeneration
     uint32_t passCount_ = 0;
     bool reset_ = true;
     State state_ = State::Empty;
+    // Declared last: its thread stops before the client (and its process handle) is destroyed.
+    WorkerWatch watch_;
 
     static bool SameQueue(ID3D12CommandQueue* a, ID3D12CommandQueue* b)
     {
@@ -83,6 +86,8 @@ class WorkerGeneration
     // Poll with timeout 0 in a render path. A generation awaiting primary retirement is not reusable.
     HRESULT Poll(DWORD startupTimeoutMs = 0)
     {
+        if (watch_.Failed())
+            state_ = State::Failed;
         if (state_ == State::Initializing)
         {
             const HRESULT hr = client_.WaitForReady(startupTimeoutMs);
@@ -112,6 +117,11 @@ class WorkerGeneration
     // ```
     HRESULT PollForQueue(ID3D12CommandQueue* queue)
     {
+        if (watch_.Failed())
+        {
+            state_ = State::Failed;
+            return E_ABORT;
+        }
         if (!queue || !client_.Owns(queue) || (submissionQueue_ && !SameQueue(queue, submissionQueue_.Get())))
             return E_INVALIDARG;
         if (state_ != State::AwaitingRetirement || !retirementQueue_)
@@ -145,6 +155,8 @@ class WorkerGeneration
             submissionQueue_ = queue;
             requiredQueue_.Reset();
             reset_ = false;
+            if (watch_.Start(client_.transfer_.PrimaryReady(), client_.transfer_.PrimaryDone(), client_.ProcessHandle()))
+                watch_.Arm(frame.frameNumber);
         }
         else if (result.phase != HandoffPhase::Validate)
             state_ = State::Failed;
@@ -204,11 +216,38 @@ class WorkerGeneration
                                 ? HRESULT_FROM_WIN32(WAIT_TIMEOUT) : E_ABORT;
         return result;
     }
-    HRESULT RecordReturn(ID3D12GraphicsCommandList* commands, ID3D12Resource* output)
+    // Orders the return on the GPU: the queue waits on the worker's done fence instead of the CPU blocking.
+    // Only with a running watchdog, which releases that wait if the worker exits or stalls (Failed() afterwards;
+    // that frame's returned rows are stale). Call immediately before the list holding RecordReturn is submitted
+    // to the same queue as SubmitAsync; every later submission on that queue also waits.
+    // ```cpp
+    // if (SUCCEEDED(generation.QueueWaitReturn(queue))) generation.RecordReturn(commands, output);
+    // ```
+    HRESULT QueueWaitReturn(ID3D12CommandQueue* queue)
+    {
+        if (state_ == State::AwaitingCopy) return S_OK;
+        if (state_ != State::PendingWorker) return state_ == State::Failed ? E_ABORT : E_INVALIDARG;
+        if (!SameQueue(queue, submissionQueue_.Get()) || !watch_.Running()) return E_NOTIMPL;
+        HRESULT hr = queue->Wait(client_.transfer_.PrimaryDone(), nextFrame_);
+        if (SUCCEEDED(hr)) hr = client_.MarkQueuedWait(nextFrame_);
+        if (FAILED(hr))
+        {
+            state_ = State::Failed;
+            return hr;
+        }
+        state_ = State::AwaitingCopy;
+        orderedRetirement_.Reset();
+        return S_OK;
+    }
+    // Newest helper turnaround and frame period measured by the watcher.
+    bool TakeTiming(WorkerWatch::Sample& sample) { return watch_.Take(sample); }
+    bool WatchFailed() const { return watch_.Failed(); }
+    HRESULT RecordReturn(ID3D12GraphicsCommandList* commands, ID3D12Resource* output, UINT rowOffset = 0,
+                         UINT rows = 0)
     {
         if (state_ != State::AwaitingCopy)
             return E_INVALIDARG;
-        const HRESULT hr = transfer_.RecordInbound(commands, output);
+        const HRESULT hr = transfer_.RecordInbound(commands, output, rowOffset, rows);
         if (SUCCEEDED(hr))
             state_ = State::CopyRecorded;
         return hr;

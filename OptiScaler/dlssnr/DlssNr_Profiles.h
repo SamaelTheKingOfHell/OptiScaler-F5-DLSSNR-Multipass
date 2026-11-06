@@ -72,6 +72,8 @@ inline constexpr std::string_view kKeptKeys[] = {
     "MultiGpu",
     "MultiGpuPipelined",
     "MultiGpuAutoBalance",
+    "MultiGpuHelperShare",
+    "MultiGpuQueueWait",
     "PrimaryPasses",
     "SecondaryPassMask",
     "SecondaryModel",

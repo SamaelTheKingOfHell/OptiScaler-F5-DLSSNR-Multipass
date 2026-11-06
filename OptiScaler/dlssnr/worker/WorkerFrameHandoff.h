@@ -45,7 +45,7 @@ inline HandoffResult SendFrame(FrameTransfer& transfer, WorkerClient& worker, Mu
         FAILED(transfer.Buffer().PrimaryBuffer()->GetDevice(IID_PPV_ARGS(&fromBuffer))) || !fromQueue || !fromBuffer ||
         FAILED(fromQueue.As(&a)) || FAILED(fromBuffer.As(&b)) || a.Get() != b.Get())
         return result;
-    HRESULT hr = transfer.RecordOutbound(commands, color, depth, motion);
+    HRESULT hr = transfer.RecordOutbound(commands, color, depth, motion, frame.rows ? frame.rowOffset : 0, frame.rows);
     if (FAILED(hr))
     {
         result.result = hr;

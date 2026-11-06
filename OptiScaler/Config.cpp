@@ -1241,6 +1241,8 @@ void Config::ReadDlssNr()
     DlssNrMultiGpu.set_from_config(readBool("DlssNr", "MultiGpu"));
     DlssNrMultiGpuPipelined.set_from_config(readBool("DlssNr", "MultiGpuPipelined"));
     DlssNrMultiGpuAutoBalance.set_from_config(readBool("DlssNr", "MultiGpuAutoBalance"));
+    DlssNrMultiGpuHelperShare.set_from_config(readUInt("DlssNr", "MultiGpuHelperShare"));
+    DlssNrMultiGpuQueueWait.set_from_config(readBool("DlssNr", "MultiGpuQueueWait"));
     DlssNrPrimaryPasses.set_from_config(readUInt("DlssNr", "PrimaryPasses"));
     DlssNrSecondaryPassMask.set_from_config(readUInt("DlssNr", "SecondaryPassMask"));
     DlssNrSecondaryModel.set_from_config(readString("DlssNr", "SecondaryModel"));
@@ -1492,6 +1494,8 @@ static void WriteDlssNr(Config& c, CSimpleIniA& out)
     out.SetValue("DlssNr", "MultiGpu", GetBoolValue(c.DlssNrMultiGpu.value_for_config()).c_str());
     out.SetValue("DlssNr", "MultiGpuPipelined", GetBoolValue(c.DlssNrMultiGpuPipelined.value_for_config()).c_str());
     out.SetValue("DlssNr", "MultiGpuAutoBalance", GetBoolValue(c.DlssNrMultiGpuAutoBalance.value_for_config()).c_str());
+    out.SetValue("DlssNr", "MultiGpuHelperShare", GetIntValue(c.DlssNrMultiGpuHelperShare.value_for_config()).c_str());
+    out.SetValue("DlssNr", "MultiGpuQueueWait", GetBoolValue(c.DlssNrMultiGpuQueueWait.value_for_config()).c_str());
     out.SetValue("DlssNr", "PrimaryPasses", GetIntValue(c.DlssNrPrimaryPasses.value_for_config()).c_str());
     out.SetValue("DlssNr", "SecondaryPassMask", GetIntValue(c.DlssNrSecondaryPassMask.value_for_config()).c_str());
     out.SetValue("DlssNr", "SecondaryModel", c.DlssNrSecondaryModel.value_for_config_or("").c_str());
@@ -1764,6 +1768,8 @@ size_t Config::ApplyDlssNrSection(const DlssNrProfiles::Section& section)
         NR_PROFILE_FIELD("MultiGpu", DlssNrMultiGpu),
         NR_PROFILE_FIELD("MultiGpuPipelined", DlssNrMultiGpuPipelined),
         NR_PROFILE_FIELD("MultiGpuAutoBalance", DlssNrMultiGpuAutoBalance),
+        NR_PROFILE_FIELD("MultiGpuHelperShare", DlssNrMultiGpuHelperShare),
+        NR_PROFILE_FIELD("MultiGpuQueueWait", DlssNrMultiGpuQueueWait),
         NR_PROFILE_FIELD("PrimaryPasses", DlssNrPrimaryPasses),
         NR_PROFILE_FIELD("SecondaryPassMask", DlssNrSecondaryPassMask),
         NR_PROFILE_FIELD("SecondaryModel", DlssNrSecondaryModel),

@@ -1,5 +1,6 @@
 #include "pch.h"
 #include <dlssnr/worker/WorkerStatus.h>
+#include <dlssnr/worker/HelperShareStatus.h>
 #include <dlssnr/worker/AdaptiveBalanceStatus.h>
 #include <dlssnr/worker/WorkerGpuTelemetry.h>
 #include <dlssnr/DlssNr_MultiGpuPlan.h>
@@ -4211,6 +4212,27 @@ static void RenderPassesPage(Config* config, float menuResScale)
             HelpMarker("Experimental: buffers one complete picture so the game can render while the second GPU "
                        "finishes the previous picture. Adds approximately one frame of presentation latency. "
                        "Requires native DirectX 12 Finished Picture, up to three passes, and frame generation off.");
+            int share = static_cast<int>(config->DlssNrMultiGpuHelperShare.value_or_default());
+            if (ImGui::SliderInt("Second GPU share", &share, 0, 100, share == 0 ? "Automatic" : "%d%% of rows"))
+                config->DlssNrMultiGpuHelperShare = static_cast<uint32_t>(std::clamp(share, 0, 100));
+            HelpMarker("How much of its passes the second GPU evaluates, as the picture's bottom rows. The game GPU "
+                       "evaluates the rest of those passes at the same time. Automatic measures the second GPU and "
+                       "gives it as many rows as it finishes within one frame, up to whole passes.");
+            {
+                using namespace DlssNr::Worker::HelperShareStatus;
+                const auto helperRows = rows.load(std::memory_order_relaxed);
+                const auto helperHeight = height.load(std::memory_order_relaxed);
+                if (helperRows && helperHeight)
+                    ImGui::TextDisabled("Second GPU: %u of %u rows, turnaround %.1f ms, frame %.1f ms%s", helperRows,
+                                        helperHeight, turnaroundMs.load(std::memory_order_relaxed),
+                                        periodMs.load(std::memory_order_relaxed),
+                                        saturated.load(std::memory_order_relaxed) ? " (at its minimum)" : "");
+            }
+            bool queueWait = config->DlssNrMultiGpuQueueWait.value_or_default();
+            if (ImGui::Checkbox("Wait for the second GPU on the GPU", &queueWait))
+                config->DlssNrMultiGpuQueueWait = queueWait;
+            HelpMarker("The game GPU waits for the second GPU's result in its own queue, so the CPU keeps preparing "
+                       "frames. A watchdog releases the wait if the second GPU's worker stops.");
         }
         ImGui::PopID();
     };

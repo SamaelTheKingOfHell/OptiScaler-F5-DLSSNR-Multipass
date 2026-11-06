@@ -805,7 +805,7 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
             return false;
         }
         if (workerContext.needsRetirement && slot.workerGeneration &&
-            FAILED(workerContext.pipelineRequested
+            FAILED(workerContext.pipelineRequested || workerContext.queueOrdered
                 ? slot.workerGeneration->TrackRetirement(slot.fence.Get(), slot.done, workerContext.queue)
                 : slot.workerGeneration->TrackRetirement(slot.fence.Get(), slot.done)))
         {

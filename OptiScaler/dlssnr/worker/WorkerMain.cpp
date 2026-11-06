@@ -208,6 +208,9 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
     Surface extraOutput = MakeSurface(device.Get(), wire.width, wire.height, colorFormat, true);
     Surface clampA = MakeSurface(device.Get(), wire.width, wire.height, colorFormat, true);
     Surface clampB = MakeSurface(device.Get(), wire.width, wire.height, colorFormat, true);
+    // Strip mode: the colour strip is copied to the top of stripIn and its answer leaves from the top of the output.
+    Surface stripIn = MakeSurface(device.Get(), wire.width, wire.height, colorFormat, false);
+    D3D12_RESOURCE_STATES stripInState = D3D12_RESOURCE_STATE_COPY_DEST;
     std::array<Surface*, 2> outputs { &frame.output, &extraOutput }, clamps { &clampA, &clampB };
     std::array<D3D12_RESOURCE_STATES, 2> outputStates { D3D12_RESOURCE_STATE_COPY_DEST,
                                                         D3D12_RESOURCE_STATE_COPY_DEST };
@@ -263,8 +266,12 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
             (wire.depthFormat != DXGI_FORMAT_UNKNOWN &&
              (static_cast<uint64_t>(frameCommand.depthX) + frameCommand.guideWidth > wire.depthWidth ||
               static_cast<uint64_t>(frameCommand.depthY) + frameCommand.guideHeight > wire.depthHeight)) ||
-            !std::isfinite(frameCommand.motionScaleX) || !std::isfinite(frameCommand.motionScaleY))
+            !std::isfinite(frameCommand.motionScaleX) || !std::isfinite(frameCommand.motionScaleY) ||
+            (frameCommand.rows && (static_cast<uint64_t>(frameCommand.rowOffset) + frameCommand.rows > wire.height)) ||
+            (!frameCommand.rows && frameCommand.rowOffset))
             throw std::runtime_error("Invalid frame control");
+        const bool strip = frameCommand.rows != 0 && frameCommand.rows < wire.height;
+        const UINT evalRows = strip ? frameCommand.rows : wire.height;
         auto* commands = recording.Begin();
         if (useGpuTiming) debugTiming.Mark(commands, 0);
         if (frameNumber > 1)
@@ -285,12 +292,28 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
         for (size_t i = 0; i < clamps.size(); ++i)
             prepare(*clamps[i], clampStates[i]);
         Barrier(commands, peer.Buffer(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        CopyFromShared(commands, peer.Buffer(), frame.color, 0);
+        if (strip)
+        {
+            if (stripInState != D3D12_RESOURCE_STATE_COPY_DEST)
+                Barrier(commands, stripIn.texture.Get(), stripInState, D3D12_RESOURCE_STATE_COPY_DEST);
+            auto src = SharedLocation(peer.Buffer(), stripIn, 0);
+            auto dst = Texture(stripIn.texture.Get());
+            const D3D12_BOX box { 0, frameCommand.rowOffset, 0, wire.width, frameCommand.rowOffset + evalRows, 1 };
+            commands->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+            Barrier(commands, stripIn.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            stripInState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            // frame.color keeps its state cycle: copy an unchanged source so the barriers stay balanced.
+            Barrier(commands, frame.color.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        else
+            CopyFromShared(commands, peer.Buffer(), frame.color, 0);
         if (frame.depth.texture)
             CopyFromShared(commands, peer.Buffer(), frame.depth, wire.depthOffset);
         CopyFromShared(commands, peer.Buffer(), frame.motion, wire.motionOffset);
         if (useGpuTiming) debugTiming.Mark(commands, 1);
-        ID3D12Resource* passInput = frame.color.texture.Get();
+        ID3D12Resource* passInput = strip ? stripIn.texture.Get() : frame.color.texture.Get();
         Surface* finalOutput = nullptr;
         for (uint32_t pass = 0; pass < wire.passCount; ++pass)
         {
@@ -302,7 +325,7 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 outputStates[slot] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             }
-            auto request = MakeEvaluation(frame, wire.width, wire.height,
+            auto request = MakeEvaluation(frame, wire.width, evalRows,
                                           frameNumber == 1 || (frameCommand.resetMask & (1u << pass)) != 0);
             request.color = passInput;
             request.output = output.texture.Get();
@@ -348,7 +371,7 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 clampStates[slot] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             }
-            clampShaders[pass]->Record(commands, output.texture.Get(), passInput, clamped.texture.Get());
+            clampShaders[pass]->Record(commands, output.texture.Get(), passInput, clamped.texture.Get(), evalRows);
             Barrier(commands, clamped.texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             clampStates[slot] = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -356,7 +379,16 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
         }
         if (useGpuTiming) debugTiming.Mark(commands, 2);
         Barrier(commands, peer.Buffer(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-        CopyToShared(commands, peer.Buffer(), *finalOutput, 0);
+        if (strip)
+        {
+            // Only the strip returns, at its own rows; the rest of the shared colour region is left untouched.
+            auto src = Texture(finalOutput->texture.Get());
+            auto dst = SharedLocation(peer.Buffer(), *finalOutput, 0);
+            const D3D12_BOX box { 0, 0, 0, wire.width, evalRows, 1 };
+            commands->CopyTextureRegion(&dst, 0, frameCommand.rowOffset, 0, &src, &box);
+        }
+        else
+            CopyToShared(commands, peer.Buffer(), *finalOutput, 0);
         Barrier(commands, peer.Buffer(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
         if (useGpuTiming) { debugTiming.Mark(commands, 3); debugTiming.Resolve(commands); }
         const auto readyStarted = wire.enableDebug ? std::chrono::steady_clock::now()
