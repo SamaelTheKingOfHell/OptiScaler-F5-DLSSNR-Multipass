@@ -111,7 +111,9 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
         return nullptr;
     };
     if (!planPath)
-        return fail("no plan file for " + std::to_string(width) + "x" + std::to_string(height) + " (NR-Split folder)");
+        return fail("no plan file for " + std::to_string(width) + "x" + std::to_string(height) + ", preset " +
+                    std::to_string(PassPreset(cfg, pass)) + ", workspace " + std::to_string(workspaceBytes) +
+                    " bytes (NR-Split folder)");
     DlssNr::NetworkSplit::Plan plan;
     {
         std::ifstream in(*planPath);
