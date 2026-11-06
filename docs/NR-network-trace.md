@@ -259,3 +259,27 @@ advances per-evaluate internal state.
 workspace, sentinel-filling the workspace, and a minimizer trial at cut 9 that
 left out data a `wait` kernel depended on. Trial-and-error minimization can
 starve the model's wait kernels. It must not run on the display GPU.
+
+## Tensor shape decoding: first findings (2026-11-06)
+
+This is the safe path to transfer sets: compute them from kernel parameters,
+with no trial runs that can hang a GPU. The Swin stage kernels (`*_inpview_*`,
+`*_ds_wait_*`, `*_upsample_*`, `*_outview_*`) carry tensor pointers followed
+by padded dimensions (height, width) as 32-bit fields. At 1280x720, Preset B:
+
+| Stage | Padded H x W in params | Channels (kernel name) | H*W*C bytes |
+|---|---|---|---|
+| 1h_32 | 384 x 672 | 32 | 8064 KiB |
+| 2h_64 | 192 x 336 | 64 | 4032 KiB |
+| 4h_128 | 96 x 168 | 128 | 2016 KiB |
+| 8h_256 | 48 x 84 | 256 | 1008 KiB |
+
+The 1h_32 stage tensors sit at workspace offsets 32340K, 40404K, 48468K and
+56532K. That spacing is exactly 8064 KiB = 384 x 672 x 32 bytes (FP8): one
+byte per channel. `pre_block` also carries the picture (720 x 1280) and its
+padded size (768 x 1344). Next steps:
+1. Decode the remaining kernel families (split_swin, vit_1d) the same way.
+2. Compute each tensor's extent from pointer and shape, plus the synchronization
+   area (workspace offsets 0 to about 64 KiB).
+3. Check the computed sets against the cut-66 minimizer result.
+4. Validate them with read-only runs.
