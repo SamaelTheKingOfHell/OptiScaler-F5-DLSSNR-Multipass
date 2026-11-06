@@ -109,3 +109,52 @@ time per pass with Preset B at 1280x720, and roughly four times that at
 2560x1440. That is one to a few milliseconds per picture across three passes,
 plus one picture of latency. A stronger helper moves the cut earlier and gains
 proportionally more.
+
+## Prototype results so far (2026-11-06)
+
+`tests/nr_gpu/nr_split_splice.cpp` and `nr_nvapi_harness.h` run three instances
+of the same model on one GPU: a reference, an owner and a helper. They compare
+the spliced output with the reference over five frames of changing synthetic
+input. All results below are Preset B, 1280x720, RTX 5070 Ti.
+
+| Experiment | Result |
+|---|---|
+| Two full instances (baseline) | Bit-identical every frame: the model is deterministic |
+| Helper runs the tail after cut 66 (14 tensors, 50.8 MiB forward) | Frame 1 bit-identical. Frames 2+: max 0.004, mean 0.0005 |
+| Helper runs the tail after cut 76 (4 tensors, 32.6 MiB) | Max 0.004, mean 0.0005 from frame 1 |
+| Helper runs the tail after cut 72 (7 tensors, 46.0 MiB) | Max 0.05 to 0.07: an input is missing |
+| Helper runs a middle segment; owner's last two kernels held back and replayed | Max 0.38: wrong, see below |
+
+What these establish:
+- **Splicing within a frame works.** At cut 66, copying the tensors referenced on
+  both sides of the cut into a second instance's arena, at the same offsets,
+  reproduced the reference bit for bit on the first frame.
+- **Arena offsets transfer between devices.** With Preset B, 206 of 213 arena
+  addresses differ between the RTX 5070 Ti and the RTX 3060 by one constant,
+  and 77 of 80 kernel parameter blobs are identical after that shift. The
+  other three are the input/output and constant-buffer kernels; they use each
+  device's own handles and need no translation.
+- **Temporal state is the open problem.** From the second frame on, the owner's
+  encoder output already differs from the reference at the cut, even when the
+  crossing tensors are copied back after the tail runs. The encoder therefore
+  reads something the tail wrote the previous frame that the tensor-boundary
+  heuristic does not capture. Candidates: the last arena tensor, whose size is
+  unknown, or regions addressed only through offsets inside other tensors.
+- **Holding back kernels and replaying them is not a valid way to emulate a
+  mid-evaluate wait.** The model records its own D3D12 commands between kernels,
+  including state changes for its I/O textures, and replaying kernels later
+  breaks that ordering. A real split needs the game GPU to wait inside the
+  evaluate without reordering. One option is a spin-wait kernel on a shared
+  flag with a bounded timeout, placed between the owner's kernels. The model
+  already synchronizes its own kernels this way (its `*_wait` and
+  `*_tilesync` kernels).
+
+Next steps before a cross-GPU prototype:
+1. Find the temporal state exactly. Snapshot the whole arena (bounded by the
+   real allocation size, which needs D3D12 allocation hooks on every device
+   interface) before and after an evaluate, and diff the regions the head
+   reads.
+2. A spin-wait kernel with a timeout. The CUDA toolkit's `ptxas` builds it,
+   like `DlssNrVitCopyKernel.h`.
+3. Then the cross-GPU version: the helper worker filters its own launches and
+   receives the forward tensors through the existing cross-adapter buffer.

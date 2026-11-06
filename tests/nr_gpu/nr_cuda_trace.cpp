@@ -84,6 +84,7 @@ struct Kernel
     uint32_t shared = 0, paramSize = 0;
     std::vector<int> buffers;
     std::vector<uint64_t> words; // 256-byte aligned parameter values that look like GPU addresses
+    std::vector<uint8_t> raw;    // the parameter blob
 };
 std::recursive_mutex g_mutex;
 std::vector<Buffer> g_buffers;
@@ -146,12 +147,15 @@ int __cdecl hk_LaunchChain(ID3D12GraphicsCommandList* list, const CuLaunch* k, u
             e.block = k[i].blockDim;
             e.shared = k[i].dynSharedMemBytes;
             e.paramSize = k[i].paramSize;
+            if (k[i].pParams && k[i].paramSize)
+                e.raw.assign(static_cast<const uint8_t*>(k[i].pParams),
+                             static_cast<const uint8_t*>(k[i].pParams) + k[i].paramSize);
             const auto* bytes = static_cast<const uint8_t*>(k[i].pParams);
             for (uint32_t o = 0; bytes && o + 8 <= k[i].paramSize; o += 4) // 4-byte steps: packed layouts
             {
                 uint64_t v = 0;
                 std::memcpy(&v, bytes + o, 8);
-                if (g_frame > 0 && v > (1ull << 32) && v < (1ull << 48) && (v & 0xff) == 0 && (o % 8) == 0)
+                if (g_frame > 0 && v >= (1ull << 24) && v < (1ull << 48) && (v & 0xff) == 0 && (o % 8) == 0)
                 {
                     ++g_paramWords[v];
                     e.words.push_back(v);
@@ -650,7 +654,7 @@ int wmain(int argc, wchar_t** argv)
             total += v;
 
         std::ofstream launches(out + L"-launches.csv");
-        launches << "frame,call,index,kernel,grid,block,shared,param_bytes,est_ms,buffers\n";
+        launches << "frame,call,index,kernel,grid,block,shared,param_bytes,est_ms,buffers,words,raw\n";
         for (size_t i = 0; i < g_kernels.size(); ++i)
         {
             const auto& e = g_kernels[i];
@@ -663,7 +667,13 @@ int wmain(int argc, wchar_t** argv)
                      << e.shared << ',' << e.paramSize << ',' << ms << ",\"";
             for (size_t b = 0; b < e.buffers.size(); ++b)
                 launches << (b ? " " : "") << e.buffers[b];
-            launches << "\"\n";
+            launches << "\",\"" << std::hex;
+            for (size_t w = 0; w < e.words.size(); ++w)
+                launches << (w ? " " : "") << e.words[w];
+            launches << "\",\"";
+            for (uint8_t byte : e.raw)
+                launches << static_cast<unsigned>(byte >> 4) << static_cast<unsigned>(byte & 15);
+            launches << std::dec << "\"\n";
         }
         std::ofstream buffers(out + L"-buffers.csv");
         buffers << "id,va,size,heap,phase\n";
