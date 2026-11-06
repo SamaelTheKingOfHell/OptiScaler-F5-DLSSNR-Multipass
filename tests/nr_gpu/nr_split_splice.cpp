@@ -38,6 +38,9 @@ enum class Role
 struct ProbeState
 {
     uint64_t wsVa = 0, wsBytes = 0, snapStartVa = 0, snapHeadVa = 0, snapMidVa = 0;
+    // SPLICE_ROLES: a workspace snapshot after every kernel from the cut to the end (read-only copies), so each
+    // kernel's writes are known exactly.
+    std::vector<uint64_t> perKernelVa;
 };
 ProbeState g_probe;
 struct Transfer
@@ -145,6 +148,14 @@ int __cdecl Launch(ID3D12GraphicsCommandList* list, const CuLaunch* k, uint32_t 
                 UavBarrier(list);
                 if (int r = Copy(list, g_index == g_cut ? g_probe.snapHeadVa : g_probe.snapMidVa, g_probe.wsVa,
                                  g_probe.wsBytes))
+                    return r;
+                UavBarrier(list);
+            }
+            const size_t slot = static_cast<size_t>(g_index - g_cut);
+            if (g_index >= g_cut && slot < g_probe.perKernelVa.size())
+            {
+                UavBarrier(list);
+                if (int r = Copy(list, g_probe.perKernelVa[slot], g_probe.wsVa, g_probe.wsBytes))
                     return r;
                 UavBarrier(list);
             }
@@ -605,6 +616,65 @@ int wmain(int argc, wchar_t** argv)
                         headWrites[k] |= a[x] != b[x];
                         midWrites[k] |= b[x] != c[x];
                     }
+            }
+            if (_wgetenv(L"SPLICE_ROLES"))
+            {
+                // Snapshot after every kernel from the cut to the end; write which blocks each kernel changed and which
+                // workspace addresses each kernel references (roles.txt), for nr_split_sets.py.
+                std::vector<ComPtr<ID3D12Resource>> snaps;
+                for (int k = g_cut; k < kernels; ++k)
+                {
+                    snaps.push_back(MakeBuffer(device.Get(), D3D12_HEAP_TYPE_DEFAULT, bytes,
+                                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true));
+                    g_probe.perKernelVa.push_back(snaps.back()->GetGPUVirtualAddress());
+                }
+                begin();
+                Barrier(list.Get(), color.texture.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST);
+                Upload(list.Get(), color, 0, 950);
+                Barrier(list.Get(), color.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                g_role = Role::Probe;
+                g_index = 0;
+                if (model.Run(list.Get(), probe, color, depth, motion, outHelper, w, h, false) != 1)
+                    throw std::runtime_error("role probe evaluate failed");
+                g_role = Role::Full;
+                submit();
+                g_probe.perKernelVa.clear();
+                FILE* roles = _wfopen(L"roles.txt", L"w");
+                std::vector<uint8_t> previous = readBuffer(snaps[0].Get());
+                for (size_t k = 1; k < snaps.size(); ++k)
+                {
+                    const auto current = readBuffer(snaps[k].Get());
+                    for (size_t b = 0; b < blocks;)
+                    {
+                        auto changed = [&](size_t x)
+                        { return std::memcmp(&previous[x * block], &current[x * block], block) != 0; };
+                        if (!changed(b))
+                        {
+                            ++b;
+                            continue;
+                        }
+                        size_t e = b;
+                        while (e < blocks && changed(e))
+                            ++e;
+                        std::fprintf(roles, "W %d %llu %llu\n", g_cut + static_cast<int>(k),
+                                     (unsigned long long) (b * block), (unsigned long long) ((e - b) * block));
+                        b = e;
+                    }
+                    previous = current;
+                }
+                for (int i = 0; i < kernels; ++i)
+                    for (uint64_t v : traceOwner[i])
+                        if (v >= wsOwner->va && v < wsOwner->va + bytes)
+                            std::fprintf(roles, "R %d %llu\n", i, (unsigned long long) (v - wsOwner->va));
+                std::fclose(roles);
+                std::printf("Wrote roles.txt: per-kernel writes for kernels %d..%d\n", g_cut + 1, kernels - 1);
+                if (_wgetenv(L"SPLICE_ROLES_ONLY"))
+                {
+                    std::fflush(nullptr);
+                    ExitProcess(0); // read-only probe done; run nothing at an unvalidated cut
+                }
             }
             // Workspace offsets referenced by the helper's segment and by the owner's end kernels.
             std::vector<uint8_t> midRefs(blocks, 0), endRefs(blocks, 0);

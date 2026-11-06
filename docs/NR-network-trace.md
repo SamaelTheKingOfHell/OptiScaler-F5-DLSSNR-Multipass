@@ -283,3 +283,54 @@ padded size (768 x 1344). Next steps:
    area (workspace offsets 0 to about 64 KiB).
 3. Check the computed sets against the cut-66 minimizer result.
 4. Validate them with read-only runs.
+
+## Transfer sets without trial runs (2026-11-06)
+
+`tests/nr_gpu/nr_split_sets.py` computes forward and backward workspace ranges
+from two inputs:
+- the decoded kernel parameters: per use, pointer plus that stage's padded
+  H x W x C, where C is 32 x first-stage height / H; picture-level dims on the
+  pre/post blocks mean a first-stage tensor; a pointer with no dims extends to
+  the next known tensor;
+- per-kernel write sets from a read-only probe. `SPLICE_ROLES=1` snapshots
+  the workspace after every kernel from the cut to the end into
+  `roles.txt`; `SPLICE_ROLES_ONLY=1` exits right after.
+
+It then runs block-level liveness through the segment. A referenced block is
+sent unless an earlier segment kernel, or the referencing kernel itself, wrote
+it. Backward data is limited to blocks the segment changed. The whole
+synchronization area always crosses both ways. Neither step needs a run that
+withholds data, so neither can starve a `wait` kernel.
+
+| Cut (resume 78), Preset B, 1280x720 | Forward | Backward |
+|---|---|---|
+| 66 (computed) | 27.14 MiB | 7.94 MiB |
+| 66 (minimized by trials) | 15.79 MiB | 7.50 MiB |
+| 60 | 26.67 MiB | 7.94 MiB |
+| 18 | 23.48 MiB | 7.94 MiB |
+| 9 | 23.53 MiB | 7.94 MiB |
+
+At cut 66 the computed sets cover every measured range except 20 to 52 KiB of
+padding the 64 KiB trial chunks picked up.
+
+Cross-GPU with computed sets (RTX 5070 Ti owner, RTX 3060 helper, 12 pictures):
+
+| Cut | Error vs single GPU | Game GPU direct queue | Helper: copy in / segment / copy out |
+|---|---|---|---|
+| 66 | max 0.0042, mean 0.00049 | 1.42 ms (vs 1.64) | 2.12 / 1.81 / 0.63 ms |
+| 9 | max 0.0044, mean 0.00049 | 0.63 ms (vs 1.65), -62% | 1.83 / 4.69 / 0.63 ms |
+
+The error at every cut equals the residue of evaluating the owner twice per
+picture, so the split itself adds none. The cut trades game-GPU time against
+helper time. With three passes, it has to be chosen against the frame budget,
+per pass or adaptively.
+
+Remaining for a game build:
+1. Pipelining (the owner's second evaluate one picture later, as in the
+   existing pipelined Finished Picture path).
+2. Worker split mode (NvAPI filter and allocation callback in the worker,
+   protocol 9).
+3. The in-game NvAPI wrapper filter and the allocation callback on the game's
+   capability parameters.
+4. Running the role probe once per model, preset and resolution, cached.
+5. An in-game visual check of the two-evaluate residue.
