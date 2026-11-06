@@ -114,7 +114,7 @@ void UploadZero(ID3D12GraphicsCommandList* list, NrFixture::Surface& s, float fi
 
 int wmain(int argc, wchar_t** argv)
 {
-    if (argc != 10)
+    if (argc != 10 && argc != 11)
     {
         std::cerr << "usage: core forwarder model worker data log width height preset\n";
         return 2;
@@ -123,6 +123,7 @@ int wmain(int argc, wchar_t** argv)
     {
         const unsigned width = std::stoul(argv[7]), height = std::stoul(argv[8]);
         const int preset = std::stoi(argv[9]);
+        const unsigned passes = argc == 11 ? std::stoul(argv[10]) : 1u;
         auto primary = OpenNvidia(0);
         auto secondary = OpenNvidia(1);
         D3D12_COMMAND_QUEUE_DESC qd {};
@@ -163,10 +164,13 @@ int wmain(int argc, wchar_t** argv)
                  "FrameTransfer::Create");
             WorkerGeneration generation(std::move(transfer));
             InitialFrameWire settings {};
-            settings.passCount = 1;
-            settings.passes[0].preset = preset;
-            settings.passes[0].intensity = 0.5f;
-            settings.passes[0].style = 2;
+            settings.passCount = passes;
+            for (unsigned i = 0; i < passes; ++i)
+            {
+                settings.passes[i].preset = preset;
+                settings.passes[i].intensity = 0.5f;
+                settings.passes[i].style = 2;
+            }
             Must(generation.Start(primary.Get(), argv[4], argv[1], argv[2], argv[3], argv[5], argv[6], settings),
                  "worker start");
             HRESULT poll = E_PENDING;
@@ -218,7 +222,7 @@ int wmain(int argc, wchar_t** argv)
                         command.guideHeight = command.motionHeight = height - first;
                     }
                     if (seam != lastSeam)
-                        command.resetMask = 1;
+                        command.resetMask = (1u << passes) - 1u;
                     lastSeam = seam;
                     // Kill test: hold the game queue so the outbound copy (and the worker's input) cannot run
                     // before the worker is killed.

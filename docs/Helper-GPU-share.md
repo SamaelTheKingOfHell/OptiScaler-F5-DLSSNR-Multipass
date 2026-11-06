@@ -82,3 +82,24 @@ copies only the rows below the seam into its final answer.
 turnaround. It checks that the returned strip rows are written and finite. It
 kills the worker after the GPU wait is queued, and checks that the queue is
 released and the failure is reported.
+
+## All passes split versus one pass split (2026-11-06)
+
+Strip fixture with three helper passes (Ampere Preset B, synthetic input), and
+the RTX 5070 Ti's per-pass Preset B cost:
+
+| Model size | 3060, 3 passes: whole / 352 rows / 64 rows | 5070 Ti, 1 pass: whole / without the strip |
+|---|---|---|
+| 1280x720 | 24.2 / 15.1 / 14.2 ms | 1.64 / 1.58 ms (688 rows) |
+| 2560x1440 | 78.4 / 25.8 / 22.7 ms | 3.96 / 3.21 ms (1120 rows) |
+
+Splitting all three passes pays the helper's fixed cost three times. At 720p,
+a 64-row strip still costs the 3060 14.2 ms and saves the 5070 Ti about
+0.2 ms per picture. At 1440p, a 352-row strip saves about 2.2 ms of the 5070
+Ti's 11.9 ms, with a 25.8 ms helper turnaround. Giving the helper about 1000
+rows of the last pass alone saves about the same with a shorter turnaround.
+Every split pass must use the same preset on both GPUs, so splitting all
+passes also requires Preset B on passes 1 and 2. To try it, set
+`SecondaryPassMask=1`. The share controller then sizes the strip for all
+helper passes. One of four 1440p three-pass fixture runs reported a failure
+that the filtered output did not identify; three reruns passed.
