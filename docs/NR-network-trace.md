@@ -158,3 +158,64 @@ Next steps before a cross-GPU prototype:
    like `DlssNrVitCopyKernel.h`.
 3. Then the cross-GPU version: the helper worker filters its own launches and
    receives the forward tensors through the existing cross-adapter buffer.
+
+## Robust split design: two owner evaluates, exact buffers (2026-11-06)
+
+**Exact allocations.** With `NR_ALLOC_CALLBACK=1`, the harness passes NGX a
+`ResourceAllocCallback`. The model then allocates through the host. Each
+feature allocates, at 1280x720 Preset B:
+- a 108.69 MiB UAV buffer (weights),
+- a 108.69 MiB buffer created in `GENERIC_READ`,
+- a 66.31 MiB UAV buffer (activation workspace),
+- a 1280x720 RGBA16F texture (temporal history).
+
+Copies can now use exact bounds.
+
+**Where the temporal state lives.** With the helper running the tail, copying
+the whole workspace forward made frame 1 bit-identical at every cut tested
+(66, 76). Copying it, or every writable buffer, back did not stop the drift
+from frame 2. The state carried between frames is therefore the history
+texture, which the last kernels write and the first kernel reads.
+
+**Design: the owner evaluates twice per picture.**
+
+```text
+owner call 1: kernels [0, cut]        -> forward set -> helper: kernel 0 + (cut, resume)
+                                                             |
+owner call 2: kernel 0 + [resume, end) <- backward set <-----+
+```
+
+Every evaluate keeps the model's own D3D12 ordering. The cross-GPU wait sits
+between two evaluate calls, so it can be a queue-level fence guarded by the
+existing worker watchdog, with no spin-wait kernel. History stays on the
+owner.
+
+**Read-only write-set discovery** (`SPLICE_DISCOVER=1`). A separate probe
+instance snapshots its workspace before kernel 1, after the head and after the
+segment, over three frames of changing input. A block counts as written when
+its content changes. Writing a sentinel pattern into the workspace was tried
+first and hung the GPU: the workspace holds the model's synchronization
+counters, so it must never be poisoned.
+
+| Cut 66, resume 78, Preset B, 1280x720 | Result |
+|---|---|
+| Whole workspace both ways | max 0.0012 frame 1, about 0.004 after |
+| Discovered sets: written runs the receiving segment references | same output; forward 66.19 MiB (2 runs), backward 15.75 MiB |
+| Every written run | same output; forward 66.23 MiB (61 runs), backward 19.71 MiB |
+| Control: the helper runs only kernel 77 | max 0.0012 frame 1, about 0.004 after |
+
+The remaining difference comes from evaluating the owner twice, not from the
+transfer. It is about 1/255 of the output range. Its source is not identified
+yet. Candidates are per-evaluate host-side state, such as a frame counter, or
+an end-of-evaluate copy recorded by the first call.
+
+Open items:
+1. Shrink the forward set. The head writes almost the whole workspace in
+   contiguous runs, so "referenced runs" stays at 66 MiB. The decoder's real
+   inputs (encoder skip tensors and bottleneck output) should be 15 to 20 MiB.
+   Next is empirical minimization: drop chunks while the output stays
+   identical to the whole-set result.
+2. Explain or remove the two-call residue.
+3. Cross-GPU: the worker filters its launches and receives the sets through
+   the cross-adapter buffer. The game GPU's queue waits between the owner's
+   two evaluates.

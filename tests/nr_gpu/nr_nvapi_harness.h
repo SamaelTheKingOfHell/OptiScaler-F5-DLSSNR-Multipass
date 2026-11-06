@@ -238,6 +238,59 @@ inline ComPtr<ID3D12Device> OpenNvidia(unsigned index, std::wstring* name = null
     throw std::runtime_error("NVIDIA adapter not found");
 }
 
+// ---- Model allocations through NGX's ResourceAllocCallback ----
+// The model allocates its buffers and textures through this callback when the host provides one, so the host sees (and
+// owns) every resource with its exact size. `tag` labels which feature is being created.
+struct Allocation
+{
+    ComPtr<ID3D12Resource> resource;
+    uint64_t va = 0, bytes = 0;
+    D3D12_RESOURCE_DESC desc {};
+    int state = 0, tag = 0;
+};
+struct AllocationLog
+{
+    ID3D12Device* device = nullptr;
+    int tag = 0;
+    std::vector<Allocation> items;
+    unsigned released = 0;
+};
+inline AllocationLog& Allocations()
+{
+    static AllocationLog log;
+    return log;
+}
+inline void __cdecl AllocCallback(D3D12_RESOURCE_DESC* desc, int state, D3D12_HEAP_PROPERTIES* heap,
+                                  ID3D12Resource** out)
+{
+    *out = nullptr;
+    auto& log = Allocations();
+    if (!log.device || !desc || !heap)
+        return;
+    ComPtr<ID3D12Resource> r;
+    if (FAILED(log.device->CreateCommittedResource(heap, D3D12_HEAP_FLAG_NONE, desc,
+                                                   static_cast<D3D12_RESOURCE_STATES>(state), nullptr,
+                                                   IID_PPV_ARGS(&r))))
+        return;
+    Allocation a;
+    a.resource = r;
+    a.desc = *desc;
+    a.state = state;
+    a.tag = log.tag;
+    a.va = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? r->GetGPUVirtualAddress() : 0;
+    a.bytes = log.device->GetResourceAllocationInfo(0, 1, desc).SizeInBytes;
+    log.items.push_back(a);
+    *out = r.Detach(); // NGX owns this reference; ReleaseCallback returns it
+}
+inline void __cdecl ReleaseCallback(IUnknown* resource)
+{
+    if (resource)
+    {
+        resource->Release();
+        ++Allocations().released;
+    }
+}
+
 // ---- Model session through the forwarder ----
 using Init = NVSDK_NGX_Result (*)(unsigned long long, const wchar_t*, ID3D12Device*, NVSDK_NGX_Version,
                                   const NVSDK_NGX_FeatureCommonInfo*);
@@ -275,6 +328,12 @@ struct Model
             throw std::runtime_error("NGX init failed");
         if (caps(&params) != NVSDK_NGX_Result_Success || !params)
             throw std::runtime_error("NGX parameters failed");
+        if (_wgetenv(L"NR_ALLOC_CALLBACK"))
+        {
+            Allocations().device = device;
+            params->Set(NVSDK_NGX_Parameter_ResourceAllocCallback, reinterpret_cast<void*>(&AllocCallback));
+            params->Set(NVSDK_NGX_Parameter_ResourceReleaseCallback, reinterpret_cast<void*>(&ReleaseCallback));
+        }
         bool found = false;
         for (int s : { 1, 2, 5, 6, 7, 4, 3, 0 })
         {

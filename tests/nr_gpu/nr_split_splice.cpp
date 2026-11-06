@@ -30,8 +30,16 @@ enum class Role
     Full,
     Trace,
     Owner,
-    Helper
+    Helper,
+    OwnerEnd, // second evaluate of the owner: kernel 0 and [resume, end), after the helper's results are copied in
+    Probe     // write-set discovery: read-only snapshots of the workspace before and after each segment
 };
+// Write-set discovery state (SPLICE_DISCOVER): which workspace bytes each segment writes.
+struct ProbeState
+{
+    uint64_t wsVa = 0, wsBytes = 0, snapStartVa = 0, snapHeadVa = 0, snapMidVa = 0;
+};
+ProbeState g_probe;
 struct Transfer
 {
     uint64_t ownerVa = 0, helperVa = 0, bytes = 0, offset = 0;
@@ -43,7 +51,7 @@ struct Deferred
 };
 Role g_role = Role::Full;
 int g_index = 0, g_cut = 0, g_resume = 0;
-bool g_injected = false;
+bool g_injected = false, g_twoCalls = true;
 std::vector<std::vector<uint64_t>>* g_trace = nullptr;
 std::vector<Transfer> g_forward, g_backward;
 uint64_t g_forwardVa = 0, g_backwardVa = 0;
@@ -110,7 +118,7 @@ int __cdecl Launch(ID3D12GraphicsCommandList* list, const CuLaunch* k, uint32_t 
                     return r;
                 g_injected = true;
             }
-            if (g_index >= g_resume)
+            if (!g_twoCalls && g_index >= g_resume)
             {
                 Deferred d;
                 d.launch = k[i];
@@ -120,8 +128,38 @@ int __cdecl Launch(ID3D12GraphicsCommandList* list, const CuLaunch* k, uint32_t 
             }
             continue;
         }
+        if (g_role == Role::Probe)
+        {
+            // Never write the workspace here: it holds the model's own synchronization counters.
+            if (g_index == 1)
+            {
+                UavBarrier(list);
+                if (int r = Copy(list, g_probe.snapStartVa, g_probe.wsVa, g_probe.wsBytes))
+                    return r;
+                UavBarrier(list);
+            }
+            if (int r = Real().launch(list, &k[i], 1))
+                return r;
+            if (g_index == g_cut || g_index + 1 == g_resume)
+            {
+                UavBarrier(list);
+                if (int r = Copy(list, g_index == g_cut ? g_probe.snapHeadVa : g_probe.snapMidVa, g_probe.wsVa,
+                                 g_probe.wsBytes))
+                    return r;
+                UavBarrier(list);
+            }
+            continue;
+        }
         if (g_role == Role::Helper && ((g_index > 0 && g_index <= g_cut) || g_index >= g_resume))
             continue;
+        if (g_role == Role::OwnerEnd && g_index > 0 && g_index < g_resume)
+            continue;
+        if (g_role == Role::OwnerEnd && g_index >= g_resume && !g_injected)
+        {
+            if (int r = CopyAll(list, g_backward, g_backwardVa, false, true))
+                return r;
+            g_injected = true;
+        }
         if (g_role == Role::Helper && g_index > g_cut && !g_injected)
         {
             if (int r = CopyAll(list, g_forward, g_forwardVa, false, false))
@@ -254,10 +292,30 @@ int wmain(int argc, wchar_t** argv)
         for (auto* s : { &outRef, &outOwner, &outHelper })
             Barrier(list.Get(), s->texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Allocations().tag = 1;
         void* ref = model.NewFeature(device.Get(), list.Get(), w, h, preset);
+        Allocations().tag = 2;
         void* owner = model.NewFeature(device.Get(), list.Get(), w, h, preset);
+        Allocations().tag = 3;
         void* helper = model.NewFeature(device.Get(), list.Get(), w, h, preset);
+        const bool discover = _wgetenv(L"SPLICE_DISCOVER") != nullptr;
+        void* probe = nullptr;
+        if (discover)
+        {
+            Allocations().tag = 4;
+            probe = model.NewFeature(device.Get(), list.Get(), w, h, preset);
+        }
+        Allocations().tag = 0;
         submit();
+        {
+            const auto& items = Allocations().items;
+            std::printf("Model allocations through the NGX callback: %zu\n", items.size());
+            for (const auto& a : items)
+                std::printf("  feature %d: %s %llux%u fmt %u, %.2f MiB, va 0x%llx, flags 0x%x, state 0x%x\n", a.tag,
+                            a.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? "buffer " : "texture",
+                            (unsigned long long) a.desc.Width, a.desc.Height, (unsigned) a.desc.Format,
+                            a.bytes / 1048576.0, (unsigned long long) a.va, (unsigned) a.desc.Flags, a.state);
+        }
 
         NvHandle module = nullptr;
         if (!Real().createModule || !Real().createFunction ||
@@ -283,10 +341,14 @@ int wmain(int argc, wchar_t** argv)
         submit();
         const int kernels = static_cast<int>(traceOwner.size());
         const bool baseline = g_cut == 0;
-        if (g_resume <= 0)
+        if (g_resume == 0)
             g_resume = kernels - 2;
+        if (g_resume < 0)
+            g_resume = kernels; // tail mode: the helper runs everything after the cut, including the output kernels
+        const bool tailMode = g_resume == kernels;
+        g_twoCalls = !_wgetenv(L"SPLICE_DEFER");
         if (traceHelper.size() != traceOwner.size() ||
-            (!baseline && (g_cut < 1 || g_resume <= g_cut + 1 || g_resume >= kernels)))
+            (!baseline && (g_cut < 1 || g_resume <= g_cut + 1 || g_resume > kernels)))
             throw std::runtime_error("kernel counts differ, or cut/resume out of range");
 
         // Owner -> helper address map; tensor starts are 256-byte aligned words in the largest address cluster.
@@ -335,6 +397,9 @@ int wmain(int argc, wchar_t** argv)
             t.ownerVa = a;
             t.helperVa = toHelper[a];
             t.bytes = (arena[i + 1] - a) & ~15ull;
+            for (const auto& alloc : Allocations().items) // exact bounds when the allocation callback is active
+                if (alloc.tag == 2 && alloc.va && a >= alloc.va && a < alloc.va + alloc.desc.Width)
+                    t.bytes = std::min<uint64_t>(t.bytes, (alloc.va + alloc.desc.Width - a) & ~15ull);
             if ((s & 1) && (s & 2))
             {
                 t.offset = forwardBytes;
@@ -347,6 +412,175 @@ int wmain(int argc, wchar_t** argv)
                 backwardBytes += (t.bytes + 255) & ~255ull;
                 g_backward.push_back(t);
             }
+        }
+        // SPLICE_WHOLE=small|all: transfer whole model buffers (exact bounds from the allocation callback) instead of
+        // the per-tensor sets: "small" = the smaller writable buffer (the activation workspace), "all" = every writable
+        // buffer. Forward at the cut; backward after the helper's segment.
+        if (const wchar_t* whole = _wgetenv(L"SPLICE_WHOLE"); whole && !baseline)
+        {
+            std::vector<const Allocation*> ownerBuffers, helperBuffers;
+            for (const auto& a : Allocations().items)
+                if (a.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+                    (a.desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+                    (a.tag == 2 ? ownerBuffers : a.tag == 3 ? helperBuffers : ownerBuffers).push_back(&a);
+            ownerBuffers.erase(std::remove_if(ownerBuffers.begin(), ownerBuffers.end(),
+                                              [](const Allocation* a) { return a->tag != 2; }),
+                               ownerBuffers.end());
+            if (ownerBuffers.empty() || ownerBuffers.size() != helperBuffers.size())
+                throw std::runtime_error("SPLICE_WHOLE needs NR_ALLOC_CALLBACK and matching allocations");
+            uint64_t smallest = ~0ull;
+            for (const auto* a : ownerBuffers)
+                smallest = std::min(smallest, a->desc.Width);
+            g_forward.clear();
+            g_backward.clear();
+            forwardBytes = backwardBytes = 0;
+            for (size_t i = 0; i < ownerBuffers.size(); ++i)
+            {
+                if (std::wstring(whole) == L"small" && ownerBuffers[i]->desc.Width != smallest)
+                    continue;
+                Transfer t;
+                t.ownerVa = ownerBuffers[i]->va;
+                t.helperVa = helperBuffers[i]->va;
+                t.bytes = ownerBuffers[i]->desc.Width & ~15ull;
+                t.offset = forwardBytes;
+                forwardBytes += (t.bytes + 255) & ~255ull;
+                g_forward.push_back(t);
+                if (!_wgetenv(L"SPLICE_NO_BACK"))
+                {
+                    t.offset = backwardBytes;
+                    backwardBytes += (t.bytes + 255) & ~255ull;
+                    g_backward.push_back(t);
+                }
+            }
+        }
+        if (discover && !baseline)
+        {
+            // Workspace of each instance: its smallest writable buffer (the activation arena).
+            auto workspace = [](int tag) -> const Allocation*
+            {
+                const Allocation* best = nullptr;
+                for (const auto& a : Allocations().items)
+                    if (a.tag == tag && a.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+                        (a.desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+                        (!best || a.desc.Width < best->desc.Width))
+                        best = &a;
+                return best;
+            };
+            const Allocation* wsOwner = workspace(2);
+            const Allocation* wsHelper = workspace(3);
+            const Allocation* wsProbe = workspace(4);
+            if (!wsOwner || !wsHelper || !wsProbe)
+                throw std::runtime_error("SPLICE_DISCOVER needs NR_ALLOC_CALLBACK");
+            const uint64_t bytes = wsOwner->desc.Width & ~255ull;
+            g_probe.wsVa = wsProbe->va;
+            g_probe.wsBytes = bytes;
+            auto snapStart = MakeBuffer(device.Get(), D3D12_HEAP_TYPE_DEFAULT, bytes,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+            g_probe.snapStartVa = snapStart->GetGPUVirtualAddress();
+            auto snapHead = MakeBuffer(device.Get(), D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                       true);
+            auto snapMid = MakeBuffer(device.Get(), D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                      true);
+            g_probe.snapHeadVa = snapHead->GetGPUVirtualAddress();
+            g_probe.snapMidVa = snapMid->GetGPUVirtualAddress();
+            auto readBuffer = [&](ID3D12Resource* src)
+            {
+                auto rb = MakeBuffer(device.Get(), D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST, false);
+                begin();
+                Barrier(list.Get(), src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list->CopyBufferRegion(rb.Get(), 0, src, 0, bytes);
+                Barrier(list.Get(), src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                submit();
+                std::vector<uint8_t> out(static_cast<size_t>(bytes));
+                void* m = nullptr;
+                D3D12_RANGE range { 0, static_cast<SIZE_T>(bytes) };
+                Must(rb->Map(0, &range, &m), "map");
+                std::memcpy(out.data(), m, out.size());
+                D3D12_RANGE none { 0, 0 };
+                rb->Unmap(0, &none);
+                return out;
+            };
+            constexpr uint64_t block = 256;
+            const size_t blocks = static_cast<size_t>(bytes / block);
+            std::vector<uint8_t> headWrites(blocks, 0), midWrites(blocks, 0);
+            // Several frames of changing input: a block counts as written by a segment when its content changes across
+            // that segment in any of them.
+            for (int pf = 1; pf <= 3; ++pf)
+            {
+                begin();
+                Barrier(list.Get(), color.texture.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST);
+                Upload(list.Get(), color, 0, 900 + pf);
+                Barrier(list.Get(), color.texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                g_role = Role::Probe;
+                g_index = 0;
+                if (model.Run(list.Get(), probe, color, depth, motion, outHelper, w, h, pf == 1) != 1)
+                    throw std::runtime_error("probe evaluate failed");
+                g_role = Role::Full;
+                submit();
+                const auto a = readBuffer(snapStart.Get());
+                const auto b = readBuffer(snapHead.Get());
+                const auto c = readBuffer(snapMid.Get());
+                for (size_t k = 0; k < blocks; ++k)
+                    for (size_t o = 0; o < block; ++o)
+                    {
+                        const size_t x = k * block + o;
+                        headWrites[k] |= a[x] != b[x];
+                        midWrites[k] |= b[x] != c[x];
+                    }
+            }
+            // Workspace offsets referenced by the helper's segment and by the owner's end kernels.
+            std::vector<uint8_t> midRefs(blocks, 0), endRefs(blocks, 0);
+            for (int i = g_cut + 1; i < kernels; ++i)
+                for (uint64_t v : traceOwner[i])
+                    if (v >= wsOwner->va && v < wsOwner->va + bytes)
+                        (i < g_resume ? midRefs : endRefs)[static_cast<size_t>((v - wsOwner->va) / block)] = 1;
+            // A transferred region is a maximal run of written blocks that contains a referenced block. With
+            // SPLICE_SETS=written every written run is transferred.
+            const bool allWritten = _wgetenv(L"SPLICE_SETS") && std::wstring(_wgetenv(L"SPLICE_SETS")) == L"written";
+            auto runs = [&](const std::vector<uint8_t>& written, const std::vector<uint8_t>& refs,
+                            std::vector<Transfer>& out, uint64_t& total)
+            {
+                out.clear();
+                total = 0;
+                size_t runCount = 0;
+                for (size_t k = 0; k < blocks;)
+                {
+                    if (!written[k])
+                    {
+                        ++k;
+                        continue;
+                    }
+                    size_t e = k;
+                    bool referenced = false;
+                    while (e < blocks && written[e])
+                        referenced |= refs[e++] != 0;
+                    ++runCount;
+                    if (referenced || allWritten)
+                    {
+                        Transfer t;
+                        t.ownerVa = wsOwner->va + k * block;
+                        t.helperVa = wsHelper->va + k * block;
+                        t.bytes = (e - k) * block;
+                        t.offset = total;
+                        total += t.bytes;
+                        out.push_back(t);
+                    }
+                    k = e;
+                }
+                return runCount;
+            };
+            const size_t headRuns = runs(headWrites, midRefs, g_forward, forwardBytes);
+            const size_t midRuns = runs(midWrites, endRefs, g_backward, backwardBytes);
+            size_t headTotal = 0, midTotal = 0;
+            for (size_t k = 0; k < blocks; ++k)
+            {
+                headTotal += headWrites[k];
+                midTotal += midWrites[k];
+            }
+            std::printf("Discovered writes: head %.2f MiB in %zu runs, segment %.2f MiB in %zu runs\n",
+                        headTotal * block / 1048576.0, headRuns, midTotal * block / 1048576.0, midRuns);
         }
         auto forwardBuffer = MakeBuffer(device.Get(), D3D12_HEAP_TYPE_DEFAULT, std::max<uint64_t>(forwardBytes, 256),
                                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
@@ -380,12 +614,21 @@ int wmain(int argc, wchar_t** argv)
                 if (model.Run(list.Get(), feature, color, depth, motion, *out, w, h, f == 1) != 1)
                     throw std::runtime_error("evaluate failed");
             }
+            if (!baseline && !tailMode && g_twoCalls)
+            {
+                // A real split puts the queue-level wait for the helper here, between the owner's two evaluates.
+                g_role = Role::OwnerEnd;
+                g_index = 0;
+                g_injected = false;
+                if (model.Run(list.Get(), owner, color, depth, motion, outOwner, w, h, false) != 1)
+                    throw std::runtime_error("owner end evaluate failed");
+            }
             g_role = Role::Full;
-            if (!baseline && ReplayDeferred(list.Get()) != 0)
+            if (!baseline && (tailMode || !g_twoCalls) && ReplayDeferred(list.Get()) != 0)
                 throw std::runtime_error("replay failed");
             submit();
             const auto a = Readback(device.Get(), queue.Get(), outRef);
-            const auto b = Readback(device.Get(), queue.Get(), baseline ? outHelper : outOwner);
+            const auto b = Readback(device.Get(), queue.Get(), baseline || tailMode ? outHelper : outOwner);
             double maxDiff = 0, sum = 0;
             size_t exact = 0, n = 0;
             for (size_t i = 0; i < a.size(); ++i)
