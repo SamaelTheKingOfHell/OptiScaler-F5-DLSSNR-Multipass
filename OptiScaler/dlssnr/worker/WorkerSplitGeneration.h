@@ -44,6 +44,12 @@ class SplitGeneration
     Com<ID3D12Resource> forward_, backward_;
     std::array<CopySlot, 4> slots_ {};
     size_t nextSlot_ = 0;
+    // Small direct lists that put a timestamp on the game queue right before its wait for the helper, so the caller
+    // can measure how long that wait held the queue (retired through stampFence_; a busy one is skipped, never waited).
+    std::array<CopySlot, 4> stamps_ {};
+    size_t nextStamp_ = 0;
+    Com<ID3D12Fence> stampFence_;
+    uint64_t stampValue_ = 0;
     uint64_t copyValue_ = 0, frame_ = 0;
     bool started_ = false, failed_ = false, pending_ = false;
     WorkerWatch watch_; // last: its thread stops before the client's process handle closes
@@ -179,6 +185,8 @@ class SplitGeneration
         return hr;
     }
     bool Failed() const { return failed_ || watch_.Failed(); }
+    // True when the helper has already finished the picture in flight (its done fence passed it).
+    bool HelperDone() const { return pending_ && transfer_.PrimaryDone()->GetCompletedValue() >= frame_; }
     const Plan& GetPlan() const { return plan_; }
     uint64_t ForwardStaging() const { return forward_->GetGPUVirtualAddress(); }
     uint64_t BackwardStaging() const { return backward_->GetGPUVirtualAddress(); }
@@ -228,6 +236,35 @@ class SplitGeneration
     }
     // Orders the backward data behind the helper on the copy queue and the direct queue behind that. The direct list
     // recorded after this call (End evaluate) runs only once the backward data has landed.
+    // Call right before AwaitReturn: `record` fills a small list that `queue` executes just ahead of the wait for the
+    // helper, e.g. a timestamp, so the wait's hold on the queue can be measured.
+    template<class Record> void StampBeforeWait(ID3D12CommandQueue* queue, const Record& record)
+    {
+        if (!stampFence_ && FAILED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&stampFence_))))
+            return;
+        auto& slot = stamps_[nextStamp_];
+        if (!slot.list &&
+            (FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&slot.allocator))) ||
+             FAILED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, slot.allocator.Get(), nullptr,
+                                               IID_PPV_ARGS(&slot.list))) ||
+             FAILED(slot.list->Close())))
+        {
+            slot.list.Reset();
+            return;
+        }
+        if (stampFence_->GetCompletedValue() < slot.retired)
+            return; // still on the GPU: no stamp this frame
+        if (FAILED(slot.allocator->Reset()) || FAILED(slot.list->Reset(slot.allocator.Get(), nullptr)))
+            return;
+        record(slot.list.Get());
+        if (FAILED(slot.list->Close()))
+            return;
+        ID3D12CommandList* lists[] = { slot.list.Get() };
+        queue->ExecuteCommandLists(1, lists);
+        queue->Signal(stampFence_.Get(), ++stampValue_);
+        slot.retired = stampValue_;
+        nextStamp_ = (nextStamp_ + 1) % stamps_.size();
+    }
     HRESULT AwaitReturn(ID3D12CommandQueue* queue)
     {
         if (!pending_)

@@ -23,22 +23,144 @@ std::wstring currentKey, failedKey;
 bool installed = false;
 
 // Choosing the split by speed. The helper's share must come back within the frame (the split is pipelined: the end of
-// the pass is recorded one frame later), so its turnaround is estimated as its measured kernel time plus the data
-// crossing PCIe twice each way (game GPU -> shared memory -> helper and back) plus fixed overhead, and the largest
-// share whose estimate fits the frame period (with margin) is chosen. Once running, frames get faster; a share that no
-// longer fits steps down to a smaller one.
-constexpr double PcieBytesPerMs = 12.0e6; // about 12 GB/s per link and direction
-constexpr double OverheadMs = 0.5;
-constexpr double FitMargin = 0.85, StepDownAt = 0.95;
+// the pass is recorded one frame later). Its turnaround is estimated from its measured kernel time and the data crossing
+// PCIe twice each way, with margins taken from measured runs (a 2560x1440 share came back about 1.4 times slower than
+// a plain 12 GB/s estimate). Among the shares that fit, the one with the most helper work net of transfer cost wins:
+// on the game GPU every MiB moved costs about 0.007 ms (0.7 ms per 100 MB measured), which is worth about 0.05 ms of
+// helper work at the measured speed ratio.
+//
+// Once running, two measurements decide, not the estimate: if the helper's half is late on more than one frame in ten,
+// or the frame is not faster than before the split, the share steps down; when no smaller share is left, the pass
+// stays whole on the game GPU. (A late helper makes the game GPU wait, so the frame stretches to the helper's pace and
+// an estimate compared with that frame would always look like it fits.)
+constexpr double PcieBytesPerMs = 8.0e6;
+constexpr double KernelMargin = 1.25, OverheadMs = 0.5;
+constexpr double FitMargin = 0.85;
+constexpr double TransferCostPerMiB = 0.05; // helper ms of benefit lost per MiB moved
 std::vector<double> intervals; // milliseconds between this pass's frames
 std::chrono::steady_clock::time_point lastFrame {};
 DlssNr::NetworkSplit::Plan currentPlan;
 uint64_t helperCap = ~0ull; // only shares below this helper time (after a step down)
 unsigned framesRunning = 0;
+double periodBefore = 0.0;  // stable frame period with the pass whole, measured before the split started
+unsigned lateChecks = 0, lateMisses = 0; // split frames measured, and those whose wait held the game GPU
+double lateWaitSum = 0.0;
+// Game-GPU time the running share saves per frame (the pass whole minus its two halves), measured.
+double gainSum = 0.0;
+unsigned gainCount = 0;
+// After giving up, the split tries again later: the frame rate changes with the scene.
+std::chrono::steady_clock::time_point retryAt {};
+constexpr unsigned WarmUpFrames = 90; // the helper's first frames after it starts are not judged
+
+// Measurements of the split pass, logged every few seconds: its game-GPU time whole and, when split, its two halves,
+// and how long the game GPU's queue waited for the helper (a timestamp right before the wait and one at the start of the
+// end half). GPU timestamps, read a few frames late. The CPU records a frame's end half one or two frames ahead of the
+// GPU, so whether the helper had finished at that moment says nothing; only the GPU-side wait does.
+namespace Stats
+{
+DlssNr::PassTimer timer;
+unsigned nextSlot = 0;
+struct Use
+{
+    unsigned slot;
+    bool split, stamped;
+};
+std::vector<Use> pending;
+double wholeSum = 0, headSum = 0, endSum = 0, waitSum = 0;
+unsigned wholeCount = 0, splitCount = 0, waitCount = 0, waitedCount = 0;
+std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+constexpr double WaitedMs = 0.5; // a wait longer than this held the game GPU
+// A slot for this frame's split pass, or ~0u when timestamps are unavailable.
+unsigned Slot(ID3D12Device* device, ID3D12CommandQueue* queue)
+{
+    if (!timer.Ready() && (!device || !queue || FAILED(timer.Create(device, queue))))
+        return ~0u;
+    return nextSlot++;
+}
+void Used(unsigned slot, bool split, bool stamped = false)
+{
+    if (slot != ~0u)
+        pending.push_back({ slot, split, stamped });
+}
+void Collect(double periodMs, const DlssNr::NetworkSplit::Plan* plan)
+{
+    // Read slots used at least six frames ago (well past the frames in flight), never more than the ring holds.
+    while (pending.size() > 6)
+    {
+        const auto use = pending.front();
+        pending.erase(pending.begin());
+        double a = 0, b = 0, w = 0;
+        if (!use.split && timer.Elapsed(use.slot, 0, 1, a))
+        {
+            wholeSum += a;
+            ++wholeCount;
+        }
+        else if (use.split && timer.Elapsed(use.slot, 0, 1, a) && timer.Elapsed(use.slot, 2, 3, b))
+        {
+            headSum += a;
+            endSum += b;
+            ++splitCount;
+            const bool judged = framesRunning > WarmUpFrames + 6;
+            if (judged && wholeCount)
+            {
+                gainSum += wholeSum / wholeCount - a - b;
+                ++gainCount;
+            }
+            if (use.stamped && timer.Elapsed(use.slot, 4, 2, w))
+            {
+                waitSum += w;
+                ++waitCount;
+                waitedCount += w > WaitedMs ? 1u : 0u;
+                if (judged)
+                {
+                    ++lateChecks;
+                    lateMisses += w > WaitedMs ? 1u : 0u;
+                    lateWaitSum += w;
+                }
+            }
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(5) || (!wholeCount && !splitCount))
+        return;
+    lastReport = now;
+    const double whole = wholeCount ? wholeSum / wholeCount : 0.0;
+    const double head = splitCount ? headSum / splitCount : 0.0, end = splitCount ? endSum / splitCount : 0.0;
+    if (splitCount)
+    {
+        char saving[96] = "", wait[96] = "";
+        if (wholeCount)
+            std::snprintf(saving, sizeof saving, ", whole %.2f ms, saving %.2f ms", whole, whole - head - end);
+        if (waitCount)
+            std::snprintf(wait, sizeof wait, "; game GPU waited %.2f ms on average, over %.1f ms on %u of %u frames",
+                          waitSum / waitCount, WaitedMs, waitedCount, waitCount);
+        LOG_INFO("DLSS-NR network split: frame {:.1f} ms; split pass on the game GPU {:.2f} + {:.2f} ms ({} frames){}"
+                 "{}; share ({}, {})",
+                 periodMs, head, end, splitCount, saving, wait, plan ? plan->cut : 0, plan ? plan->resume : 0);
+    }
+    else
+        LOG_INFO("DLSS-NR network split: frame {:.1f} ms; split pass whole on the game GPU {:.2f} ms ({} frames)",
+                 periodMs, whole, wholeCount);
+    headSum = endSum = waitSum = 0;
+    splitCount = waitCount = waitedCount = 0;
+    // The whole-pass figure is kept: it is the baseline the halves are compared with.
+    if (wholeCount > 600)
+    {
+        wholeSum /= 2;
+        wholeCount /= 2;
+    }
+}
+} // namespace Stats
 
 double Estimate(const DlssNr::NetworkSplit::Plan& p)
 {
-    return p.helperMicros / 1000.0 + 2.0 * double(p.forwardBytes + p.backwardBytes) / PcieBytesPerMs + OverheadMs;
+    return KernelMargin * p.helperMicros / 1000.0 + 2.0 * double(p.forwardBytes + p.backwardBytes) / PcieBytesPerMs +
+           OverheadMs;
+}
+// Helper work net of what moving its data costs the game GPU, in helper milliseconds.
+double Score(const DlssNr::NetworkSplit::Plan& p)
+{
+    return p.helperMicros / 1000.0 - TransferCostPerMiB * double(p.forwardBytes + p.backwardBytes) / 1048576.0;
 }
 void Observe()
 {
@@ -48,7 +170,7 @@ void Observe()
         const double ms = std::chrono::duration<double, std::milli>(now - lastFrame).count();
         if (ms > 0.0 && ms < 250.0)
             intervals.push_back(ms);
-        if (intervals.size() > 120)
+        if (intervals.size() > 180)
             intervals.erase(intervals.begin());
     }
     lastFrame = now;
@@ -61,6 +183,30 @@ double PeriodMs()
     auto sorted = intervals;
     std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
     return sorted[sorted.size() / 2];
+}
+// The median frame period once it is steady (the middle half of the last frames within 25 percent of each other, so a
+// loading screen or a hitch is not taken for the game's pace), else 0.
+double StablePeriodMs()
+{
+    if (intervals.size() < 120)
+        return 0.0;
+    auto sorted = intervals;
+    std::sort(sorted.begin(), sorted.end());
+    const double q1 = sorted[sorted.size() / 4], median = sorted[sorted.size() / 2], q3 = sorted[sorted.size() * 3 / 4];
+    return q3 <= 1.25 * q1 ? median : 0.0;
+}
+void Retire();
+// Gives up the running share for a smaller one (chosen again from the whole frame's pace).
+void StepDown(const char* why)
+{
+    LOG_INFO("DLSS-NR network split: share ({}, {}) {}; trying a smaller one", currentPlan.cut, currentPlan.resume, why);
+    helperCap = currentPlan.helperMicros;
+    Retire();
+    intervals.clear();
+    lateChecks = lateMisses = 0;
+    lateWaitSum = 0.0;
+    gainSum = 0.0;
+    gainCount = 0;
 }
 
 struct Feature
@@ -283,6 +429,7 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
     if (!primary || g_nr.isPort || info == features.end() || !info->second.fingerprint)
         return nullptr;
     Observe();
+    Stats::Collect(PeriodMs(), current ? &currentPlan : nullptr);
     const auto& f = info->second;
     const auto fixed = FixedPlanPath(cfg);
     std::wostringstream k;
@@ -300,17 +447,43 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
         const HRESULT status = current->Poll();
         if (status == S_OK)
         {
-            // With the split running the frame is faster; a share that no longer returns in time steps down.
-            const double period = ++framesRunning > 180 ? PeriodMs() : 0.0;
-            if (currentPlan.helperMicros && period > 0.0 && Estimate(currentPlan) > StepDownAt * period)
+            // Measured, not estimated: a helper that is late, or a frame that is no faster, means a smaller share.
+            if (++framesRunning == 1)
             {
-                LOG_INFO("DLSS-NR network split: kernels ({}, {}) take about {:.1f} ms on the helper, more than the "
-                         "frame now allows ({:.1f} ms); choosing a smaller share",
-                         currentPlan.cut, currentPlan.resume, Estimate(currentPlan), period);
-                helperCap = currentPlan.helperMicros;
-                Retire();
-                intervals.clear();
-                return nullptr;
+                intervals.clear(); // the frame with the split, from here on
+                lateChecks = lateMisses = 0;
+                lateWaitSum = 0.0;
+                gainSum = 0.0;
+                gainCount = 0;
+            }
+            if (currentPlan.helperMicros)
+            {
+                // The game GPU waited for the helper on more than one frame in five, or 1 ms on average.
+                if (lateChecks >= 60 && (lateMisses * 5 > lateChecks || lateWaitSum / lateChecks > 1.0))
+                {
+                    char why[128];
+                    std::snprintf(why, sizeof why, "held the game GPU %.2f ms on average (over 0.5 ms on %u of %u frames)",
+                                  lateWaitSum / lateChecks, lateMisses, lateChecks);
+                    StepDown(why);
+                    return nullptr;
+                }
+                // The game-GPU time it saves, measured on the pass itself (the frame period moves with the scene, so
+                // comparing it with the period before the split blamed the split for the scene).
+                if (gainCount >= 120 && gainSum / gainCount < 0.15)
+                {
+                    char why[96];
+                    std::snprintf(why, sizeof why, "saved only %.2f ms of game-GPU time per frame",
+                                  gainSum / gainCount);
+                    StepDown(why);
+                    return nullptr;
+                }
+                if (lateChecks >= 600) // a rolling window
+                {
+                    lateChecks = lateMisses = 0;
+                    lateWaitSum = 0.0;
+                    gainSum = 0.0;
+                    gainCount = 0;
+                }
             }
             return current;
         }
@@ -322,7 +495,15 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
         return nullptr;
     }
     if (failedKey == key)
-        return nullptr;
+    {
+        if (!retryAt.time_since_epoch().count() || std::chrono::steady_clock::now() < retryAt)
+            return nullptr;
+        LOG_INFO("DLSS-NR network split: trying the split again at the current frame rate");
+        failedKey.clear();
+        helperCap = ~0ull;
+        retryAt = {};
+        intervals.clear();
+    }
     auto fail = [&](const std::string& why) -> std::shared_ptr<SplitGeneration>
     {
         failedKey = key;
@@ -372,10 +553,19 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
     if (calibration)
         calibration.reset(); // another configuration's run
 
+    // The helper (adapter, a device on it, the files) is looked up once per configuration: creating devices on every
+    // frame under the NR lock can deadlock with the present thread, and it did after a step down.
+    static std::wstring foundKey;
+    static std::optional<Helper> found;
     std::string why;
-    auto helper = FindHelper(primary, cfg, why);
-    if (!helper)
-        return fail(why);
+    if (foundKey != key || !found)
+    {
+        found = FindHelper(primary, cfg, why);
+        foundKey = key;
+        if (!found)
+            return fail(why);
+    }
+    auto& helper = found;
     std::error_code sizeError;
     const auto modelBytes = std::filesystem::file_size(helper->model, sizeError);
     wchar_t name[64];
@@ -431,16 +621,23 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
         chosen = &plans[0];
     else
     {
-        const double period = PeriodMs();
-        if (period <= 0.0)
-            return nullptr; // still measuring the frame
+        // A steady frame below 66 ms: a loading screen is steady too (94 ms in Requiem), and a share sized for it
+        // would be far too large for the game itself.
+        const double period = StablePeriodMs();
+        if (period <= 0.0 || period > 66.0)
+            return nullptr; // still measuring the game's own steady pace
+        periodBefore = period;
         for (const auto& p : plans)
-            if (p.helperMicros < helperCap && Estimate(p) <= FitMargin * period &&
-                (!chosen || p.helperMicros > chosen->helperMicros))
+            if (p.helperMicros < helperCap && Estimate(p) <= FitMargin * period && Score(p) > 0.0 &&
+                (!chosen || Score(p) > Score(*chosen)))
                 chosen = &p;
         if (!chosen)
-            return fail("no share of the network returns from the helper within the frame (" +
-                        std::to_string(period).substr(0, 4) + " ms); it stays on the game GPU");
+            retryAt = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        if (!chosen)
+            return fail(helperCap != ~0ull
+                            ? "no smaller share helps at this frame rate; the pass stays on the game GPU for a minute"
+                            : "no share of the network returns from the helper within the frame (" +
+                                  std::to_string(period).substr(0, 4) + " ms); it stays on the game GPU");
         LOG_INFO("DLSS-NR network split: frame {:.1f} ms; helper share ({}, {}) estimated {:.1f} ms ({:.1f} ms of "
                  "kernels, {} KiB out, {} KiB back)",
                  period, chosen->cut, chosen->resume, Estimate(*chosen), chosen->helperMicros / 1000.0,

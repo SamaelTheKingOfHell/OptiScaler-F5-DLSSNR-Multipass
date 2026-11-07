@@ -65,6 +65,7 @@
 #include <dlssnr/worker/WorkerGeneration.h>
 #include <dlssnr/worker/WorkerSplitGeneration.h>
 #include <dlssnr/DlssNr_ModelAllocations.h>
+#include <dlssnr/DlssNr_PassTimer.h>
 #include <dlssnr/DlssNr_SplitCalibration.h>
 #include <fstream>
 #include <map>
@@ -6014,12 +6015,16 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                                                  splitGeneration->ForwardStaging(),
                                                  splitGeneration->BackwardStaging());
             };
+            const unsigned timerSlot = NetworkSplitRun::Stats::Slot(device, workerContext->queue);
             splitGeneration->BeforeHead(cmdList);
             BeginSplit(Role::Head);
+            NetworkSplitRun::Stats::timer.Mark(cmdList, timerSlot, 0);
             result = EvaluatePass(cmdList, passReset);
+            NetworkSplitRun::Stats::timer.Mark(cmdList, timerSlot, 1);
             const bool headRecorded = DlssNrNative::EndSplitEvaluate();
             splitGeneration->AfterHead(cmdList);
             HRESULT handoff = E_FAIL;
+            bool stamped = false;
             if (headRecorded && result == NVSDK_NGX_Result_Success)
             {
                 DlssNr::Worker::FrameCommand command {};
@@ -6061,15 +6066,29 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                     stateEnvelope.Resume(cmdList);
                 }
                 if (SUCCEEDED(handoff))
+                {
+                    // A timestamp just ahead of the wait: with the end half's first one it measures the wait.
+                    if (timerSlot != ~0u)
+                    {
+                        splitGeneration->StampBeforeWait(workerContext->queue, [&](ID3D12GraphicsCommandList* l)
+                                                         { NetworkSplitRun::Stats::timer.Mark(l, timerSlot, 4); });
+                        stamped = true;
+                    }
                     handoff = splitGeneration->AwaitReturn(workerContext->queue);
+                }
             }
             if (SUCCEEDED(handoff))
             {
                 splitGeneration->BeforeEnd(cmdList);
                 BeginSplit(Role::End);
+                NetworkSplitRun::Stats::timer.Mark(cmdList, timerSlot, 2);
                 result = EvaluatePass(cmdList, false);
+                NetworkSplitRun::Stats::timer.Mark(cmdList, timerSlot, 3);
+                NetworkSplitRun::Stats::timer.Resolve(cmdList, timerSlot);
                 splitDone = DlssNrNative::EndSplitEvaluate();
                 splitGeneration->AfterEnd(cmdList);
+                if (splitDone)
+                    NetworkSplitRun::Stats::Used(timerSlot, true, stamped);
                 if (!splitDone)
                     LOG_WARN("DLSS-NR network split: the end of pass {} did not run as calibrated; the pass runs "
                              "whole on the game GPU and the split stops.", pass + 1);
@@ -6090,7 +6109,17 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                                         vitEveryFrame ? 1u : std::clamp(cfg.DlssNrVitEveryPlain.value_or_default(), 1u, 2u),
                                         (long long) (g_nr.successfulDispatches & 0x3FFFFFFFFFFFFFFFull), cmdList,
                                         cfg.DlssNrKernelProfile.value_or_default(), copySets);
+            const unsigned wholeSlot =
+                splitThisPass ? NetworkSplitRun::Stats::Slot(device, workerContext->queue) : ~0u;
+            if (wholeSlot != ~0u)
+                NetworkSplitRun::Stats::timer.Mark(cmdList, wholeSlot, 0);
             result = EvaluatePass(cmdList, passReset);
+            if (wholeSlot != ~0u)
+            {
+                NetworkSplitRun::Stats::timer.Mark(cmdList, wholeSlot, 1);
+                NetworkSplitRun::Stats::timer.Resolve(cmdList, wholeSlot);
+                NetworkSplitRun::Stats::Used(wholeSlot, false);
+            }
             if (DlssNrNative::EndEvaluate(cmdList))
                 LOG_WARN("DLSS-NR: Reuse bottleneck is {}", DlssNrNative::VitStatus());
             if (recordSplit)

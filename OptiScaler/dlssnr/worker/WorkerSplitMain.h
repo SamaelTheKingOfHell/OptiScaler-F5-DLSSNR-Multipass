@@ -13,6 +13,8 @@
 
 #include "../DlssNr_NetworkSplit.h"
 #include "../DlssNr_SplitCalibration.h"
+#include "../DlssNr_PassTimer.h"
+#include <chrono>
 #include "../DlssNrVitCopyKernel.h"
 #pragma warning(push, 0)
 #include <detours/detours.h>
@@ -691,6 +693,12 @@ inline int Run(ID3D12Device* device, DlssNr::MultiGpu::CrossAdapterPeer& peer, c
         throw std::runtime_error("Could not signal split worker initialization");
 
     ID3D12Resource* shared = peer.Buffer();
+    // Per-frame timing, logged every 300 frames: copy in, the segment, copy out (GPU), and the turnaround from the
+    // owner's ready signal to this GPU finishing (CPU).
+    DlssNr::PassTimer timer;
+    timer.Create(device, queue.Get());
+    double copyInSum = 0, segmentSum = 0, copyOutSum = 0, turnaroundSum = 0;
+    unsigned samples = 0;
     for (uint64_t frame = 1;; ++frame)
     {
         FrameCommand command {};
@@ -708,11 +716,14 @@ inline int Run(ID3D12Device* device, DlssNr::MultiGpu::CrossAdapterPeer& peer, c
             throw std::runtime_error("Invalid split frame control");
         Check(alloc->Reset(), "Reset split allocator");
         Check(list->Reset(alloc.Get(), nullptr), "Reset split list");
+        const unsigned timerSlot = static_cast<unsigned>(frame % DlssNr::PassTimer::Slots);
+        timer.Mark(list.Get(), timerSlot, 0);
         Transition(list.Get(), shared, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
         Transition(list.Get(), forward.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
         list->CopyBufferRegion(forward.Get(), 0, shared, 0, plan.forwardBytes);
         Transition(list.Get(), forward.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         Transition(list.Get(), shared, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        timer.Mark(list.Get(), timerSlot, 1);
         s.filter.Begin(Role::Segment, &plan, workspaceResource->GetGPUVirtualAddress(),
                        forward->GetGPUVirtualAddress(), backward->GetGPUVirtualAddress());
         const int status = evaluate(list.Get(), feature, params, color.Get(), depth.Get(), motion.Get(), output.Get(),
@@ -722,19 +733,40 @@ inline int Run(ID3D12Device* device, DlssNr::MultiGpu::CrossAdapterPeer& peer, c
                                     1.0f);
         if (status != 1 || !s.filter.End())
             throw std::runtime_error("Split worker segment evaluate failed");
+        timer.Mark(list.Get(), timerSlot, 2);
         Transition(list.Get(), backward.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         Transition(list.Get(), shared, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
         list->CopyBufferRegion(shared, plan.forwardBytes, backward.Get(), 0, plan.backwardBytes);
         Transition(list.Get(), shared, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
         Transition(list.Get(), backward.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        timer.Mark(list.Get(), timerSlot, 3);
+        timer.Resolve(list.Get(), timerSlot);
         Check(list->Close(), "Close split list");
         if (DlssNr::MultiGpu::WaitForFenceOrPeer(peer.Ready(), frame, parent, 30000) !=
             DlssNr::MultiGpu::WorkerFenceWaitResult::Ready)
             throw std::runtime_error("Owner exited or failed before sending the split frame");
+        const auto readyAt = std::chrono::steady_clock::now();
         queue->ExecuteCommandLists(1, lists);
         if (FAILED(queue->Signal(peer.Done(), frame)))
             throw std::runtime_error("Split worker could not signal done");
         retire();
+        double in = 0, segment = 0, out = 0;
+        if (timer.Elapsed(timerSlot, 0, 1, in) && timer.Elapsed(timerSlot, 1, 2, segment) && timer.Elapsed(timerSlot, 2, 3, out))
+        {
+            copyInSum += in;
+            segmentSum += segment;
+            copyOutSum += out;
+            turnaroundSum +=
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readyAt).count();
+            if (++samples == 300)
+            {
+                std::cerr << "Split worker: copy in " << copyInSum / samples << " ms, segment " << segmentSum / samples
+                          << " ms, copy out " << copyOutSum / samples << " ms, ready to done "
+                          << turnaroundSum / samples << " ms (" << samples << " frames)\n" << std::flush;
+                copyInSum = segmentSum = copyOutSum = turnaroundSum = 0;
+                samples = 0;
+            }
+        }
     }
     std::cerr << "Split worker finished.\n" << std::flush;
     return 0;
