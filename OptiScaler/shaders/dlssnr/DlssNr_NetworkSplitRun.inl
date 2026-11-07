@@ -65,7 +65,6 @@ double PeriodMs()
 
 struct Feature
 {
-    std::vector<DlssNr::ModelAllocations::Workspace> buffers;
     DlssNr::ModelAllocations::Workspace workspace;
     uint64_t fingerprint = 0;
     bool recorded = false; // the layout was looked at (fingerprint 0 = it did not decode)
@@ -88,20 +87,17 @@ void BeforeCreate(const Config& cfg, ID3D12Device* device)
 {
     if (!cfg.DlssNrNetworkSplit.value_or_default())
         return;
+    DlssNr::ModelAllocations::UseDevice(device);
     if (!installed)
         installed = DlssNr::ModelAllocations::Install(g_nr.capabilityParams);
-    DlssNr::ModelAllocations::BeginCreate(device);
 }
+// A feature created with the callbacks in place: its buffers (allocated now or on its first evaluate) are tracked.
 void AfterCreate(const Config& cfg, const void* feature)
 {
-    if (!cfg.DlssNrNetworkSplit.value_or_default())
+    if (!cfg.DlssNrNetworkSplit.value_or_default() || !feature)
         return;
-    auto buffers = DlssNr::ModelAllocations::EndCreate();
-    if (!feature)
-        return;
-    features[feature] = Feature {};
-    if (!buffers.empty())
-        features[feature].buffers = std::move(buffers);
+    if (installed)
+        features[feature] = Feature {};
     else
         features.erase(feature);
 }
@@ -118,9 +114,16 @@ void Recorded(const void* feature, const std::vector<Cal::Kernel>& kernels)
         return;
     auto& f = it->second;
     f.recorded = true;
-    f.workspace = DlssNr::ModelAllocations::StartingAt(f.buffers, Cal::ClearPointer(kernels));
+    const uint64_t clear = Cal::ClearPointer(kernels);
+    f.workspace = DlssNr::ModelAllocations::StartingAt(clear);
     Cal::Layout layout;
-    std::string why = "the workspace buffer was not among the model's allocations";
+    const auto [live, allocated] = DlssNr::ModelAllocations::Counts();
+    std::string why = !clear ? "the first of " + std::to_string(kernels.size()) +
+                                   " kernels is not the synchronization clear (" +
+                                   (kernels.empty() ? std::string("none") : kernels[0].name) + ")"
+                             : "no model buffer starts where the first kernel clears (" + std::to_string(live) +
+                                   " live buffers, " + std::to_string(allocated) +
+                                   " allocations through the callback)";
     if (f.workspace.address && Cal::Decode(kernels, f.workspace.address, f.workspace.bytes, layout, why))
     {
         f.fingerprint = Cal::Fingerprint(layout);
@@ -329,8 +332,9 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
         if (!ReadPlan(calibration->plan, plan, why))
             return fail("the helper's calibration plan: " + why);
         if (plan.layout != calibration->fingerprint)
-            return fail("the helper GPU's runtime lays the network out differently; pick a compatible "
-                        "SecondaryModel");
+            return fail("the helper GPU's runtime lays the network out differently from pass " +
+                        std::to_string(pass + 1) + " (preset " + std::to_string(PassPreset(cfg, pass)) +
+                        "); use a SecondaryModel that runs this preset, or split a pass with a preset it runs");
         std::error_code error;
         std::filesystem::create_directories(calibration->cache.parent_path(), error);
         std::filesystem::copy_file(calibration->plan, calibration->cache,
