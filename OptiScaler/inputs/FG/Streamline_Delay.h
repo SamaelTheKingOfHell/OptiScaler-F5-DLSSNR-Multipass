@@ -20,6 +20,7 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 #include <array>
+#include <cstring>
 #include <mutex>
 #include <vector>
 #include <sl.h>
@@ -91,6 +92,7 @@ struct State
     std::vector<Pending> pending;
     bool wasDelayed = false;
     unsigned delayedPresents = 0, retagFailures = 0;
+    const char* lastMiss = nullptr; // why the last delayed picture could not be matched
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12Fence> fence;
     uint64_t fenceValue = 0;
@@ -239,7 +241,17 @@ inline void OnConstants(const sl::Constants& values, const sl::FrameToken& token
     if (!s.enabled)
         return;
     auto& f = s.ring[s.current];
-    f.constants = values;
+    if (values.structVersion == sl::kStructVersion2)
+        f.constants = values;
+    else
+    {
+        // An older, shorter struct (or an invalid version, as some games send): copy what it has, as
+        // Sl_Inputs::setConstants does.
+        f.constants = sl::Constants {};
+        std::memcpy(&f.constants, &values,
+                    sizeof(values) - sizeof(sl::Constants::minRelativeLinearDepthObjectSeparation));
+        f.constants.structVersion = sl::kStructVersion2;
+    }
     f.constants.next = nullptr; // chained extensions belong to the game's call
     f.hasConstants = true;
     s.token = &token;
@@ -298,7 +310,14 @@ inline bool AtPresent(ID3D12CommandQueue* queue, bool delayed)
     const bool canDelay = delayed && s.frames > 0 && previous.hasConstants && s.token && s.setConstants &&
                           (s.tokenTags ? s.setTagForFrame != nullptr : s.setTag != nullptr);
     if (delayed && !canDelay)
+    {
         ok = false;
+        ++s.retagFailures;
+        s.lastMiss = !s.frames ? "no previous frame yet"
+                     : !previous.hasConstants ? "no constants from the game (slSetConstants not seen)"
+                     : !s.token ? "no frame token"
+                     : "Streamline's tag or constants entry not captured";
+    }
     if (canDelay)
     {
         std::vector<sl::Resource> resources;
@@ -359,5 +378,12 @@ inline std::pair<unsigned, unsigned> Counts()
     auto& s = Detail::S();
     std::lock_guard<std::mutex> lock(s.mutex);
     return { s.delayedPresents, s.retagFailures };
+}
+// Why the last delayed picture could not be given the previous frame's inputs, or nullptr.
+inline const char* LastMiss()
+{
+    auto& s = Detail::S();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    return s.lastMiss;
 }
 } // namespace SlFgDelay

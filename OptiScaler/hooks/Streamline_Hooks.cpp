@@ -1306,7 +1306,8 @@ sl::Result StreamlineHooks::hkslSetConstants(const sl::Constants& values, const 
     std::scoped_lock lock(setConstantsMutex);
     LOG_TRACE("called with frameIndex: {}, viewport: {}", (unsigned int) frame, (unsigned int) viewport);
 
-    State::Instance().slFGInputs.setConstants(values, (uint32_t) frame);
+    if (State::Instance().activeFgInput == FGInput::DLSSG || State::Instance().activeFgInput == FGInput::NvngxFG)
+        State::Instance().slFGInputs.setConstants(values, (uint32_t) frame);
     SlFgDelay::Register(o_slSetTag, o_slSetTagForFrame, o_slSetConstants);
     SlFgDelay::OnConstants(values, frame, viewport);
 
@@ -2208,8 +2209,11 @@ void StreamlineHooks::hookInterposer(HMODULE slInterposer)
                 if (o_slEvaluateFeature != nullptr)
                     DetourAttach(&(PVOID&) o_slEvaluateFeature, hkslEvaluateFeature);
 
+                // Also for the network split: native DLSS-G is then handed the previous frame's tags and constants
+                // when the picture is a pipelined one (inputs/FG/Streamline_Delay.h), which needs these three.
                 if (State::Instance().activeFgInput == FGInput::NvngxFG ||
-                    State::Instance().activeFgInput == FGInput::DLSSG)
+                    State::Instance().activeFgInput == FGInput::DLSSG ||
+                    Config::Instance()->DlssNrNetworkSplit.value_or_default())
                 {
                     if (o_slSetTag != nullptr)
                         DetourAttach(&(PVOID&) o_slSetTag, hkslSetTag);
