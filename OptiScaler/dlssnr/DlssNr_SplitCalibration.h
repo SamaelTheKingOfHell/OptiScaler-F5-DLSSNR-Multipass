@@ -67,6 +67,15 @@ inline std::vector<Use> Uses(const std::vector<uint8_t>& p, uint64_t base, uint6
         uint32_t h, w;
         std::memcpy(&h, &p[o], 4);
         std::memcpy(&w, &p[o + 4], 4);
+        // The upper half of a 64-bit address is a small number too (0x18 for an address at 0x18'xxxxxxxx): never a
+        // height. An address's lower half is above any stage size, so that tells them apart.
+        if (o % 8 == 4)
+        {
+            uint32_t below;
+            std::memcpy(&below, &p[o - 4], 4);
+            if (below > 4096)
+                continue;
+        }
         if (h >= 8 && h <= 4096 && w >= 8 && w <= 4096 && w > h && h % 4 == 0 && w % 4 == 0)
             dims.push_back({ o, h, w });
     }
@@ -181,6 +190,47 @@ inline uint64_t Fingerprint(const Layout& l)
             break;
     }
     return h;
+}
+
+// The layout as text, one kernel per line (name, then offset:HxW per workspace pointer), for comparing two instances.
+inline std::string Describe(const Layout& l)
+{
+    std::string s;
+    char item[64];
+    std::snprintf(item, sizeof item, "workspace %llu sync %llu first %ux%u\n", (unsigned long long) l.workspaceBytes,
+                  (unsigned long long) l.syncBytes, l.firstH, l.firstW);
+    s += item;
+    for (size_t k = 0; k < l.names.size(); ++k)
+    {
+        s += std::to_string(k) + " " + l.names[k];
+        for (const auto& u : l.uses[k])
+        {
+            std::snprintf(item, sizeof item, " %llu:%ux%u", (unsigned long long) u.offset, u.h, u.w);
+            s += item;
+        }
+        s += "\n";
+    }
+    return s;
+}
+
+// The raw parameter blocks as 32-bit words in hex, one kernel per line, for comparing two instances' launches.
+inline std::string DescribeParams(const std::vector<Kernel>& ks)
+{
+    std::string s;
+    char word[12];
+    for (size_t k = 0; k < ks.size(); ++k)
+    {
+        s += std::to_string(k) + " " + ks[k].name;
+        for (size_t o = 0; o + 4 <= ks[k].params.size(); o += 4)
+        {
+            uint32_t v;
+            std::memcpy(&v, &ks[k].params[o], 4);
+            std::snprintf(word, sizeof word, " %08x", v);
+            s += word;
+        }
+        s += "\n";
+    }
+    return s;
 }
 
 inline bool ChooseCut(const Layout& l, int& cut, int& resume, std::string& why)

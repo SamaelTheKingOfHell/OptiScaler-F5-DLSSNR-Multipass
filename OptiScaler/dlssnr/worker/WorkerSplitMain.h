@@ -477,6 +477,11 @@ inline void Calibrate(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Com
     // A plan for every split the chain allows, each with the helper's measured time for its kernels (kernel 0 runs on
     // both sides). The owner picks one by its frame time and the transfer volume.
     const uint64_t fingerprint = Cal::Fingerprint(layout);
+    // The layout as text beside the plan, for comparing with the owner's when the fingerprints differ.
+    std::ofstream(planPath.substr(0, planPath.find_last_of(L"\\/") + 1) + L"split-layout.txt", std::ios::trunc)
+        << Cal::Describe(layout);
+    std::ofstream(planPath.substr(0, planPath.find_last_of(L"\\/") + 1) + L"split-params.txt", std::ios::trunc)
+        << Cal::DescribeParams(kernels);
     std::ofstream out(planPath, std::ios::trunc);
     out << "# calibrated by the helper: " << kernels.size() << " kernels, workspace " << workspaceBytes << " bytes\n";
     size_t written = 0;

@@ -91,6 +91,7 @@ void BeforeCreate(const Config& cfg, ID3D12Device* device)
     if (!installed)
         installed = DlssNr::ModelAllocations::Install(g_nr.capabilityParams);
 }
+std::filesystem::path CacheDir();
 // A feature created with the callbacks in place: its buffers (allocated now or on its first evaluate) are tracked.
 void AfterCreate(const Config& cfg, const void* feature)
 {
@@ -132,6 +133,12 @@ void Recorded(const void* feature, const std::vector<Cal::Kernel>& launches)
     if (f.workspace.address && Cal::Decode(kernels, f.workspace.address, f.workspace.bytes, layout, why))
     {
         f.fingerprint = Cal::Fingerprint(layout);
+        {
+            std::error_code error;
+            std::filesystem::create_directories(CacheDir(), error);
+            std::ofstream(CacheDir() / L"game-layout.txt", std::ios::trunc) << Cal::Describe(layout);
+            std::ofstream(CacheDir() / L"game-params.txt", std::ios::trunc) << Cal::DescribeParams(kernels);
+        }
         LOG_INFO("DLSS-NR network split: {} kernels, workspace {} bytes, synchronization {} bytes, layout {:016x}",
                  kernels.size(), f.workspace.bytes, layout.syncBytes, f.fingerprint);
     }
@@ -332,20 +339,29 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
             return nullptr;
         if (FAILED(ready))
             return fail("the helper's calibration failed (see worker.log in the worker data folder)");
-        DlssNr::NetworkSplit::Plan plan;
-        std::string why;
-        if (!ReadPlan(calibration->plan, plan, why))
-            return fail("the helper's calibration plan: " + why);
-        if (plan.layout != calibration->fingerprint)
+        // One plan per candidate split, all calibrated on the same layout.
+        std::vector<DlssNr::NetworkSplit::Plan> calibrated;
+        {
+            std::ifstream in(calibration->plan);
+            calibrated = DlssNr::NetworkSplit::ParsePlans(in);
+        }
+        if (calibrated.empty())
+            return fail("the helper's calibration wrote no usable plan");
+        if (calibrated[0].layout != calibration->fingerprint)
+        {
+            char ids[64];
+            std::snprintf(ids, sizeof ids, "%016llx here, %016llx on the helper",
+                          static_cast<unsigned long long>(calibration->fingerprint),
+                          static_cast<unsigned long long>(calibrated[0].layout));
             return fail("the helper GPU's runtime lays the network out differently from pass " +
-                        std::to_string(pass + 1) + " (preset " + std::to_string(PassPreset(cfg, pass)) +
+                        std::to_string(pass + 1) + " (preset " + std::to_string(PassPreset(cfg, pass)) + "; " + ids +
                         "); use a SecondaryModel that runs this preset, or split a pass with a preset it runs");
+        }
         std::error_code error;
         std::filesystem::create_directories(calibration->cache.parent_path(), error);
         std::filesystem::copy_file(calibration->plan, calibration->cache,
                                    std::filesystem::copy_options::overwrite_existing, error);
-        LOG_INFO("DLSS-NR network split: calibrated: kernels ({}, {}) on the helper, {} KiB out, {} KiB back{}",
-                 plan.cut, plan.resume, plan.forwardBytes / 1024, plan.backwardBytes / 1024,
+        LOG_INFO("DLSS-NR network split: calibrated {} candidate splits on the helper{}", calibrated.size(),
                  error ? " (not cached)" : "");
         calibration->client.Stop(5000);
         calibration.reset();
