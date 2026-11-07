@@ -22,6 +22,47 @@ std::shared_ptr<SplitGeneration> current;
 std::wstring currentKey, failedKey;
 bool installed = false;
 
+// Choosing the split by speed. The helper's share must come back within the frame (the split is pipelined: the end of
+// the pass is recorded one frame later), so its turnaround is estimated as its measured kernel time plus the data
+// crossing PCIe twice each way (game GPU -> shared memory -> helper and back) plus fixed overhead, and the largest
+// share whose estimate fits the frame period (with margin) is chosen. Once running, frames get faster; a share that no
+// longer fits steps down to a smaller one.
+constexpr double PcieBytesPerMs = 12.0e6; // about 12 GB/s per link and direction
+constexpr double OverheadMs = 0.5;
+constexpr double FitMargin = 0.85, StepDownAt = 0.95;
+std::vector<double> intervals; // milliseconds between this pass's frames
+std::chrono::steady_clock::time_point lastFrame {};
+DlssNr::NetworkSplit::Plan currentPlan;
+uint64_t helperCap = ~0ull; // only shares below this helper time (after a step down)
+unsigned framesRunning = 0;
+
+double Estimate(const DlssNr::NetworkSplit::Plan& p)
+{
+    return p.helperMicros / 1000.0 + 2.0 * double(p.forwardBytes + p.backwardBytes) / PcieBytesPerMs + OverheadMs;
+}
+void Observe()
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (lastFrame.time_since_epoch().count())
+    {
+        const double ms = std::chrono::duration<double, std::milli>(now - lastFrame).count();
+        if (ms > 0.0 && ms < 250.0)
+            intervals.push_back(ms);
+        if (intervals.size() > 120)
+            intervals.erase(intervals.begin());
+    }
+    lastFrame = now;
+}
+// The median frame period, 0 until enough frames were seen.
+double PeriodMs()
+{
+    if (intervals.size() < 60)
+        return 0.0;
+    auto sorted = intervals;
+    std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+    return sorted[sorted.size() / 2];
+}
+
 struct Feature
 {
     std::vector<DlssNr::ModelAllocations::Workspace> buffers;
@@ -226,6 +267,7 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
     const auto info = features.find(feature);
     if (!primary || g_nr.isPort || info == features.end() || !info->second.fingerprint)
         return nullptr;
+    Observe();
     const auto& f = info->second;
     const auto fixed = FixedPlanPath(cfg);
     std::wostringstream k;
@@ -233,13 +275,30 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
       << f.fingerprint << L':' << (fixed ? fixed->wstring() : L"auto") << L':'
       << string_to_wstring(cfg.DlssNrSecondaryModel.value_or_default());
     const auto key = k.str();
-    if (current && key != currentKey)
+    if (current && currentKey.rfind(key, 0) != 0)
+    {
         Retire();
+        helperCap = ~0ull;
+    }
     if (current)
     {
         const HRESULT status = current->Poll();
         if (status == S_OK)
+        {
+            // With the split running the frame is faster; a share that no longer returns in time steps down.
+            const double period = ++framesRunning > 180 ? PeriodMs() : 0.0;
+            if (currentPlan.helperMicros && period > 0.0 && Estimate(currentPlan) > StepDownAt * period)
+            {
+                LOG_INFO("DLSS-NR network split: kernels ({}, {}) take about {:.1f} ms on the helper, more than the "
+                         "frame now allows ({:.1f} ms); choosing a smaller share",
+                         currentPlan.cut, currentPlan.resume, Estimate(currentPlan), period);
+                helperCap = currentPlan.helperMicros;
+                Retire();
+                intervals.clear();
+                return nullptr;
+            }
             return current;
+        }
         if (status == E_PENDING)
             return nullptr;
         failedKey = key;
@@ -328,14 +387,41 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
         return nullptr;
     }
 
-    DlssNr::NetworkSplit::Plan plan;
-    if (!ReadPlan(planPath, plan, why))
-        return fail("plan " + planPath.string() + ": " + why);
-    if (!plan.Fits(f.workspace.bytes))
-        return fail("plan " + planPath.string() + " does not fit this model's workspace (" +
-                    std::to_string(f.workspace.bytes) + " bytes)");
-    if (plan.layout && plan.layout != f.fingerprint)
-        return fail("plan " + planPath.string() + " was calibrated for another layout");
+    std::vector<DlssNr::NetworkSplit::Plan> plans;
+    {
+        std::ifstream in(planPath);
+        if (!in)
+            return fail("plan " + planPath.string() + ": unreadable");
+        plans = DlssNr::NetworkSplit::ParsePlans(in);
+    }
+    plans.erase(std::remove_if(plans.begin(), plans.end(),
+                               [&](const DlssNr::NetworkSplit::Plan& p)
+                               { return !p.Fits(f.workspace.bytes) || (p.layout && p.layout != f.fingerprint); }),
+                plans.end());
+    if (plans.empty())
+        return fail("plan " + planPath.string() + " has no split for this model's workspace and layout");
+    // A fixed single plan without timing is used as it is; otherwise choose by the measured frame period.
+    const DlssNr::NetworkSplit::Plan* chosen = nullptr;
+    if (plans.size() == 1 && !plans[0].helperMicros)
+        chosen = &plans[0];
+    else
+    {
+        const double period = PeriodMs();
+        if (period <= 0.0)
+            return nullptr; // still measuring the frame
+        for (const auto& p : plans)
+            if (p.helperMicros < helperCap && Estimate(p) <= FitMargin * period &&
+                (!chosen || p.helperMicros > chosen->helperMicros))
+                chosen = &p;
+        if (!chosen)
+            return fail("no share of the network returns from the helper within the frame (" +
+                        std::to_string(period).substr(0, 4) + " ms); it stays on the game GPU");
+        LOG_INFO("DLSS-NR network split: frame {:.1f} ms; helper share ({}, {}) estimated {:.1f} ms ({:.1f} ms of "
+                 "kernels, {} KiB out, {} KiB back)",
+                 period, chosen->cut, chosen->resume, Estimate(*chosen), chosen->helperMicros / 1000.0,
+                 chosen->forwardBytes / 1024, chosen->backwardBytes / 1024);
+    }
+    const auto plan = *chosen;
     auto next = std::make_shared<SplitGeneration>();
     if (FAILED(next->Create(primary, helper->adapter.device.Get(), plan)))
         return fail("the shared buffer, copy queue or staging could not be created");
@@ -344,7 +430,9 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
                            helper->model.c_str(), helper->data.c_str(), log.c_str(), Wire(cfg, pass, width, height))))
         return fail("the helper could not be started");
     current = std::move(next);
-    currentKey = key;
+    currentKey = key + L':' + std::to_wstring(plan.cut) + L'-' + std::to_wstring(plan.resume);
+    currentPlan = plan;
+    framesRunning = 0;
     LOG_INFO("DLSS-NR network split: pass {} kernels ({}, {}) on {}, plan {} ({} KiB out, {} KiB back)", pass + 1,
              plan.cut, plan.resume, wstring_to_string(helper->adapter.description.Description), planPath.string(),
              plan.forwardBytes / 1024, plan.backwardBytes / 1024);

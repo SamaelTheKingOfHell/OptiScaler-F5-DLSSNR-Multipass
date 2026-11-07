@@ -411,3 +411,33 @@ Results (RTX 3060, Ampere Preset B runtime):
 Open: cut 9 gives the helper about 90 percent of the network. On the RTX 3060 at 1440p that is far slower than the
 game GPU's whole pass, so the cut needs to follow the helper's measured speed (and transfer volume) before this can
 raise frame rates. Not yet run in a game.
+
+## Choosing the split by speed (2026-11-07)
+
+The helper no longer gets a fixed share. Every split the chain allows is a candidate: the helper starts after a kernel
+that ends a synchronization group (`_wait`) and hands back after one, or at the post block (55 candidates for Preset
+B). The calibration times each kernel on the helper (timestamps around every kernel, kernels serialized by UAV
+barriers, median of three evaluates) and writes a plan for every candidate with its helper time (`T` line).
+
+The game measures its frame period while the pass runs whole, then estimates each candidate's turnaround as the
+helper's kernel time plus the data crossing PCIe twice each way at about 12 GB/s plus 0.5 ms, and takes the largest
+share that fits 85 percent of the period. The split is always pipelined (the end of the pass is recorded on the next
+continuation), so the share has a frame to come back. Once running, the frame is faster; a share whose estimate
+exceeds 95 percent of the new period steps down to a smaller one. If no share fits, the pass stays on the game GPU.
+
+The split now has its own route: it creates the owned command chain and pipelines with `MultiGpu=false` (before, it
+could not run at all without `MultiGpu=true`).
+
+RTX 3060, Ampere Preset B runtime, 2560x1440 (whole network 25.1 ms, kernels serialized). A selection:
+
+| helper share (cut, resume) | helper kernels | out / back |
+|---|---|---|
+| (9, 19) encoder bottom stage | 0.97 ms | 4.9 / 3.0 MiB |
+| (18, 60) ViT bottleneck | 7.24 ms | 1.9 / 10.8 MiB |
+| (9, 60) | 8.20 ms | 4.9 / 13.6 MiB |
+| (9, 72) | 10.30 ms | 8.5 / 18.2 MiB |
+| (9, 78) previous fixed cut | 14.10 ms | 85.8 / 29.0 MiB |
+
+(18, 60) and (9, 72), run on the RTX 3060 alone with `SPLICE_PLAN`, matched a whole evaluate within the two-evaluate
+residue over 8 pictures (max 0.0029 and 0.0034). Not yet run in a game; the frame-period model and the PCIe estimate
+are untested there.

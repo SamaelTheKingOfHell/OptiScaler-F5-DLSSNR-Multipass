@@ -63,6 +63,8 @@ struct State
     int probeIndex = 0, probeFirst = -1, probeLast = -1;
     uint64_t workspaceVa = 0, workspaceBytes = 0;
     std::vector<uint64_t> snaps;
+    // Kernel timing: a timestamp before kernel 0 and after every kernel (each kernel finishes before the next starts).
+    ID3D12QueryHeap* timestamps = nullptr;
     // Model allocations made while creating our single feature: the smallest writable buffer is its workspace.
     ID3D12Device* device = nullptr;
     std::vector<std::pair<ComPtr<ID3D12Resource>, D3D12_RESOURCE_DESC>> allocations;
@@ -108,8 +110,15 @@ inline int ProbeLaunch(ID3D12GraphicsCommandList* list, const CuLaunch* k, uint3
             s.recorded.push_back({ name == s.names.end() ? std::string() : name->second,
                                    std::vector<uint8_t>(p, p + k[i].paramSize) });
         }
+        if (s.timestamps && index == 0)
+            list->EndQuery(s.timestamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
         if (const int status = s.launch(list, &k[i], 1))
             return status;
+        if (s.timestamps)
+        {
+            UavBarrier(list);
+            list->EndQuery(s.timestamps, D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(index + 1));
+        }
         if (index >= s.probeFirst && index <= s.probeLast && size_t(index - s.probeFirst) < s.snaps.size())
         {
             UavBarrier(list);
@@ -124,7 +133,7 @@ inline int ProbeLaunch(ID3D12GraphicsCommandList* list, const CuLaunch* k, uint3
 inline int __cdecl Launch(ID3D12GraphicsCommandList* list, const CuLaunch* k, uint32_t count)
 {
     auto& s = S();
-    if (s.recording || s.probeFirst >= 0)
+    if (s.recording || s.probeFirst >= 0 || s.timestamps)
         return ProbeLaunch(list, k, count);
     for (uint32_t i = 0; i < count; ++i)
     {
@@ -316,7 +325,7 @@ inline void Calibrate(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Com
     s.workspaceVa = workspace->GetGPUVirtualAddress();
     s.workspaceBytes = workspaceBytes;
     uint32_t seed = 1;
-    const auto run = [&](bool reset)
+    const auto run = [&](bool reset, const std::function<void()>& beforeClose = {})
     {
         std::vector<ComPtr<ID3D12Resource>> uploads;
         Check(alloc->Reset(), "Reset calibration allocator");
@@ -326,6 +335,8 @@ inline void Calibrate(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Com
         s.probeIndex = 0;
         if (evaluateOnce(reset) != 1)
             throw std::runtime_error("Calibration evaluate failed");
+        if (beforeClose)
+            beforeClose();
         Check(list->Close(), "Close calibration list");
         ID3D12CommandList* lists[] = { list };
         queue->ExecuteCommandLists(1, lists);
@@ -342,6 +353,46 @@ inline void Calibrate(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Com
     int cut = 0, resume = 0;
     if (!Cal::Decode(kernels, s.workspaceVa, workspaceBytes, layout, why) || !Cal::ChooseCut(layout, cut, resume, why))
         throw std::runtime_error("Calibration: " + why);
+
+    // Each kernel's time on this GPU: the median of three evaluates, kernels serialized by UAV barriers (a slight
+    // overestimate of the chain, which overlaps neighbours a little).
+    const size_t count = kernels.size();
+    std::vector<double> micros(count, 0.0);
+    {
+        ComPtr<ID3D12QueryHeap> heap;
+        D3D12_QUERY_HEAP_DESC qh {};
+        qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qh.Count = static_cast<UINT>(count + 1);
+        Check(device->CreateQueryHeap(&qh, IID_PPV_ARGS(&heap)), "Create calibration timestamps");
+        auto stamps = Buffer(device, (count + 1) * 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
+        UINT64 frequency = 0;
+        Check(queue->GetTimestampFrequency(&frequency), "Timestamp frequency");
+        std::vector<std::vector<double>> samples(count);
+        s.timestamps = heap.Get();
+        for (int r = 0; r < 3; ++r)
+        {
+            run(false, [&] { list->ResolveQueryData(heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, qh.Count, stamps.Get(), 0); });
+            if (s.probeIndex != static_cast<int>(count))
+                throw std::runtime_error("Calibration: the kernel chain changed between evaluates");
+            uint64_t* t = nullptr;
+            const D3D12_RANGE range { 0, static_cast<SIZE_T>((count + 1) * 8) };
+            Check(stamps->Map(0, &range, reinterpret_cast<void**>(&t)), "Map calibration timestamps");
+            for (size_t k = 0; k < count; ++k)
+                samples[k].push_back(t[k + 1] > t[k] ? double(t[k + 1] - t[k]) * 1e6 / double(frequency) : 0.0);
+            const D3D12_RANGE none { 0, 0 };
+            stamps->Unmap(0, &none);
+        }
+        s.timestamps = nullptr;
+        double whole = 0.0;
+        for (size_t k = 0; k < count; ++k)
+        {
+            std::sort(samples[k].begin(), samples[k].end());
+            micros[k] = samples[k][1];
+            whole += micros[k];
+        }
+        std::cerr << "Split calibration: whole network " << whole / 1000.0 << " ms on this GPU (kernels serialized)\n"
+                  << std::flush;
+    }
 
     const uint64_t budget = 1536ull << 20;
     const size_t window = (std::max<size_t>)(2, (std::min<size_t>)(kernels.size(), size_t(budget / workspaceBytes)));
@@ -408,19 +459,30 @@ inline void Calibrate(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Com
     s.probeFirst = s.probeLast = -1;
     s.snaps.clear();
 
-    Plan plan;
-    if (!Cal::Compute(layout, writes, cut, resume, plan, why))
-        throw std::runtime_error("Calibration: " + why);
+    // A plan for every split the chain allows, each with the helper's measured time for its kernels (kernel 0 runs on
+    // both sides). The owner picks one by its frame time and the transfer volume.
     const uint64_t fingerprint = Cal::Fingerprint(layout);
     std::ofstream out(planPath, std::ios::trunc);
-    out << Cal::Write(plan, fingerprint,
-                      "calibrated by the helper: " + std::to_string(kernels.size()) + " kernels, workspace " +
-                          std::to_string(workspaceBytes) + " bytes");
-    if (!out)
-        throw std::runtime_error("Calibration: the plan could not be written");
-    std::cerr << "Split calibration: cut " << cut << ", resume " << resume << ", forward " << plan.forwardBytes
-              << " bytes, backward " << plan.backwardBytes << " bytes, layout " << std::hex << fingerprint << std::dec
-              << "\n" << std::flush;
+    out << "# calibrated by the helper: " << kernels.size() << " kernels, workspace " << workspaceBytes << " bytes\n";
+    size_t written = 0;
+    for (const auto& [c, r] : Cal::Candidates(layout))
+    {
+        Plan plan;
+        if (!Cal::Compute(layout, writes, c, r, plan, why))
+            continue;
+        double t = micros[0];
+        for (int k = c + 1; k < r; ++k)
+            t += micros[k];
+        plan.helperMicros = static_cast<uint64_t>(t);
+        out << Cal::Write(plan, fingerprint, "");
+        ++written;
+        std::cerr << "  (" << c << ", " << r << "): helper " << t / 1000.0 << " ms, forward " << plan.forwardBytes
+                  << ", backward " << plan.backwardBytes << " bytes\n";
+    }
+    if (!out || !written)
+        throw std::runtime_error("Calibration: the plans could not be written");
+    std::cerr << "Split calibration: " << written << " candidate splits, layout " << std::hex << fingerprint
+              << std::dec << "\n" << std::flush;
 }
 
 // Runs the helper's segment for every frame the owner sends. Returns the process exit code.

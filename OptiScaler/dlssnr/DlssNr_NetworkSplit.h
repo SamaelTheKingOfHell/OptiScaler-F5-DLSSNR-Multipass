@@ -34,6 +34,7 @@ struct Plan
     int cut = 0, resume = 0;
     uint64_t workspaceBytes = 0; // calibrated workspace size: a mismatch means another resolution or model
     uint64_t layout = 0;         // workspace layout fingerprint it was calibrated on (DlssNr_SplitCalibration.h), 0 unknown
+    uint64_t helperMicros = 0;   // measured helper GPU time of its kernels, 0 unknown
     std::vector<Range> forward, backward;
     uint64_t forwardBytes = 0, backwardBytes = 0;
 
@@ -76,6 +77,8 @@ inline bool ParsePlan(std::istream& in, Plan& plan, std::string& error)
             l >> plan.workspaceBytes;
         else if (kind == 'L')
             l >> std::hex >> plan.layout;
+        else if (kind == 'T')
+            l >> plan.helperMicros;
         else if (kind == 'F' || kind == 'B')
         {
             Range r;
@@ -96,6 +99,38 @@ inline bool ParsePlan(std::istream& in, Plan& plan, std::string& error)
         return false;
     }
     return true;
+}
+
+// Several plans in one stream, each starting at its "C" line (lines before the first one belong to it). Plans that
+// do not parse are skipped.
+inline std::vector<Plan> ParsePlans(std::istream& in)
+{
+    std::vector<Plan> out;
+    std::string line, block;
+    bool seenCut = false;
+    auto flush = [&]
+    {
+        std::istringstream b(block);
+        Plan p;
+        std::string why;
+        if (ParsePlan(b, p, why))
+            out.push_back(p);
+        block.clear();
+    };
+    while (std::getline(in, line))
+    {
+        const auto first = line.find_first_not_of(" \t");
+        if (first != std::string::npos && line[first] == 'C')
+        {
+            if (seenCut)
+                flush();
+            seenCut = true;
+        }
+        block += line + "\n";
+    }
+    if (seenCut)
+        flush();
+    return out;
 }
 
 // The compact form carried by the worker handshake: forward ranges first, then backward ones.

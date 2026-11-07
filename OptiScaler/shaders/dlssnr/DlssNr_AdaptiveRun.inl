@@ -15,7 +15,9 @@ double Seconds()
 // ```
 bool ConfiguredRoute(const Config& cfg, bool gameFrameHandoff)
 {
-    return cfg.DlssNrMultiGpu.value_or_default() && cfg.DlssNrEnabled.value_or_default() &&
+    // The pass handoff (MultiGpu) and the network split (NetworkSplit) share this route.
+    return (cfg.DlssNrMultiGpu.value_or_default() || cfg.DlssNrNetworkSplit.value_or_default()) &&
+        cfg.DlssNrEnabled.value_or_default() &&
         cfg.DlssNrFinishedPicture.value_or_default() && cfg.DlssNrApplyModel.value_or_default() &&
         cfg.DlssNrPasses.value_or_default() <= DefaultMaxPassCount &&
         cfg.DlssNrMultiViewScreens.value_or_default() == 0 && !gameFrameHandoff &&

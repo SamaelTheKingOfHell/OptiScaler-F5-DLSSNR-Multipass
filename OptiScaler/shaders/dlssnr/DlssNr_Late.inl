@@ -523,7 +523,11 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
     const bool supportedRoute = Late::Automatic::ConfiguredRoute(*Config::Instance(), gameFrameHandoff);
     if (!supportedRoute || !Config::Instance()->DlssNrMultiGpuAutoBalance.value_or_default())
         Late::Automatic::Configure(*Config::Instance(), desc, {}, false);
-    bool pipelineMode = Config::Instance()->DlssNrMultiGpuPipelined.value_or_default() && supportedRoute;
+    // The network split is always pipelined: its helper is slower than the game GPU on its share, so the end of the
+    // pass is recorded on the next continuation instead of the game queue waiting for it inside this frame.
+    bool pipelineMode = (Config::Instance()->DlssNrMultiGpuPipelined.value_or_default() ||
+                         Config::Instance()->DlssNrNetworkSplit.value_or_default()) &&
+                        supportedRoute;
     Worker::AdaptiveStatus::pipelineActive.store(false, std::memory_order_relaxed);
     const auto presentCompleted = [&] {
         if (pipelineMode) Late::PresentCompleted(completedPipeline, picture, queue, colorSpace);
@@ -614,8 +618,8 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
     const auto configuredPlan = Config::Instance()->DlssNrSecondaryPassMask.has_value()
         ? MultiGpu::MakePassPlanFromMask(totalPasses, Config::Instance()->DlssNrSecondaryPassMask.value(), MaxPassCount)
         : MultiGpu::MakePassPlan(totalPasses, Config::Instance()->DlssNrPrimaryPasses.value_or_default(), MaxPassCount);
-    const bool hasSecondary = balancePrimary != ~0u ? balancePrimary < totalPasses
-        : configuredPlan && configuredPlan->HasSecondary();
+    const bool hasSecondary = Config::Instance()->DlssNrNetworkSplit.value_or_default() ||
+        (balancePrimary != ~0u ? balancePrimary < totalPasses : configuredPlan && configuredPlan->HasSecondary());
     pipelineMode = pipelineMode && hasSecondary;
     workerContext.pipelineRequested = pipelineMode && !slot.residualOnly;
     if (workerContext.pipelineRequested)
@@ -640,7 +644,8 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
     }
     // Native Streamline interpolation uses an application-frame handoff even
     // when no OptiScaler FG feature is active; keep that path single-GPU too.
-    if (!slot.residualOnly && !gameFrameHandoff && Config::Instance()->DlssNrMultiGpu.value_or_default())
+    if (!slot.residualOnly && !gameFrameHandoff &&
+        (Config::Instance()->DlssNrMultiGpu.value_or_default() || Config::Instance()->DlssNrNetworkSplit.value_or_default()))
     {
         slot.ownedChain = std::make_unique<MultiGpu::OwnedCommandChain>();
         auto* realQueue = Late::RealQueue(queue);

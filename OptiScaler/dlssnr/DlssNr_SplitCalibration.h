@@ -266,29 +266,32 @@ inline bool Compute(const Layout& l, const Writes& writes, int cut, int resume, 
         const auto next = std::upper_bound(starts.begin(), starts.end(), u.offset);
         return next == starts.end() ? Block : (std::min<uint64_t>)(*next - u.offset, 1ull << 20);
     };
-    std::vector<uint8_t> scratch(blocks);
-    auto regions = [&](int k, std::vector<uint8_t>& set)
-    {
-        // Pointers inside the synchronization area count too: some carry a stage tensor's dims (kernels 76 and 77 of
-        // Preset B take one at 69632 with first-stage dims), and the area itself crosses regardless.
-        for (const auto& u : l.uses[k])
-            Detail::Mark(set, u.offset, extent(u), size);
-    };
+    // Walks only each kernel's own tensors and writes, so planning every candidate stays fast at large sizes.
+    // Pointers inside the synchronization area count too: some carry a stage tensor's dims (kernels 76 and 77 of
+    // Preset B take one at 69632 with first-stage dims), and the area itself crosses regardless.
     auto live = [&](int first, int last, const std::vector<uint8_t>* eligible)
     {
-        std::vector<uint8_t> written(blocks), needed(blocks), refs(blocks), own(blocks);
+        std::vector<uint8_t> written(blocks), needed(blocks), own(blocks);
         for (int k = first; k < last; ++k)
         {
-            std::fill(refs.begin(), refs.end(), uint8_t(0));
-            std::fill(own.begin(), own.end(), uint8_t(0));
-            regions(k, refs);
             for (const auto& [o, m] : writes[k])
                 Detail::Mark(own, o, m, size);
-            for (uint64_t b = 0; b < blocks; ++b)
-                if (refs[b] && !written[b] && !own[b] && (!eligible || (*eligible)[b]))
-                    needed[b] = 1;
-            for (uint64_t b = 0; b < blocks; ++b)
-                written[b] |= own[b];
+            for (const auto& u : l.uses[k])
+            {
+                const uint64_t end = (std::min)(u.offset + extent(u), size) / Block;
+                for (uint64_t b = u.offset / Block; b < end; ++b)
+                    if (!written[b] && !own[b] && (!eligible || (*eligible)[b]))
+                        needed[b] = 1;
+            }
+            for (const auto& [o, m] : writes[k])
+            {
+                const uint64_t end = (std::min)(o + m, size) / Block;
+                for (uint64_t b = o / Block; b < end; ++b)
+                {
+                    written[b] = 1;
+                    own[b] = 0;
+                }
+            }
         }
         return needed;
     };
@@ -314,13 +317,42 @@ inline bool Compute(const Layout& l, const Writes& writes, int cut, int resume, 
     return true;
 }
 
+// Every split the chain allows: the helper starts after a kernel that ends a synchronization group ("_wait") and
+// hands back after one, or at the post block. (cut, resume) pairs, resume <= the post block.
+inline std::vector<std::pair<int, int>> Candidates(const Layout& l)
+{
+    const int n = static_cast<int>(l.names.size());
+    int post = -1;
+    for (int i = 1; i < n && post < 0; ++i)
+        if (l.names[i].find("post_block") != std::string::npos)
+            post = i;
+    std::vector<int> waits;
+    for (int i = 1; i < post; ++i)
+        if (l.names[i].find("_wait") != std::string::npos)
+            waits.push_back(i);
+    std::vector<int> resumes;
+    for (int w : waits)
+        if (w + 1 < post)
+            resumes.push_back(w + 1);
+    if (post > 0)
+        resumes.push_back(post);
+    std::vector<std::pair<int, int>> out;
+    for (int c : waits)
+        for (int r : resumes)
+            if (r > c + 1)
+                out.push_back({ c, r });
+    return out;
+}
+
 // The plan file text, with the layout fingerprint it was calibrated on ("L"), for the cache and the owner's check.
+// Several plans may follow each other in one file (each starts with its "C" line; ParsePlans reads them).
 inline std::string Write(const Plan& plan, uint64_t fingerprint, const std::string& comment)
 {
-    std::string s = "# " + comment + "\n";
-    char line[96];
-    std::snprintf(line, sizeof line, "L %016llx\nC %d %d\nW %llu\n", (unsigned long long) fingerprint, plan.cut,
-                  plan.resume, (unsigned long long) plan.workspaceBytes);
+    std::string s = comment.empty() ? std::string() : "# " + comment + "\n";
+    char line[128];
+    std::snprintf(line, sizeof line, "C %d %d\nT %llu\nL %016llx\nW %llu\n", plan.cut, plan.resume,
+                  (unsigned long long) plan.helperMicros, (unsigned long long) fingerprint,
+                  (unsigned long long) plan.workspaceBytes);
     s += line;
     for (const auto* set : { &plan.forward, &plan.backward })
         for (const auto& r : *set)

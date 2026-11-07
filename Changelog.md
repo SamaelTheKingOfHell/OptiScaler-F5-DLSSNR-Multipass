@@ -1,3 +1,9 @@
+## 2026-11-07 — Network split chooses its share by speed (WIP)
+
+- The calibration now times every kernel on the helper GPU and writes a plan for every split the kernel chain allows (55 for Preset B). The game measures its frame period and gives the helper the largest share whose kernel time plus PCIe transfers fits in the frame, stepping down if the faster frame no longer leaves room. RTX 3060 at 2560x1440: shares from 1 to 17 ms. The ViT bottleneck (18, 60) costs 7.2 ms there and moves under 13 MiB per picture, where the old fixed cut moved 115 MiB.
+- The split has its own route now and is always pipelined; before, it could not run without `MultiGpu=true`.
+- Anthropic Claude Opus 5.5. Two new split points matched a whole evaluate on the 3060 (max 0.0034). Not run in a game.
+
 ## 2026-11-07 — Network split calibrates itself (WIP)
 
 - The network split no longer needs a plan file per resolution. The game records one evaluate to read the model's layout (workspace and synchronization area from its first kernel, tensor sizes from the launch parameters). The helper worker measures each kernel's writes on its own GPU with read-only snapshots and computes the plan, and the game uses it only if both layouts match. Plans are cached per layout. Pictures that reset history stay whole on the game GPU. The shipped 720p plan is removed.
