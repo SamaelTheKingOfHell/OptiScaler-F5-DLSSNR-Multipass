@@ -23,6 +23,7 @@ Slot* CompletePipeline()
 void PresentCompleted(Slot* source, ID3D12Resource* target, ID3D12CommandQueue* queue,
                       DXGI_COLOR_SPACE_TYPE colorSpace)
 {
+    Late::presentedPrevious = false;
     if (!source || !source->pipelinePicture || !target || !queue || source->quarantined) return;
     const auto from = source->pipelinePicture->GetDesc(), to = target->GetDesc();
     if (from.Width != to.Width || from.Height != to.Height || from.Format != to.Format ||
@@ -41,6 +42,7 @@ void PresentCompleted(Slot* source, ID3D12Resource* target, ID3D12CommandQueue* 
     {
         source->displayFence = result.fence;
         source->displayValue = result.value;
+        Late::presentedPrevious = Late::presentingPrevious;
     }
     else if (result.result != E_PENDING)
     {

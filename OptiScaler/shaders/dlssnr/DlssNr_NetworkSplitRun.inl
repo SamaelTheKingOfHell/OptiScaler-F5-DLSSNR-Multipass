@@ -134,9 +134,17 @@ void Collect(double periodMs, const DlssNr::NetworkSplit::Plan* plan)
         if (waitCount)
             std::snprintf(wait, sizeof wait, "; game GPU waited %.2f ms on average, over %.1f ms on %u of %u frames",
                           waitSum / waitCount, WaitedMs, waitedCount, waitCount);
+        // Native frame generation handed the previous frame's inputs (inputs/FG/Streamline_Delay.h), when it runs.
+        char fg[96] = "";
+        static std::pair<unsigned, unsigned> fgBefore {};
+        const auto fgNow = SlFgDelay::Counts();
+        if (fgNow != fgBefore)
+            std::snprintf(fg, sizeof fg, "; frame generation delayed on %u presents (%u failed)",
+                          fgNow.first - fgBefore.first, fgNow.second - fgBefore.second);
+        fgBefore = fgNow;
         LOG_INFO("DLSS-NR network split: frame {:.1f} ms; split pass on the game GPU {:.2f} + {:.2f} ms ({} frames){}"
-                 "{}; share ({}, {})",
-                 periodMs, head, end, splitCount, saving, wait, plan ? plan->cut : 0, plan ? plan->resume : 0);
+                 "{}{}; share ({}, {})",
+                 periodMs, head, end, splitCount, saving, wait, fg, plan ? plan->cut : 0, plan ? plan->resume : 0);
     }
     else
         LOG_INFO("DLSS-NR network split: frame {:.1f} ms; split pass whole on the game GPU {:.2f} ms ({} frames)",

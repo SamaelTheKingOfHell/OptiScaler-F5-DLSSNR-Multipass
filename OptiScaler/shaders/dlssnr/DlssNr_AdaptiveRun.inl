@@ -20,7 +20,8 @@ bool ConfiguredRoute(const Config& cfg, bool gameFrameHandoff)
         cfg.DlssNrEnabled.value_or_default() &&
         cfg.DlssNrFinishedPicture.value_or_default() && cfg.DlssNrApplyModel.value_or_default() &&
         cfg.DlssNrPasses.value_or_default() <= DefaultMaxPassCount &&
-        cfg.DlssNrMultiViewScreens.value_or_default() == 0 && !gameFrameHandoff &&
+        cfg.DlssNrMultiViewScreens.value_or_default() == 0 &&
+        (!gameFrameHandoff || cfg.DlssNrNetworkSplit.value_or_default()) &&
         State::Instance().swapchainInteropApi == SwapchainInteropApi::None && !g_multiRun && !g_nr.isPort &&
         !cfg.DlssNrRunBeforeSr.value_or_default() && !cfg.DlssNrDeferredDlss.value_or_default() &&
         !cfg.DlssNrDetailReuse.value_or_default() && !cfg.DlssNrEditCache.value_or_default() &&

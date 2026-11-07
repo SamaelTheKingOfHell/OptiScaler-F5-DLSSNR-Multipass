@@ -36,6 +36,10 @@ void RequestReset() { reset = true; ++resetVersion; }
 void FinishReset(bool ran, uint64_t atStart) { reset = !ran || resetVersion != atStart; }
 #include "DlssNr_AdaptiveRun.inl"
 Slot* pendingPipeline = nullptr;
+// Whether the picture presented at the last present was the previous frame's (a pipelined picture): native frame
+// generation then gets the previous frame's inputs too (inputs/FG/Streamline_Delay.h). `presentingPrevious` is what
+// the caller is about to present; PresentCompleted makes it the fact once the copy was submitted.
+bool presentingPrevious = false, presentedPrevious = false;
 std::unique_ptr<Worker::FinishedPicturePresenter> presenter;
 Slot* CompletePipeline();
 bool DrainPipeline();
@@ -530,7 +534,9 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
                         supportedRoute;
     Worker::AdaptiveStatus::pipelineActive.store(false, std::memory_order_relaxed);
     const auto presentCompleted = [&] {
-        if (pipelineMode) Late::PresentCompleted(completedPipeline, picture, queue, colorSpace);
+        if (!pipelineMode) return;
+        Late::presentingPrevious = completedPipeline != nullptr;
+        Late::PresentCompleted(completedPipeline, picture, queue, colorSpace);
     };
     if (!Config::Instance()->DlssNrFinishedPicture.value_or_default() ||
         !Config::Instance()->DlssNrEnabled.value_or_default())
@@ -644,7 +650,9 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
     }
     // Native Streamline interpolation uses an application-frame handoff even
     // when no OptiScaler FG feature is active; keep that path single-GPU too.
-    if (!slot.residualOnly && !gameFrameHandoff &&
+    // The Streamline handoff route stays single-GPU, except for the network split: native frame generation is then
+    // delayed to match its pipelined picture (inputs/FG/Streamline_Delay.h).
+    if (!slot.residualOnly && (!gameFrameHandoff || Config::Instance()->DlssNrNetworkSplit.value_or_default()) &&
         (Config::Instance()->DlssNrMultiGpu.value_or_default() || Config::Instance()->DlssNrNetworkSplit.value_or_default()))
     {
         slot.ownedChain = std::make_unique<MultiGpu::OwnedCommandChain>();
@@ -853,7 +861,10 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
     }
     if (!finish()) return;
     if (pipelineMode)
+    {
+        Late::presentingPrevious = completedPipeline != nullptr;
         Late::PresentCompleted(completedPipeline ? completedPipeline : &slot, picture, queue, colorSpace);
+    }
 }
 
 DXGI_COLOR_SPACE_TYPE NativeInputColourSpace(IDXGISwapChain* swapchain, DXGI_FORMAT format)
@@ -927,7 +938,7 @@ void EndStreamlinePicture(uint64_t snapshot, const char* unavailable)
     // Newer worker recordings/submissions are for a later app picture. Only expire the
     // interval selected at Begin, even if another capture arrived while DXGI was queried.
     for (auto& slot : Late::slots)
-        if (slot.serial <= snapshot)
+        if (slot.serial <= snapshot && &slot != Late::pendingPipeline) // the pipelined picture completes next frame
         {
             slot.expired = true;
             if (slot.submitted) slot.pending = false;
@@ -944,6 +955,12 @@ void EndStreamlinePicture(uint64_t snapshot, const char* unavailable)
 void ApplyToFinishedPicture(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue)
 {
     ApplyFinishedSwapchain(swapchain, queue, false);
+}
+
+bool LastPresentDelayed()
+{
+    std::lock_guard<std::recursive_mutex> lock(g_nrMutex);
+    return Late::presentedPrevious;
 }
 
 void ApplyToStreamlinePicture(IDXGISwapChain* swapchain, ID3D12Resource* picture, ID3D12CommandQueue* queue,

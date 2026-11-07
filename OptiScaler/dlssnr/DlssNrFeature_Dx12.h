@@ -108,6 +108,9 @@ void ApplyToStreamlinePicture(IDXGISwapChain* swapchain, ID3D12Resource* picture
                               uint64_t snapshot);
 // A registered runtime stopped exposing app buffers with FG off. Compose once before pass-through Present.
 void ApplyToStreamlinePassthrough(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue, uint64_t snapshot);
+// True when the last present showed the previous frame's picture (pipelined neural rendering): native frame
+// generation then needs the previous frame's inputs (inputs/FG/Streamline_Delay.h).
+bool LastPresentDelayed();
 
 // The native input producer's entry: runs DLSS-NR on the picture `color` (a back buffer in the PRESENT state, or any resource) with a depth and a motion
 // texture of the picture's size made from the depth finder and the optical flow (both NON_PIXEL_SHADER_RESOURCE, motion in

@@ -9,6 +9,7 @@
 #include <new>
 #include <framegen/dlssg/DlssgTelemetry.h>
 #include <shaders/dlssnr/DlssNr_FinishedReady.h>
+#include <inputs/FG/Streamline_Delay.h>
 
 namespace DlssNr::StreamlinePicture
 {
@@ -141,8 +142,14 @@ template <bool Local> struct Hooks
         if (cfg.DlssNrEnabled.value_or_default() && cfg.DlssNrFinishedPicture.value_or_default())
         {
             auto picture = Read(swapchain, getIndex.load(), getBuffer.load());
+            // Pipelined neural rendering presents the previous frame's picture: frame generation then needs the
+            // previous frame's inputs too (inputs/FG/Streamline_Delay.h).
+            SlFgDelay::SetEnabled(cfg.DlssNrNetworkSplit.value_or_default());
             if (picture)
+            {
                 ApplyToStreamlinePicture(swapchain, picture.Get(), queue.Get(), snapshot);
+                SlFgDelay::AtPresent(queue.Get(), LastPresentDelayed());
+            }
             else if (!GameFgMayBeRunning())
                 ApplyToStreamlinePassthrough(swapchain, queue.Get(), snapshot);
             else

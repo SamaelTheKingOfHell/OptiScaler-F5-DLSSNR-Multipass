@@ -66,6 +66,7 @@
 #include <dlssnr/worker/WorkerSplitGeneration.h>
 #include <dlssnr/DlssNr_ModelAllocations.h>
 #include <dlssnr/DlssNr_PassTimer.h>
+#include <inputs/FG/Streamline_Delay.h>
 #include <dlssnr/DlssNr_SplitCalibration.h>
 #include <fstream>
 #include <map>

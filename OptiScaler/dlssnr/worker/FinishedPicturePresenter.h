@@ -199,7 +199,10 @@ class FinishedPicturePresenter
         hr = slot.commands->Close();
         if (FAILED(hr)) { impl_->failure = out.result = hr; return out; }
         slot.source = completeSource;
-        slot.target = backbufferTarget;
+        // The back buffer is not held: its swap chain keeps it alive while the game presents, and a reference kept
+        // here until the next Submit stops the game from destroying that swap chain when it recreates it (enabling
+        // frame generation does): the new swap chain for the same window then fails with E_ACCESSDENIED.
+        slot.target.Reset();
         slot.value = impl_->nextValue++;
         slot.submitted = true;
         ID3D12CommandList* lists[] = { slot.commands.Get() };

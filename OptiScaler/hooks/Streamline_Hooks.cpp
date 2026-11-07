@@ -7,6 +7,7 @@
 #include <intrin.h>
 #include <Config.h>
 #include <dlssnr/DlssNr_StreamlinePicture.h>
+#include <inputs/FG/Streamline_Delay.h>
 
 #include <nvapi/fakenvapi.h>
 #include <misc/IdentifyGpu.h>
@@ -667,6 +668,8 @@ sl::Result StreamlineHooks::hkslSetTag(const sl::ViewportHandle& viewport, const
         }
     }
 
+    SlFgDelay::Register(o_slSetTag, o_slSetTagForFrame, o_slSetConstants);
+    SlFgDelay::OnTags(nullptr, viewport, tags, numTags, cmdBuffer);
     auto result = o_slSetTag(viewport, tags, numTags, cmdBuffer);
     return result;
 }
@@ -750,6 +753,8 @@ sl::Result StreamlineHooks::hkslSetTagForFrame(const sl::FrameToken& frame, cons
         }
     }
 
+    SlFgDelay::Register(o_slSetTag, o_slSetTagForFrame, o_slSetConstants);
+    SlFgDelay::OnTags(&frame, viewport, resources, numResources, cmdBuffer);
     auto result = o_slSetTagForFrame(frame, viewport, resources, numResources, cmdBuffer);
     return result;
 }
@@ -1302,6 +1307,8 @@ sl::Result StreamlineHooks::hkslSetConstants(const sl::Constants& values, const 
     LOG_TRACE("called with frameIndex: {}, viewport: {}", (unsigned int) frame, (unsigned int) viewport);
 
     State::Instance().slFGInputs.setConstants(values, (uint32_t) frame);
+    SlFgDelay::Register(o_slSetTag, o_slSetTagForFrame, o_slSetConstants);
+    SlFgDelay::OnConstants(values, frame, viewport);
 
     return o_slSetConstants(values, frame, viewport);
 }
