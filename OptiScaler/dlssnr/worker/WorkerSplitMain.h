@@ -61,6 +61,7 @@ struct State
     bool recording = false;
     std::vector<DlssNr::NetworkSplit::Calibration::Kernel> recorded;
     int probeIndex = 0, probeFirst = -1, probeLast = -1;
+    bool probeStarted = false; // kernels are counted from the network's synchronization clear
     uint64_t workspaceVa = 0, workspaceBytes = 0;
     std::vector<uint64_t> snaps;
     // Kernel timing: a timestamp before kernel 0 and after every kernel (each kernel finishes before the next starts).
@@ -102,6 +103,17 @@ inline int ProbeLaunch(ID3D12GraphicsCommandList* list, const CuLaunch* k, uint3
     auto& s = S();
     for (uint32_t i = 0; i < count; ++i)
     {
+        const auto named = s.names.find(k[i].hFunction);
+        if (!s.probeStarted)
+        {
+            if (named == s.names.end() || !DlssNr::NetworkSplit::Calibration::IsClear(named->second))
+            {
+                if (const int status = s.launch(list, &k[i], 1))
+                    return status;
+                continue;
+            }
+            s.probeStarted = true;
+        }
         const int index = s.probeIndex++;
         if (s.recording)
         {
@@ -137,6 +149,7 @@ inline int __cdecl Launch(ID3D12GraphicsCommandList* list, const CuLaunch* k, ui
         return ProbeLaunch(list, k, count);
     for (uint32_t i = 0; i < count; ++i)
     {
+        const auto named = s.names.find(k[i].hFunction);
         const int status = s.filter.Kernel(
             [&] { return s.launch(list, &k[i], 1); },
             [&](uint64_t dst, uint64_t src, uint64_t bytes)
@@ -158,7 +171,8 @@ inline int __cdecl Launch(ID3D12GraphicsCommandList* list, const CuLaunch* k, ui
                 D3D12_RESOURCE_BARRIER b {};
                 b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
                 list->ResourceBarrier(1, &b);
-            });
+            },
+            named != s.names.end() && DlssNr::NetworkSplit::Calibration::IsClear(named->second));
         if (status)
             return status;
     }
@@ -333,6 +347,7 @@ inline void Calibrate(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Com
         for (auto* t : { color, depth, motion })
             FillRandom(device, list, t, seed++, uploads);
         s.probeIndex = 0;
+        s.probeStarted = false;
         if (evaluateOnce(reset) != 1)
             throw std::runtime_error("Calibration evaluate failed");
         if (beforeClose)
@@ -600,6 +615,7 @@ inline int Run(ID3D12Device* device, DlssNr::MultiGpu::CrossAdapterPeer& peer, c
     s.recorded.clear();
     s.recording = true;
     s.probeIndex = 0;
+    s.probeStarted = false;
     const int found = evaluateOnce(true);
     s.recording = false;
     if (found != 1)

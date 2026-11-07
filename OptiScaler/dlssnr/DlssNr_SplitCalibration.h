@@ -100,6 +100,17 @@ inline uint64_t ClearPointer(const std::vector<Kernel>& ks)
     return p;
 }
 
+// The network part of an evaluate's launches: from the synchronization clear on. Some callers add input copies
+// before it (a game evaluate launched 82 kernels starting with cg2r_copy_kernel where the helper launched 80).
+inline bool IsClear(const std::string& name) { return name.find("cb_clear") != std::string::npos; }
+inline std::vector<Kernel> FromClear(const std::vector<Kernel>& ks)
+{
+    for (size_t i = 0; i < ks.size(); ++i)
+        if (IsClear(ks[i].name))
+            return std::vector<Kernel>(ks.begin() + i, ks.end());
+    return {};
+}
+
 // Returns false (with why) when the chain does not look like the network this was built for.
 inline bool Decode(const std::vector<Kernel>& ks, uint64_t base, uint64_t size, Layout& out, std::string& why)
 {
@@ -142,7 +153,8 @@ inline bool Decode(const std::vector<Kernel>& ks, uint64_t base, uint64_t size, 
     return true;
 }
 
-// FNV-1a over names, pointer offsets, dims and sizes: equal fingerprints mean equal workspace layouts.
+// FNV-1a over names, pointer offsets, dims and sizes, from the clear through the post block (output copies after it
+// may differ between callers): equal fingerprints mean equal workspace layouts.
 inline uint64_t Fingerprint(const Layout& l)
 {
     uint64_t h = 1469598103934665603ull;
@@ -165,6 +177,8 @@ inline uint64_t Fingerprint(const Layout& l)
             mix(&u.h, 4);
             mix(&u.w, 4);
         }
+        if (k > 0 && l.names[k].find("post_block") != std::string::npos)
+            break;
     }
     return h;
 }

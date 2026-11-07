@@ -200,6 +200,7 @@ class Filter
     const Plan* plan_ = nullptr;
     uint64_t workspace_ = 0, forward_ = 0, backward_ = 0;
     int index_ = 0;
+    bool started_ = false; // the network's first kernel (the synchronization clear) has been seen
     bool forwardDone_ = false, backwardDone_ = false;
 
     template<class Copy, class Barrier>
@@ -227,6 +228,7 @@ class Filter
         backward_ = backwardStaging;
         index_ = 0;
         forwardDone_ = backwardDone_ = false;
+        started_ = false;
     }
     Role Active() const { return role_; }
     // True when this evaluate recorded every transfer its role owes (a shorter kernel chain than calibrated is not).
@@ -240,8 +242,17 @@ class Filter
     }
     // Handles one kernel of the evaluate. `launch()` sends the kernel; `copy(dst, src, bytes)` records a copy;
     // `barrier()` records a UAV barrier. Returns the first nonzero status.
-    template<class Launch, class Copy, class Barrier> int Kernel(Launch launch, Copy copy, Barrier barrier)
+    // `clear`: this launch is the network's synchronization clear (cc_cb_clear). Kernels are counted from it; launches
+    // before it (input copies some callers add) always go out unchanged.
+    template<class Launch, class Copy, class Barrier>
+    int Kernel(Launch launch, Copy copy, Barrier barrier, bool clear = true)
     {
+        if (!started_)
+        {
+            if (!clear)
+                return launch();
+            started_ = true;
+        }
         const int i = index_++;
         if (role_ == Role::Off)
             return launch();

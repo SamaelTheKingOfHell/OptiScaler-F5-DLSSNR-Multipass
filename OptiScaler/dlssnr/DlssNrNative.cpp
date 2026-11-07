@@ -162,13 +162,15 @@ bool VitDrop(State&s,const NVAPI_CU_KERNEL_LAUNCH_PARAMS*k,NvU32 count,std::vect
 NVDX_ObjectHandle CopyKernel(State&s,ID3D12Device*dev){auto&k=s.vitCopyFn[dev];if(k.failed)return nullptr;
  if(!k.fn){k.device=dev;NVDX_ObjectHandle m=nullptr;if(!s.createModule||!s.createFunction||s.createModule(dev,DlssNrVitCopyKernel::fatbin,(NvU32)sizeof DlssNrVitCopyKernel::fatbin,&m)!=NVAPI_OK||s.createFunction(dev,m,"nr_vit_copy16",&k.fn)!=NVAPI_OK){if(m&&s.destroyModule)s.destroyModule(dev,m);k.fn=nullptr;k.failed=true;return nullptr;}s.fnInfo[k.fn]=DlssNrKernelProfile::Classify("nr_vit_copy16");}
  return k.fn;}
+// The network's synchronization clear: kernels are counted from it (a game evaluate may launch input copies first).
+bool ClearKernel(State&s,NVDX_ObjectHandle f){auto it=s.fnInfo.find(f);return it!=s.fnInfo.end()&&DlssNr::NetworkSplit::Calibration::IsClear(it->second.name);}
 // Network split: each kernel of the chain through the filter, one launch at a time; transfers use the copy kernel.
 NvAPI_Status SplitLaunch(State&s,ID3D12GraphicsCommandList*c,const NVAPI_CU_KERNEL_LAUNCH_PARAMS*k,NvU32 count){
  ComPtr<ID3D12Device>dev;if(FAILED(c->GetDevice(IID_PPV_ARGS(&dev)))){s.splitFailed=true;return NVAPI_ERROR;}
  for(NvU32 i=0;i<count;++i){const int rc=s.split.Kernel([&]{return (int)RealLaunch(s,c,&k[i],1);},
    [&](uint64_t dst,uint64_t src,uint64_t bytes){const NVDX_ObjectHandle fn=CopyKernel(s,dev.Get());if(!fn){s.splitFailed=true;return (int)NVAPI_ERROR;}
     const uint64_t n=bytes/16;struct Params{uint64_t dst,src,n;}p{dst,src,n};NVAPI_CU_KERNEL_LAUNCH_PARAMS l{};l.hFunction=fn;l.gridDim={(unsigned)std::min<uint64_t>((n+255)/256,1024),1,1};l.blockDim={256,1,1};l.pParams=&p;l.paramSize=sizeof p;return (int)RealLaunch(s,c,&l,1);},
-   [&]{Barrier(c);});
+   [&]{Barrier(c);},ClearKernel(s,k[i].hFunction));
   if(rc){s.splitFailed=true;return (NvAPI_Status)rc;}}
  return NVAPI_OK;}
 // DlssNrVitReuse::CheckOutput says where its 2-D output is and how big. Returns why it could not, or nullptr.

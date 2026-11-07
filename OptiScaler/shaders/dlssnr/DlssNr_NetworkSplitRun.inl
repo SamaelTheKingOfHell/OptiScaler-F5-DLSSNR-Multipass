@@ -107,20 +107,25 @@ bool NeedsRecord(const void* feature)
     const auto it = features.find(feature);
     return it != features.end() && !it->second.recorded;
 }
-void Recorded(const void* feature, const std::vector<Cal::Kernel>& kernels)
+void Recorded(const void* feature, const std::vector<Cal::Kernel>& launches)
 {
     const auto it = features.find(feature);
     if (it == features.end())
         return;
     auto& f = it->second;
     f.recorded = true;
+    // The network starts at its synchronization clear; the game's evaluate may launch input copies before it.
+    const auto kernels = Cal::FromClear(launches);
+    if (kernels.size() != launches.size())
+        LOG_INFO("DLSS-NR network split: {} launches before the network's first kernel run unchanged",
+                 launches.size() - kernels.size());
     const uint64_t clear = Cal::ClearPointer(kernels);
     f.workspace = DlssNr::ModelAllocations::StartingAt(clear);
     Cal::Layout layout;
     const auto [live, allocated] = DlssNr::ModelAllocations::Counts();
-    std::string why = !clear ? "the first of " + std::to_string(kernels.size()) +
-                                   " kernels is not the synchronization clear (" +
-                                   (kernels.empty() ? std::string("none") : kernels[0].name) + ")"
+    std::string why = !clear ? "none of the " + std::to_string(launches.size()) +
+                                   " launches is the synchronization clear (first: " +
+                                   (launches.empty() ? std::string("none") : launches[0].name) + ")"
                              : "no model buffer starts where the first kernel clears (" + std::to_string(live) +
                                    " live buffers, " + std::to_string(allocated) +
                                    " allocations through the callback)";
