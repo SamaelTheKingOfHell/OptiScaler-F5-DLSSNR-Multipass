@@ -30,6 +30,7 @@
 #include "DlssNrVitCopyKernel.h"
 #include "DlssNrKernelProfile.h"
 #include "DlssNr_NetworkSplit.h"
+#include "DlssNr_SplitCalibration.h"
 #pragma comment(lib,"bcrypt.lib")
 namespace DlssNrNative {namespace {
 namespace fs=std::filesystem;using Microsoft::WRL::ComPtr;void Check(HRESULT r){if(FAILED(r))throw std::runtime_error("D3D12 status "+std::to_string((unsigned)r));}void NvCheck(NvAPI_Status r){if(r!=NVAPI_OK)throw std::runtime_error("NVAPI status "+std::to_string(r));}
@@ -74,6 +75,8 @@ struct State{std::recursive_mutex mutex;bool enabled=false,candidate=false,resta
  struct VitCopyKernel{ComPtr<ID3D12Device>device;NVDX_ObjectHandle fn=nullptr;bool failed=false;};std::map<ID3D12Device*,VitCopyKernel>vitCopyFn;std::vector<Buffer>vitRetired;
  // Network split: the role of the evaluate being recorded on splitList (other lists, e.g. the game's own DLSS, pass untouched).
  DlssNr::NetworkSplit::Filter split;ID3D12GraphicsCommandList*splitList=nullptr;bool splitFailed=false;
+ // Split calibration: the launches of one evaluate on recordList, as the model issued them (before ViT reuse or the hybrid path).
+ ID3D12GraphicsCommandList*recordList=nullptr;std::vector<DlssNr::NetworkSplit::Calibration::Kernel>recorded;
  decltype(&NvAPI_D3D12_CreateCuModule) createModule=nullptr;decltype(&NvAPI_D3D12_CreateCuFunction)createFunction=nullptr;decltype(&NvAPI_D3D12_LaunchCuKernelChain)launch=nullptr;
  decltype(&NvAPI_D3D12_DestroyCuModule)destroyModule=nullptr;decltype(&NvAPI_D3D12_DestroyCuFunction)destroyFunction=nullptr;};
 // Deliberately retain resources until process exit, never free under recorded GPU work.
@@ -182,6 +185,7 @@ const char* VitCopyRecord(State&s,ID3D12GraphicsCommandList*c,DlssNrVitReuse::Co
  catch(const std::exception&){return "the copy could not be recorded";}
  return nullptr;}
 NvAPI_Status __cdecl Launch(ID3D12GraphicsCommandList*c,const NVAPI_CU_KERNEL_LAUNCH_PARAMS*k,NvU32 count){auto&s=S();std::lock_guard<std::recursive_mutex>g(s.mutex);
+ if(c&&c==s.recordList&&k)for(NvU32 i=0;i<count;++i){auto it=s.fnInfo.find(k[i].hFunction);auto*p=static_cast<const uint8_t*>(k[i].pParams);s.recorded.push_back({it!=s.fnInfo.end()?it->second.name:std::string(),p?std::vector<uint8_t>(p,p+k[i].paramSize):std::vector<uint8_t>()});}
  if(c&&c==s.splitList&&s.split.Active()!=DlssNr::NetworkSplit::Role::Off)return SplitLaunch(s,c,k,count);
  // A UAV barrier where the skipped run would have been: without it the kernel before the gap and the one after it can overlap on the
  // GPU. The run's own kernels kept them apart. On the plain set the kernel after it is the run's kept last kernel (see DlssNrVitReuse.h).
@@ -264,6 +268,8 @@ void BeginEvaluate(const void*feature,bool reset,unsigned every,unsigned everyPl
 bool EndEvaluate(ID3D12GraphicsCommandList*cmd){auto&s=S();std::lock_guard<std::recursive_mutex>g(s.mutex);s.prof.End(cmd);const bool wasOff=s.vit.Disabled();const bool wellFormed=s.vit.End();return (!wellFormed||s.vit.Disabled())&&!wasOff;}
 void BeginSplitEvaluate(ID3D12GraphicsCommandList*cmd,int role,const DlssNr::NetworkSplit::Plan*plan,uint64_t workspace,uint64_t forwardStaging,uint64_t backwardStaging){auto&s=S();std::lock_guard<std::recursive_mutex>g(s.mutex);s.splitList=cmd;s.splitFailed=false;s.split.Begin((DlssNr::NetworkSplit::Role)role,plan,workspace,forwardStaging,backwardStaging);}
 bool EndSplitEvaluate(){auto&s=S();std::lock_guard<std::recursive_mutex>g(s.mutex);const bool complete=s.split.End();s.splitList=nullptr;return complete&&!s.splitFailed;}
+void BeginRecord(ID3D12GraphicsCommandList*cmd){auto&s=S();std::lock_guard<std::recursive_mutex>g(s.mutex);s.recordList=cmd;s.recorded.clear();}
+std::vector<DlssNr::NetworkSplit::Calibration::Kernel> EndRecord(){auto&s=S();std::lock_guard<std::recursive_mutex>g(s.mutex);s.recordList=nullptr;return std::move(s.recorded);}
 std::vector<std::string> TakeProfileReports(){auto&s=S();std::lock_guard<std::recursive_mutex>g(s.mutex);return s.prof.TakeReports();}
 std::string VitStatus(){auto&s=S();std::lock_guard<std::recursive_mutex>g(s.mutex);return s.vit.Status();}
 bool VitPlainKernels(){return S().vit.LastSet()==DlssNrVitReuse::KernelSet::Plain;}

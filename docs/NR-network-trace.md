@@ -367,3 +367,47 @@ The two-evaluate design is now built into the renderer and the worker. It is off
 
 Not verified yet: anything in a game (frame rate, image, the pipelined resume), plans for other model sizes, and the
 behaviour when the game rebuilds features mid-session.
+
+## Self-calibrating split (2026-11-07)
+
+Plan files per resolution are gone from the default path. The split now works out its plan for whatever model is
+running (`OptiScaler/dlssnr/DlssNr_SplitCalibration.h`):
+
+- **Layout.** One ordinary evaluate of the split pass is recorded on the game GPU (function name and parameter block per
+  launch, before ViT reuse touches them). Kernel 0 (`cc_cb_clear`) names the workspace (the buffer it clears from) and
+  the synchronization area (its count of 32-bit words: 86016 bytes at 1280x720, 211456 at 2560x1440). Tensor extents
+  come from the stage dims that follow each pointer. A fingerprint of the layout lets two instances be compared.
+- **Writes.** The helper worker (`wire.split.cut = -1`) measures what each kernel writes on its own GPU: whole evaluates
+  on fresh random inputs, with a read-only workspace snapshot after every kernel of a window (as many as fit in about
+  1.5 GiB; windows overlap by one kernel for the baseline). All 386 measured writes in the 720p traces start at one of
+  the kernel's own pointer arguments.
+- **Cut.** After the last `_wait` kernel of the leading `tinlayout` stages, up to the post block. For Preset B this is
+  (9, 78) at both sizes tested.
+- **Plan.** Block liveness as before. Forward data may be a superset (the helper overwrites or reads it); backward data
+  is limited to blocks the helper measurably changed, because a returned block replaces the game GPU's own. Pointers
+  inside the synchronization area count with their extents (kernels 76 and 77 take one at 69632 with first-stage dims).
+- **Checks.** The game uses a helper plan only when the helper's layout fingerprint equals its own. Plans are cached in
+  `%LOCALAPPDATA%\OptiScaler\NR-Split\<fingerprint>-<helper runtime size>.txt`. Reset pictures stay whole on the game
+  GPU: with the end evaluate not reset, the reset picture differed (max 0.011), and a reset evaluate's kernel chain was
+  not verified to match the calibrated one.
+
+Results (RTX 3060, Ampere Preset B runtime):
+
+| | 1280x720 | 2560x1440 |
+|---|---|---|
+| calibration time | 6.3 s | 12.6 s |
+| workspace | 69488640 | 248429056 |
+| cut, resume | 9, 78 | 9, 78 |
+| forward / backward per picture | 23.6 / 8.0 MiB | 85.9 / 29.0 MiB |
+
+- The C++ core reproduces the validated 720p plan with no byte missing and no extra byte outside the synchronization
+  area (`tests/nr_split_calibration.cpp`). The worker's own 720p calibration produced the same ranges.
+- The 1440p plan, run on the RTX 3060 alone (owner and helper instances on one GPU, `SPLICE_PLAN`), matched a whole
+  evaluate within the two-evaluate residue on non-reset pictures: max 0.0029, mean 0.00027 (unsplit with an extra
+  evaluate: max 0.0029, mean 0.00034).
+- The 5070 Ti and 3060 traces at 720p give the same fingerprint, so the game runtime and the Ampere runtime share the
+  layout there.
+
+Open: cut 9 gives the helper about 90 percent of the network. On the RTX 3060 at 1440p that is far slower than the
+game GPU's whole pass, so the cut needs to follow the helper's measured speed (and transfer volume) before this can
+raise frame rates. Not yet run in a game.

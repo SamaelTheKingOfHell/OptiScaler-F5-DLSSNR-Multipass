@@ -199,7 +199,7 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
     Check(DlssNr::MultiGpu::CrossAdapterPeer::Open(device.Get(), wire.primary, wire.secondary, wire.bytes, heap.value,
                                                    ready.value, done.value, peer),
           "Worker open handles");
-    if (wire.split.cut > 0)
+    if (wire.split.cut != 0)
         return SplitWorker::Run(device.Get(), peer, wire,
                                 [&](void* buffer, DWORD bytes) { return readExact(buffer, bytes); }, parent.value,
                                 initialized.value, core, forwarder, model, data);

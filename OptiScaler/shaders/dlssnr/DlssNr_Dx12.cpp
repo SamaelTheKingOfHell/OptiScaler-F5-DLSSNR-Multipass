@@ -65,6 +65,7 @@
 #include <dlssnr/worker/WorkerGeneration.h>
 #include <dlssnr/worker/WorkerSplitGeneration.h>
 #include <dlssnr/DlssNr_ModelAllocations.h>
+#include <dlssnr/DlssNr_SplitCalibration.h>
 #include <fstream>
 #include <map>
 #include <dlssnr/worker/WorkerStatus.h>
@@ -5986,13 +5987,15 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                 evalMvScaleY);
         };
         // Network split of this pass: Head here, the middle on the helper, End here once its tensors are back.
-        const auto splitWorkspace = splitEligible && pass == splitPass ? NetworkSplitRun::WorkspaceOf(passFeature)
-                                                                       : DlssNr::ModelAllocations::Workspace {};
+        // Reset pictures (scene cuts) stay whole: a reset evaluate is not the chain the plan was calibrated on.
+        const bool splitThisPass = splitEligible && pass == splitPass && !passReset;
+        const bool recordSplit = splitThisPass && NetworkSplitRun::NeedsRecord(passFeature);
+        const auto splitWorkspace = splitThisPass ? NetworkSplitRun::WorkspaceOf(passFeature)
+                                                  : DlssNr::ModelAllocations::Workspace {};
         std::shared_ptr<DlssNr::Worker::SplitGeneration> splitGeneration;
         if (splitWorkspace.address)
-            splitGeneration = NetworkSplitRun::Prepare(device, cfg, pass, modelWidth, modelHeight,
-                                                       splitWorkspace.bytes);
-        else if (splitEligible && pass == splitPass)
+            splitGeneration = NetworkSplitRun::Prepare(device, cfg, pass, modelWidth, modelHeight, passFeature);
+        else if (splitThisPass && NetworkSplitRun::KnownWithoutBuffers(passFeature))
         {
             static bool told = false;
             if (!told)
@@ -6080,6 +6083,8 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
         }
         if (!splitDone)
         {
+            if (recordSplit)
+                DlssNrNative::BeginRecord(cmdList);
             DlssNrNative::BeginEvaluate(passFeature, passReset,
                                         vitEveryFrame ? 1u : std::clamp(cfg.DlssNrVitEvery.value_or_default(), 1u, 2u),
                                         vitEveryFrame ? 1u : std::clamp(cfg.DlssNrVitEveryPlain.value_or_default(), 1u, 2u),
@@ -6088,6 +6093,8 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
             result = EvaluatePass(cmdList, passReset);
             if (DlssNrNative::EndEvaluate(cmdList))
                 LOG_WARN("DLSS-NR: Reuse bottleneck is {}", DlssNrNative::VitStatus());
+            if (recordSplit)
+                NetworkSplitRun::Recorded(passFeature, DlssNrNative::EndRecord());
         }
 
         for (const std::string& report : DlssNrNative::TakeProfileReports())

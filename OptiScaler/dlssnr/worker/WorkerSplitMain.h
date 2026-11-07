@@ -12,11 +12,15 @@
 // Included by WorkerMain.cpp only.
 
 #include "../DlssNr_NetworkSplit.h"
+#include "../DlssNr_SplitCalibration.h"
 #include "../DlssNrVitCopyKernel.h"
 #pragma warning(push, 0)
 #include <detours/detours.h>
 #pragma warning(pop)
 #include <functional>
+#include <fstream>
+#include <map>
+#include <random>
 
 namespace SplitWorker
 {
@@ -51,6 +55,14 @@ struct State
     PFN_Launch launch = nullptr;
     Filter filter;
     NvHandle copy = nullptr;
+    // Calibration (wire.split.cut < 0): every kernel's name; the chain of one evaluate; a workspace snapshot after each
+    // kernel of [probeFirst, probeLast] (read-only copies into snaps).
+    std::map<NvHandle, std::string> names;
+    bool recording = false;
+    std::vector<DlssNr::NetworkSplit::Calibration::Kernel> recorded;
+    int probeIndex = 0, probeFirst = -1, probeLast = -1;
+    uint64_t workspaceVa = 0, workspaceBytes = 0;
+    std::vector<uint64_t> snaps;
     // Model allocations made while creating our single feature: the smallest writable buffer is its workspace.
     ID3D12Device* device = nullptr;
     std::vector<std::pair<ComPtr<ID3D12Resource>, D3D12_RESOURCE_DESC>> allocations;
@@ -61,9 +73,59 @@ inline State& S()
     return s;
 }
 
+inline int CopyLaunch(ID3D12GraphicsCommandList* list, uint64_t dst, uint64_t src, uint64_t bytes)
+{
+    auto& s = S();
+    struct
+    {
+        uint64_t dst, src, n;
+    } p { dst, src, bytes / 16 };
+    CuLaunch c {};
+    c.hFunction = s.copy;
+    c.gridDim = { static_cast<uint32_t>((std::min<uint64_t>)((p.n + 255) / 256, 1024)), 1, 1 };
+    c.blockDim = { 256, 1, 1 };
+    c.pParams = &p;
+    c.paramSize = static_cast<uint32_t>(sizeof(p));
+    return s.launch(list, &c, 1);
+}
+inline void UavBarrier(ID3D12GraphicsCommandList* list)
+{
+    D3D12_RESOURCE_BARRIER b {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    list->ResourceBarrier(1, &b);
+}
+// Calibration launches: each kernel unchanged, recorded, and followed by a snapshot when inside the probe window.
+inline int ProbeLaunch(ID3D12GraphicsCommandList* list, const CuLaunch* k, uint32_t count)
+{
+    auto& s = S();
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const int index = s.probeIndex++;
+        if (s.recording)
+        {
+            const auto name = s.names.find(k[i].hFunction);
+            const auto* p = static_cast<const uint8_t*>(k[i].pParams);
+            s.recorded.push_back({ name == s.names.end() ? std::string() : name->second,
+                                   std::vector<uint8_t>(p, p + k[i].paramSize) });
+        }
+        if (const int status = s.launch(list, &k[i], 1))
+            return status;
+        if (index >= s.probeFirst && index <= s.probeLast && size_t(index - s.probeFirst) < s.snaps.size())
+        {
+            UavBarrier(list);
+            if (const int status = CopyLaunch(list, s.snaps[index - s.probeFirst], s.workspaceVa, s.workspaceBytes))
+                return status;
+            UavBarrier(list);
+        }
+    }
+    return 0;
+}
+
 inline int __cdecl Launch(ID3D12GraphicsCommandList* list, const CuLaunch* k, uint32_t count)
 {
     auto& s = S();
+    if (s.recording || s.probeFirst >= 0)
+        return ProbeLaunch(list, k, count);
     for (uint32_t i = 0; i < count; ++i)
     {
         const int status = s.filter.Kernel(
@@ -93,6 +155,14 @@ inline int __cdecl Launch(ID3D12GraphicsCommandList* list, const CuLaunch* k, ui
     }
     return 0;
 }
+inline int __cdecl CreateFunctionNamed(ID3D12Device* device, NvHandle module, const char* name, NvHandle* out)
+{
+    auto& s = S();
+    const int status = s.createFunction(device, module, name, out);
+    if (status == 0 && out && *out && name)
+        s.names[*out] = name;
+    return status;
+}
 inline void* __cdecl Query(unsigned id)
 {
     auto& s = S();
@@ -106,7 +176,7 @@ inline void* __cdecl Query(unsigned id)
         return raw;
     case 0xe2436e22:
         s.createFunction = reinterpret_cast<PFN_CreateFunction>(raw);
-        return raw;
+        return reinterpret_cast<void*>(&CreateFunctionNamed);
     case 0x24973538:
         s.launch = reinterpret_cast<PFN_Launch>(raw);
         return reinterpret_cast<void*>(&Launch);
@@ -187,15 +257,182 @@ using EvaluateFeature = int (*)(ID3D12GraphicsCommandList*, void*, void*, ID3D12
                                 unsigned, unsigned, unsigned, unsigned, unsigned, int, int, float, int, float, float,
                                 float, int, float, float);
 
+// Fills a texture with pseudo-random values of its format (half floats in [0.06, 1), floats in [0, 1)), so each
+// calibration evaluate recomputes every tensor to different bytes than the ones it overwrites.
+inline void FillRandom(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* texture, uint32_t seed,
+                       std::vector<ComPtr<ID3D12Resource>>& keep)
+{
+    const auto desc = texture->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
+    UINT rows = 0;
+    UINT64 rowBytes = 0, total = 0;
+    device->GetCopyableFootprints(&desc, 0, 1, 0, &fp, &rows, &rowBytes, &total);
+    auto upload = Buffer(device, total, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+    uint8_t* mapped = nullptr;
+    Check(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped)), "Map calibration upload");
+    std::mt19937 rng(seed);
+    for (UINT y = 0; y < rows; ++y)
+    {
+        uint8_t* row = mapped + fp.Offset + uint64_t(y) * fp.Footprint.RowPitch;
+        if (desc.Format == DXGI_FORMAT_R32_FLOAT)
+            for (UINT64 x = 0; x + 4 <= rowBytes; x += 4)
+            {
+                const float v = float(rng() % 1000000) / 1000000.0f;
+                std::memcpy(row + x, &v, 4);
+            }
+        else
+            for (UINT64 x = 0; x + 2 <= rowBytes; x += 2)
+            {
+                const uint16_t v = static_cast<uint16_t>(0x2C00 + rng() % (0x3BFF - 0x2C00));
+                std::memcpy(row + x, &v, 2);
+            }
+    }
+    upload->Unmap(0, nullptr);
+    D3D12_TEXTURE_COPY_LOCATION dst {}, src {};
+    dst.pResource = texture;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.pResource = upload.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint = fp;
+    Transition(list, texture, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    Transition(list, texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    keep.push_back(upload);
+}
+
+// Calibration (DlssNr_SplitCalibration.h), all read-only on this GPU: one recorded evaluate gives the chain and the
+// workspace layout; then whole evaluates, each on fresh random inputs, snapshot the workspace after every kernel of a
+// window (as many snapshots as fit in about 1.5 GiB; the window's first kernel is the baseline of the next), and the
+// changed 256-byte blocks between consecutive snapshots are each kernel's writes. The plan goes to planPath with the
+// layout fingerprint, for the owner to check against its own layout.
+template<class Retire, class Evaluate>
+inline void Calibrate(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12CommandAllocator* alloc,
+                      ID3D12GraphicsCommandList* list, Retire& retire, const Evaluate& evaluateOnce,
+                      ID3D12Resource* color, ID3D12Resource* depth, ID3D12Resource* motion,
+                      ID3D12Resource* workspace, uint64_t workspaceBytes, const std::wstring& planPath)
+{
+    namespace Cal = DlssNr::NetworkSplit::Calibration;
+    auto& s = S();
+    s.workspaceVa = workspace->GetGPUVirtualAddress();
+    s.workspaceBytes = workspaceBytes;
+    uint32_t seed = 1;
+    const auto run = [&](bool reset)
+    {
+        std::vector<ComPtr<ID3D12Resource>> uploads;
+        Check(alloc->Reset(), "Reset calibration allocator");
+        Check(list->Reset(alloc, nullptr), "Reset calibration list");
+        for (auto* t : { color, depth, motion })
+            FillRandom(device, list, t, seed++, uploads);
+        s.probeIndex = 0;
+        if (evaluateOnce(reset) != 1)
+            throw std::runtime_error("Calibration evaluate failed");
+        Check(list->Close(), "Close calibration list");
+        ID3D12CommandList* lists[] = { list };
+        queue->ExecuteCommandLists(1, lists);
+        retire();
+    };
+    run(true); // warm-up
+    s.recorded.clear();
+    s.recording = true;
+    run(false);
+    s.recording = false;
+    const auto kernels = s.recorded;
+    Cal::Layout layout;
+    std::string why;
+    int cut = 0, resume = 0;
+    if (!Cal::Decode(kernels, s.workspaceVa, workspaceBytes, layout, why) || !Cal::ChooseCut(layout, cut, resume, why))
+        throw std::runtime_error("Calibration: " + why);
+
+    const uint64_t budget = 1536ull << 20;
+    const size_t window = (std::max<size_t>)(2, (std::min<size_t>)(kernels.size(), size_t(budget / workspaceBytes)));
+    std::vector<ComPtr<ID3D12Resource>> snaps;
+    for (size_t i = 0; i < window; ++i)
+    {
+        snaps.push_back(Buffer(device, workspaceBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               true));
+        s.snaps.push_back(snaps.back()->GetGPUVirtualAddress());
+    }
+    auto readback = Buffer(device, workspaceBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false);
+    std::vector<uint8_t> previous(workspaceBytes), current(workspaceBytes);
+    const auto read = [&](ID3D12Resource* snap, std::vector<uint8_t>& host)
+    {
+        Check(alloc->Reset(), "Reset calibration allocator");
+        Check(list->Reset(alloc, nullptr), "Reset calibration list");
+        Transition(list, snap, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyBufferRegion(readback.Get(), 0, snap, 0, workspaceBytes);
+        Transition(list, snap, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Check(list->Close(), "Close calibration readback");
+        ID3D12CommandList* lists[] = { list };
+        queue->ExecuteCommandLists(1, lists);
+        retire();
+        void* mapped = nullptr;
+        const D3D12_RANGE range { 0, static_cast<SIZE_T>(workspaceBytes) };
+        Check(readback->Map(0, &range, &mapped), "Map calibration readback");
+        std::memcpy(host.data(), mapped, workspaceBytes);
+        const D3D12_RANGE none { 0, 0 };
+        readback->Unmap(0, &none);
+    };
+    Cal::Writes writes(kernels.size());
+    const int last = static_cast<int>(kernels.size()) - 1;
+    for (int first = 0; first < last;)
+    {
+        s.probeFirst = first;
+        s.probeLast = (std::min)(last, first + static_cast<int>(window) - 1);
+        run(false);
+        if (s.probeIndex != static_cast<int>(kernels.size()))
+            throw std::runtime_error("Calibration: the kernel chain changed between evaluates");
+        read(snaps[0].Get(), previous);
+        for (int k = first + 1; k <= s.probeLast; ++k)
+        {
+            read(snaps[k - first].Get(), current);
+            for (uint64_t b = 0; b < workspaceBytes / Cal::Block;)
+            {
+                const auto changed = [&](uint64_t x)
+                { return std::memcmp(&previous[x * Cal::Block], &current[x * Cal::Block], Cal::Block) != 0; };
+                if (!changed(b))
+                {
+                    ++b;
+                    continue;
+                }
+                uint64_t e = b;
+                while (e < workspaceBytes / Cal::Block && changed(e))
+                    ++e;
+                writes[k].push_back({ b * Cal::Block, (e - b) * Cal::Block });
+                b = e;
+            }
+            std::swap(previous, current);
+        }
+        std::cerr << "Split calibration: kernels " << first + 1 << ".." << s.probeLast << " measured\n" << std::flush;
+        first = s.probeLast;
+    }
+    s.probeFirst = s.probeLast = -1;
+    s.snaps.clear();
+
+    Plan plan;
+    if (!Cal::Compute(layout, writes, cut, resume, plan, why))
+        throw std::runtime_error("Calibration: " + why);
+    const uint64_t fingerprint = Cal::Fingerprint(layout);
+    std::ofstream out(planPath, std::ios::trunc);
+    out << Cal::Write(plan, fingerprint,
+                      "calibrated by the helper: " + std::to_string(kernels.size()) + " kernels, workspace " +
+                          std::to_string(workspaceBytes) + " bytes");
+    if (!out)
+        throw std::runtime_error("Calibration: the plan could not be written");
+    std::cerr << "Split calibration: cut " << cut << ", resume " << resume << ", forward " << plan.forwardBytes
+              << " bytes, backward " << plan.backwardBytes << " bytes, layout " << std::hex << fingerprint << std::dec
+              << "\n" << std::flush;
+}
+
 // Runs the helper's segment for every frame the owner sends. Returns the process exit code.
 inline int Run(ID3D12Device* device, DlssNr::MultiGpu::CrossAdapterPeer& peer, const InitialFrameWire& wire,
                const std::function<bool(void*, DWORD)>& readExact, HANDLE parent, HANDLE initialized,
                const wchar_t* corePath, const wchar_t* forwarderPath, const wchar_t* modelPath,
                const wchar_t* dataPath)
 {
+    const bool calibrate = wire.split.cut < 0;
     Plan plan;
-    if (!DlssNr::NetworkSplit::FromWire(wire.split, plan) ||
-        plan.forwardBytes + plan.backwardBytes > wire.bytes)
+    if (!calibrate && (!DlssNr::NetworkSplit::FromWire(wire.split, plan) ||
+                       plan.forwardBytes + plan.backwardBytes > wire.bytes))
         throw std::runtime_error("Invalid network split plan");
     auto& s = S();
     s.device = device;
@@ -288,16 +525,71 @@ inline int Run(ID3D12Device* device, DlssNr::MultiGpu::CrossAdapterPeer& peer, c
     queue->ExecuteCommandLists(1, lists);
     retire();
 
+    const auto evaluateOnce = [&](bool reset)
+    {
+        return evaluate(list.Get(), feature, params, color.Get(), depth.Get(), motion.Get(), output.Get(), w, h, w, h,
+                        w, h, 0, 0, 0, 0, 0, reset ? 1 : 0, tune.intensity, tune.style, tune.structure, tune.tone,
+                        tune.skin, tune.autoMask, 1.0f, 1.0f);
+    };
+    // The workspace is the buffer kernel 0 (cc_cb_clear) clears from, found from one recorded evaluate. (The smallest
+    // writable buffer is not it at every size.)
+    Check(alloc->Reset(), "Reset split allocator");
+    Check(list->Reset(alloc.Get(), nullptr), "Reset split list");
+    s.recorded.clear();
+    s.recording = true;
+    s.probeIndex = 0;
+    const int found = evaluateOnce(true);
+    s.recording = false;
+    if (found != 1)
+        throw std::runtime_error("Split worker workspace evaluate failed");
+    Check(list->Close(), "Close split workspace evaluate");
+    queue->ExecuteCommandLists(1, lists);
+    retire();
+    const uint64_t clear = DlssNr::NetworkSplit::Calibration::ClearPointer(s.recorded);
     const D3D12_RESOURCE_DESC* workspace = nullptr;
     ID3D12Resource* workspaceResource = nullptr;
     for (const auto& [resource, desc] : s.allocations)
-        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
-            (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && (!workspace || desc.Width < workspace->Width))
+    {
+        const uint64_t va = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? resource->GetGPUVirtualAddress() : 0;
+        if (va && clear >= va && clear < va + desc.Width)
         {
             workspace = &desc;
             workspaceResource = resource.Get();
         }
-    if (!workspace || !plan.Fits(workspace->Width))
+    }
+    if (!workspace || clear != workspaceResource->GetGPUVirtualAddress())
+    {
+        std::cerr << "Split worker: kernel 0 clears from 0x" << std::hex << clear << std::dec << "; buffers:";
+        for (const auto& [resource, desc] : s.allocations)
+            if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+                std::cerr << " 0x" << std::hex << resource->GetGPUVirtualAddress() << std::dec << "+" << desc.Width;
+        std::cerr << "\n" << std::flush;
+        throw std::runtime_error("The model workspace was not found");
+    }
+    if (calibrate)
+    {
+        NvHandle copyModule = nullptr;
+        if (!s.createModule || !s.createFunction ||
+            s.createModule(device, DlssNrVitCopyKernel::fatbin,
+                           static_cast<uint32_t>(sizeof(DlssNrVitCopyKernel::fatbin)), &copyModule) != 0 ||
+            s.createFunction(device, copyModule, "nr_vit_copy16", &s.copy) != 0)
+            throw std::runtime_error("Copy kernel unavailable");
+        const std::wstring planPath = std::wstring(dataPath) + L"\\split-plan.txt";
+        Calibrate(device, queue.Get(), alloc.Get(), list.Get(), retire, evaluateOnce, color.Get(), depth.Get(),
+                  motion.Get(), workspaceResource, workspace->Width, planPath);
+        if (!SetEvent(initialized))
+            throw std::runtime_error("Could not signal split calibration");
+        // Stay until the owner has read the plan and sends shutdown (or exits).
+        for (;;)
+        {
+            FrameCommand command {};
+            if (!readExact(&command, static_cast<DWORD>(sizeof(command))) || command.kind == CommandKind::Shutdown)
+                break;
+        }
+        std::cerr << "Split calibration finished.\n" << std::flush;
+        return 0;
+    }
+    if (!plan.Fits(workspace->Width))
         throw std::runtime_error("The model workspace does not match the split plan (resolution, preset or runtime)");
     std::cerr << "Split worker: workspace " << workspace->Width << " bytes, segment (" << plan.cut << ", "
               << plan.resume << "), forward " << plan.forwardBytes << " bytes, backward " << plan.backwardBytes

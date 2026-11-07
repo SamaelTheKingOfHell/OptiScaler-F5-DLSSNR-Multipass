@@ -4,6 +4,7 @@
 #include <vector>
 struct ID3D12GraphicsCommandList;
 namespace DlssNr::NetworkSplit { struct Plan; }
+namespace DlssNr::NetworkSplit::Calibration { struct Kernel; }
 namespace DlssNrNative {
 void* WrapNvapi(unsigned id,void* original);
 void SetEnabled(bool enabled);
@@ -20,6 +21,10 @@ bool EndEvaluate(ID3D12GraphicsCommandList* cmd);
 // EndSplitEvaluate is true when every transfer of the role was recorded and every launch succeeded.
 void BeginSplitEvaluate(ID3D12GraphicsCommandList* cmd, int role, const DlssNr::NetworkSplit::Plan* plan, uint64_t workspace, uint64_t forwardStaging, uint64_t backwardStaging);
 bool EndSplitEvaluate();
+// Records the launches of the evaluate recorded next on `cmd` (function name and parameter block per kernel, as the
+// model issued them), for the split calibration's layout check. EndRecord returns them and stops recording.
+void BeginRecord(ID3D12GraphicsCommandList* cmd);
+std::vector<DlssNr::NetworkSplit::Calibration::Kernel> EndRecord();
 // Kernel census / per-group GPU timing lines finished since the last call (ini [DlssNr] KernelProfile), for the log.
 std::vector<std::string> TakeProfileReports();
 std::string VitStatus();

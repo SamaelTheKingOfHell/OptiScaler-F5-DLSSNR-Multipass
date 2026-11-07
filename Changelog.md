@@ -1,3 +1,9 @@
+## 2026-11-07 — Network split calibrates itself (WIP)
+
+- The network split no longer needs a plan file per resolution. The game records one evaluate to read the model's layout (workspace and synchronization area from its first kernel, tensor sizes from the launch parameters). The helper worker measures each kernel's writes on its own GPU with read-only snapshots and computes the plan, and the game uses it only if both layouts match. Plans are cached per layout. Pictures that reset history stay whole on the game GPU. The shipped 720p plan is removed.
+- RTX 3060 calibration: 6.3 s at 1280x720 (reproduces the validated plan exactly), 12.6 s at 2560x1440. The 1440p plan matched a whole evaluate within the two-evaluate residue on the 3060 (max 0.0029). Workspace selection now follows the first kernel's pointer; the smallest-buffer rule was wrong at 1440p.
+- Anthropic Claude Opus 5.5. Unit tests pass. Not run in a game; the cut still gives the helper most of the network, which is too much for an RTX 3060 at 1440p.
+
 ## 2026-11-06 — DLSS-NR network split in OptiScaler (WIP, off by default)
 
 - New `[DlssNr] NetworkSplit`, `NetworkSplitPass` and `NetworkSplitPlan`, with a menu checkbox and pass slider. The second GPU evaluates the middle of one pass's network (kernels between a calibrated cut and resume) while the game GPU evaluates the start and the end. The tensors cross as calibrated workspace byte ranges on a copy queue, and every cross-GPU wait is a queue fence wait guarded by the worker watchdog. Any failure before the end runs that pass whole on the game GPU.

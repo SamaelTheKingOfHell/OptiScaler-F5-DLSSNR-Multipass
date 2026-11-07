@@ -33,6 +33,7 @@ struct Plan
 {
     int cut = 0, resume = 0;
     uint64_t workspaceBytes = 0; // calibrated workspace size: a mismatch means another resolution or model
+    uint64_t layout = 0;         // workspace layout fingerprint it was calibrated on (DlssNr_SplitCalibration.h), 0 unknown
     std::vector<Range> forward, backward;
     uint64_t forwardBytes = 0, backwardBytes = 0;
 
@@ -54,7 +55,7 @@ struct Plan
     }
 };
 
-// Plan file:  "C <cut> <resume>", optional "W <workspace bytes>", then "F <offset> <bytes>" / "B <offset> <bytes>".
+// Plan file:  "C <cut> <resume>", optional "W <workspace bytes>" and "L <layout fingerprint, hex>", then "F <offset> <bytes>" / "B <offset> <bytes>".
 // ```cpp
 // Plan plan; std::string why;
 // if (!ParsePlan(file, plan, why)) LOG_WARN("network split plan: {}", why);
@@ -73,6 +74,8 @@ inline bool ParsePlan(std::istream& in, Plan& plan, std::string& error)
             l >> plan.cut >> plan.resume;
         else if (kind == 'W')
             l >> plan.workspaceBytes;
+        else if (kind == 'L')
+            l >> std::hex >> plan.layout;
         else if (kind == 'F' || kind == 'B')
         {
             Range r;

@@ -4238,9 +4238,9 @@ static void RenderPassesPage(Config* config, float menuResScale)
         if (ImGui::Checkbox("Split the network with the second GPU (experimental)", &networkSplit))
             config->DlssNrNetworkSplit = networkSplit;
         HelpMarker("The second GPU evaluates the middle of one pass's network while the game GPU evaluates its start "
-                   "and end. Needs a plan calibrated for the model size and preset (OptiScaler/NR-Split) and takes "
-                   "the place of the pass handoff above. Features built before turning it on keep running on the "
-                   "game GPU until they are rebuilt.");
+                   "and end. The first time a model size runs, the second GPU calibrates the split by itself for a "
+                   "few seconds. Takes the place of the pass handoff above. Features built before turning it on keep "
+                   "running on the game GPU until they are rebuilt (change the preset or restart the game).");
         if (networkSplit)
         {
             int splitPass = static_cast<int>(std::max(config->DlssNrNetworkSplitPass.value_or_default(), 1u));

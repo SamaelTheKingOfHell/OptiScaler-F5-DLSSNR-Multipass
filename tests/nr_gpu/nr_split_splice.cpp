@@ -15,6 +15,8 @@
 //        /link OptiScaler\library\detours\detours.lib d3d12.lib dxgi.lib user32.lib
 #include "nr_nvapi_harness.h"
 #include "../../OptiScaler/dlssnr/DlssNrVitCopyKernel.h"
+#include "../../OptiScaler/dlssnr/DlssNr_NetworkSplit.h"
+#include <fstream>
 
 #include <algorithm>
 #include <cmath>
@@ -319,6 +321,7 @@ float Half(uint16_t h)
 
 int wmain(int argc, wchar_t** argv)
 {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc != 12)
     {
         std::fprintf(stderr, "usage: core forwarder model data adapter width height preset cut resume frames\n");
@@ -736,6 +739,46 @@ int wmain(int argc, wchar_t** argv)
             std::printf("Discovered writes: head %.2f MiB in %zu runs, segment %.2f MiB in %zu runs\n",
                         headTotal * block / 1048576.0, headRuns, midTotal * block / 1048576.0, midRuns);
         }
+        // SPLICE_PLAN=<file>: transfer exactly the ranges of a plan file (DlssNr_NetworkSplit.h format, e.g. one the
+        // worker's calibration wrote). Each instance's workspace is the buffer its kernel 0 clears from. Needs
+        // NR_ALLOC_CALLBACK.
+        if (const wchar_t* planFile = _wgetenv(L"SPLICE_PLAN"); planFile && !baseline)
+        {
+            std::ifstream in(planFile);
+            DlssNr::NetworkSplit::Plan plan;
+            std::string why;
+            if (!in || !DlssNr::NetworkSplit::ParsePlan(in, plan, why))
+                throw std::runtime_error("SPLICE_PLAN: " + why);
+            if (plan.cut != g_cut || plan.resume != g_resume)
+                throw std::runtime_error("SPLICE_PLAN: run with the plan's cut and resume");
+            auto workspaceOf = [&](int tag, uint64_t clear) -> const Allocation*
+            {
+                for (const auto& a : Allocations().items)
+                    if (a.tag == tag && a.va == clear && a.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+                        return &a;
+                return nullptr;
+            };
+            const Allocation* o = traceOwner[0].empty() ? nullptr : workspaceOf(2, traceOwner[0][0]);
+            const Allocation* hp = traceHelper[0].empty() ? nullptr : workspaceOf(3, traceHelper[0][0]);
+            if (!o || !hp || !plan.Fits(o->desc.Width) || o->desc.Width != hp->desc.Width)
+                throw std::runtime_error("SPLICE_PLAN: workspaces not found or the plan does not fit them");
+            g_forward.clear();
+            g_backward.clear();
+            for (const auto* set : { &plan.forward, &plan.backward })
+                for (const auto& r : *set)
+                {
+                    Transfer t;
+                    t.ownerVa = o->va + r.offset;
+                    t.helperVa = hp->va + r.offset;
+                    t.bytes = r.bytes;
+                    t.offset = r.packed;
+                    (set == &plan.forward ? g_forward : g_backward).push_back(t);
+                }
+            forwardBytes = plan.forwardBytes;
+            backwardBytes = plan.backwardBytes;
+            std::printf("Plan %ls: forward %.2f MiB in %zu, backward %.2f MiB in %zu\n", planFile,
+                        forwardBytes / 1048576.0, g_forward.size(), backwardBytes / 1048576.0, g_backward.size());
+        }
         auto forwardBuffer = MakeBuffer(device.Get(), D3D12_HEAP_TYPE_DEFAULT, std::max<uint64_t>(forwardBytes, 256),
                                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
         auto backwardBuffer = MakeBuffer(device.Get(), D3D12_HEAP_TYPE_DEFAULT,
@@ -940,7 +983,7 @@ int wmain(int argc, wchar_t** argv)
                 g_role = Role::OwnerEnd;
                 g_index = 0;
                 g_injected = false;
-                if (model.Run(list.Get(), owner, color, depth, motion, outOwner, w, h, false) != 1)
+                if (model.Run(list.Get(), owner, color, depth, motion, outOwner, w, h, f == 1) != 1)
                     throw std::runtime_error("owner end evaluate failed");
             }
             g_role = Role::Full;

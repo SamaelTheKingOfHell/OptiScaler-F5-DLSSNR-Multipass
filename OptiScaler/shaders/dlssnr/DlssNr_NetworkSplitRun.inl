@@ -1,20 +1,48 @@
 // Included in the D3D12 implementation's anonymous namespace. Every entry is called under g_nrMutex.
 // Network split (dlssnr/DlssNr_NetworkSplit.h): the helper GPU evaluates the middle of one pass's network. This file
-// finds the plan and the helper, starts it, and keeps one generation per configuration; DispatchResumable records the
-// two evaluates around it.
+// works out the plan for whatever model is running and keeps one helper per configuration; DispatchResumable records
+// the two evaluates around it.
+//
+// The plan is not tied to a resolution (dlssnr/DlssNr_SplitCalibration.h):
+//   1. While the split is on, each feature's buffers are captured as it is created (DlssNr_ModelAllocations.h).
+//   2. One ordinary evaluate of the split pass is recorded (DlssNrNative::BeginRecord); its first kernel names the
+//      workspace, and the chain gives the layout and its fingerprint.
+//   3. A plan cached under that fingerprint (and the helper runtime) is used as it is. Otherwise the helper worker
+//      calibrates on its own GPU (read-only snapshots, about 5 to 15 seconds while the game keeps running), and its
+//      plan is used only when the helper's layout fingerprint equals ours. Then it is cached.
+// NetworkSplitPlan names a fixed plan file instead (relative names under OptiScaler/NR-Split/).
 namespace NetworkSplitRun
 {
 using DlssNr::Worker::InitialFrameWire;
 using DlssNr::Worker::SplitGeneration;
 using Microsoft::WRL::ComPtr;
+namespace Cal = DlssNr::NetworkSplit::Calibration;
 
 std::shared_ptr<SplitGeneration> current;
 std::wstring currentKey, failedKey;
-// Each feature's workspace, captured while it was created (DlssNr_ModelAllocations.h).
-std::map<const void*, DlssNr::ModelAllocations::Workspace> workspaces;
 bool installed = false;
 
-// Around g_nr.create: when the split is on, the model allocates through our callback so its workspace is known.
+struct Feature
+{
+    std::vector<DlssNr::ModelAllocations::Workspace> buffers;
+    DlssNr::ModelAllocations::Workspace workspace;
+    uint64_t fingerprint = 0;
+    bool recorded = false; // the layout was looked at (fingerprint 0 = it did not decode)
+};
+std::map<const void*, Feature> features;
+
+// A calibration run of the helper worker, for one layout.
+struct Calibration
+{
+    DlssNr::MultiGpu::CrossAdapterBuffer transfer;
+    DlssNr::Worker::WorkerClient client;
+    std::filesystem::path plan, cache;
+    uint64_t fingerprint = 0;
+    std::wstring key;
+};
+std::unique_ptr<Calibration> calibration;
+
+// Around g_nr.create: when the split is on, the model allocates through our callback so its buffers are known.
 void BeforeCreate(const Config& cfg, ID3D12Device* device)
 {
     if (!cfg.DlssNrNetworkSplit.value_or_default())
@@ -27,44 +55,72 @@ void AfterCreate(const Config& cfg, const void* feature)
 {
     if (!cfg.DlssNrNetworkSplit.value_or_default())
         return;
-    const auto ws = DlssNr::ModelAllocations::EndCreate();
-    if (feature && ws.address)
-        workspaces[feature] = ws;
-    else if (feature)
-        workspaces.erase(feature);
+    auto buffers = DlssNr::ModelAllocations::EndCreate();
+    if (!feature)
+        return;
+    features[feature] = Feature {};
+    if (!buffers.empty())
+        features[feature].buffers = std::move(buffers);
+    else
+        features.erase(feature);
 }
-DlssNr::ModelAllocations::Workspace WorkspaceOf(const void* feature)
+// True while this feature's layout is unknown and its next ordinary evaluate should be recorded.
+bool NeedsRecord(const void* feature)
 {
-    const auto it = workspaces.find(feature);
-    return it == workspaces.end() ? DlssNr::ModelAllocations::Workspace {} : it->second;
+    const auto it = features.find(feature);
+    return it != features.end() && !it->second.recorded;
 }
-
-std::optional<std::filesystem::path> PlanPath(const Config& cfg, unsigned pass, unsigned width, unsigned height)
+void Recorded(const void* feature, const std::vector<Cal::Kernel>& kernels)
 {
-    // Auto: <w>x<h>-<preset>.txt, then <w>x<h>.txt. The plan's workspace size rejects another preset or runtime.
-    std::vector<std::string> names;
-    const auto chosen = cfg.DlssNrNetworkSplitPlan.value_or_default();
-    if (chosen.empty() || chosen == "auto")
+    const auto it = features.find(feature);
+    if (it == features.end())
+        return;
+    auto& f = it->second;
+    f.recorded = true;
+    f.workspace = DlssNr::ModelAllocations::StartingAt(f.buffers, Cal::ClearPointer(kernels));
+    Cal::Layout layout;
+    std::string why = "the workspace buffer was not among the model's allocations";
+    if (f.workspace.address && Cal::Decode(kernels, f.workspace.address, f.workspace.bytes, layout, why))
     {
-        const auto size = std::to_string(width) + "x" + std::to_string(height);
-        names = { size + "-" + std::to_string(PassPreset(cfg, pass)) + ".txt", size + ".txt" };
+        f.fingerprint = Cal::Fingerprint(layout);
+        LOG_INFO("DLSS-NR network split: {} kernels, workspace {} bytes, synchronization {} bytes, layout {:016x}",
+                 kernels.size(), f.workspace.bytes, layout.syncBytes, f.fingerprint);
     }
     else
-        names = { chosen };
-    for (const auto& name : names)
+        LOG_WARN("DLSS-NR network split: the model's layout could not be read ({}); it stays on the game GPU.", why);
+}
+// The workspace of a feature whose layout is known, or {}.
+DlssNr::ModelAllocations::Workspace WorkspaceOf(const void* feature)
+{
+    const auto it = features.find(feature);
+    return it == features.end() || !it->second.fingerprint ? DlssNr::ModelAllocations::Workspace {}
+                                                           : it->second.workspace;
+}
+bool KnownWithoutBuffers(const void* feature) { return features.find(feature) == features.end(); }
+
+std::optional<std::filesystem::path> FixedPlanPath(const Config& cfg)
+{
+    const auto chosen = cfg.DlssNrNetworkSplitPlan.value_or_default();
+    if (chosen.empty() || chosen == "auto")
+        return std::nullopt;
+    const std::filesystem::path given(chosen);
+    if (given.is_absolute())
+        return given;
+    for (const auto& base : { g_dllDir / L"OptiScaler" / L"NR-Split", g_dllDir / L"NR-Split",
+                              Util::ExePath().remove_filename() / L"OptiScaler" / L"NR-Split" })
     {
-        const std::filesystem::path given(name);
-        if (given.is_absolute())
-            return given;
-        for (const auto& base : { g_dllDir / L"OptiScaler" / L"NR-Split", g_dllDir / L"NR-Split",
-                                  Util::ExePath().remove_filename() / L"OptiScaler" / L"NR-Split" })
-        {
-            std::error_code error;
-            if (std::filesystem::is_regular_file(base / given, error) && !error)
-                return base / given;
-        }
+        std::error_code error;
+        if (std::filesystem::is_regular_file(base / given, error) && !error)
+            return base / given;
     }
-    return std::nullopt;
+    return given; // reported as unreadable below
+}
+std::filesystem::path CacheDir()
+{
+    const wchar_t* local = _wgetenv(L"LOCALAPPDATA");
+    std::error_code error;
+    return (local && *local ? std::filesystem::path(local) : std::filesystem::temp_directory_path(error)) /
+           L"OptiScaler" / L"NR-Split";
 }
 
 void Retire()
@@ -75,17 +131,106 @@ void Retire()
     currentKey.clear();
 }
 
-// The ready generation for this pass, or nullptr while it starts (or after it failed for this configuration). The
-// workspace size must match the plan's calibration.
-std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cfg, unsigned pass, unsigned width,
-                                         unsigned height, uint64_t workspaceBytes)
+// Everything the helper needs, found once per start.
+struct Helper
 {
-    if (!primary || !workspaceBytes || g_nr.isPort)
+    DlssNr::MultiGpu::SelectedAdapter adapter;
+    std::filesystem::path worker, model, core, data;
+    std::wstring forwarder;
+};
+std::optional<Helper> FindHelper(ID3D12Device* primary, const Config& cfg, std::string& why)
+{
+    Helper h;
+    ComPtr<IDXGIFactory4> factory;
+    {
+        DxgiProxy::ScopedFactoryCreation factoryCreation {};
+        ComPtr<IDXGIFactory> base;
+        auto createFactory = DxgiProxy::CreateDxgiFactory_();
+        if (!createFactory ||
+            FAILED(createFactory(__uuidof(IDXGIFactory), reinterpret_cast<IDXGIFactory**>(base.GetAddressOf()))) ||
+            FAILED(base.As(&factory)))
+            return why = "could not enumerate graphics adapters", std::nullopt;
+    }
+    auto createDevice = D3d12Proxy::D3D12CreateDevice_();
+    ScopedSkipSpoofingThread skipSpoofing {};
+    ScopedCreatingD3DDevice creatingDevice {};
+    if (!createDevice || FAILED(DlssNr::MultiGpu::SelectSecondary(factory.Get(), primary->GetAdapterLuid(), nullptr,
+                                                                  0x10de, createDevice, h.adapter)))
+        return why = "no compatible secondary NVIDIA adapter was found", std::nullopt;
+    const auto selectedModel = cfg.DlssNrSecondaryModel.value_or_default();
+    const auto model = selectedModel.empty() || selectedModel == "auto"
+        ? FindSelectedModel()
+        : DlssNr::Worker::ModelCatalog::Resolve({ g_dllDir, Util::ExePath().remove_filename() }, selectedModel);
+    for (const auto& candidate : { g_dllDir / L"OptiScaler" / L"NR-Worker" / L"dlssnr_worker.exe",
+                                   g_dllDir / L"NR-Worker" / L"dlssnr_worker.exe",
+                                   Util::ExePath().remove_filename() / L"OptiScaler" / L"NR-Worker" /
+                                       L"dlssnr_worker.exe" })
+    {
+        std::error_code error;
+        if (std::filesystem::is_regular_file(candidate, error) && !error)
+        {
+            h.worker = candidate;
+            break;
+        }
+    }
+    const auto coreDir = Util::NvngxPath();
+    if (!model || h.worker.empty() || !coreDir || !g_nr.forwarder)
+        return why = "the worker, model or NVIDIA core is missing", std::nullopt;
+    h.model = *model;
+    h.core = *coreDir / L"_nvngx.dll";
+    wchar_t forwarderPath[32768] {};
+    const DWORD length =
+        GetModuleFileNameW(g_nr.forwarder, forwarderPath, static_cast<DWORD>(std::size(forwarderPath)));
+    if (!length || length >= std::size(forwarderPath))
+        return why = "the model forwarder path is unavailable", std::nullopt;
+    h.forwarder = forwarderPath;
+    std::error_code error;
+    h.data = std::filesystem::temp_directory_path(error) / L"OptiScaler-NR-Worker" /
+             (std::to_wstring(GetCurrentProcessId()) + L"-split");
+    if (!error)
+        std::filesystem::create_directories(h.data, error);
+    if (error)
+        return why = "the worker data directory could not be created", std::nullopt;
+    return h;
+}
+InitialFrameWire Wire(const Config& cfg, unsigned pass, unsigned width, unsigned height)
+{
+    InitialFrameWire wire {};
+    wire.width = width;
+    wire.height = height;
+    wire.applicationId = State::Instance().NVNGX_ApplicationId;
+    const auto t = PassTuning(cfg, pass);
+    auto& p = wire.passes[0];
+    p.preset = static_cast<int>(PassPreset(cfg, pass));
+    p.style = static_cast<int>(PassStyle(cfg, pass));
+    p.intensity = t.intensity;
+    p.structure = t.structure;
+    p.tone = t.tone;
+    p.skin = t.skin;
+    p.autoMask = t.autoMask ? 1 : 0;
+    return wire;
+}
+bool ReadPlan(const std::filesystem::path& path, DlssNr::NetworkSplit::Plan& plan, std::string& why)
+{
+    std::ifstream in(path);
+    if (!in)
+        return why = "unreadable", false;
+    return DlssNr::NetworkSplit::ParsePlan(in, plan, why);
+}
+
+// The ready generation for this pass, or nullptr while the plan is worked out or the helper starts (or after a
+// failure for this configuration).
+std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cfg, unsigned pass, unsigned width,
+                                         unsigned height, const void* feature)
+{
+    const auto info = features.find(feature);
+    if (!primary || g_nr.isPort || info == features.end() || !info->second.fingerprint)
         return nullptr;
-    const auto planPath = PlanPath(cfg, pass, width, height);
+    const auto& f = info->second;
+    const auto fixed = FixedPlanPath(cfg);
     std::wostringstream k;
-    k << width << L'x' << height << L':' << pass << L':' << PassPreset(cfg, pass) << L':' << workspaceBytes << L':'
-      << (planPath ? planPath->wstring() : L"-") << L':'
+    k << width << L'x' << height << L':' << pass << L':' << PassPreset(cfg, pass) << L':' << std::hex
+      << f.fingerprint << L':' << (fixed ? fixed->wstring() : L"auto") << L':'
       << string_to_wstring(cfg.DlssNrSecondaryModel.value_or_default());
     const auto key = k.str();
     if (current && key != currentKey)
@@ -107,101 +252,101 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
     auto fail = [&](const std::string& why) -> std::shared_ptr<SplitGeneration>
     {
         failedKey = key;
+        calibration.reset();
         LOG_WARN("DLSS-NR network split: {}; using the game GPU.", why);
         return nullptr;
     };
-    if (!planPath)
-        return fail("no plan file for " + std::to_string(width) + "x" + std::to_string(height) + ", preset " +
-                    std::to_string(PassPreset(cfg, pass)) + ", workspace " + std::to_string(workspaceBytes) +
-                    " bytes (NR-Split folder)");
-    DlssNr::NetworkSplit::Plan plan;
+
+    // A calibration in progress: wait for its plan without blocking.
+    if (calibration && calibration->key == key)
     {
-        std::ifstream in(*planPath);
+        const HRESULT ready = calibration->client.WaitForReady(0);
+        if (ready == E_PENDING)
+            return nullptr;
+        if (FAILED(ready))
+            return fail("the helper's calibration failed (see worker.log in the worker data folder)");
+        DlssNr::NetworkSplit::Plan plan;
         std::string why;
-        if (!in || !DlssNr::NetworkSplit::ParsePlan(in, plan, why))
-            return fail("plan " + planPath->string() + ": " + (in ? why : std::string("unreadable")));
-    }
-    if (!plan.Fits(workspaceBytes))
-        return fail("plan " + planPath->string() + " was calibrated for another workspace (" +
-                    std::to_string(plan.workspaceBytes) + " bytes, the model has " + std::to_string(workspaceBytes) +
-                    ")");
-    ComPtr<IDXGIFactory4> factory;
-    {
-        DxgiProxy::ScopedFactoryCreation factoryCreation {};
-        ComPtr<IDXGIFactory> base;
-        auto createFactory = DxgiProxy::CreateDxgiFactory_();
-        if (!createFactory ||
-            FAILED(createFactory(__uuidof(IDXGIFactory), reinterpret_cast<IDXGIFactory**>(base.GetAddressOf()))) ||
-            FAILED(base.As(&factory)))
-            return fail("could not enumerate graphics adapters");
-    }
-    auto createDevice = D3d12Proxy::D3D12CreateDevice_();
-    DlssNr::MultiGpu::SelectedAdapter secondary;
-    ScopedSkipSpoofingThread skipSpoofing {};
-    ScopedCreatingD3DDevice creatingDevice {};
-    if (!createDevice || FAILED(DlssNr::MultiGpu::SelectSecondary(factory.Get(), primary->GetAdapterLuid(), nullptr,
-                                                                  0x10de, createDevice, secondary)))
-        return fail("no compatible secondary NVIDIA adapter was found");
-    const auto selectedModel = cfg.DlssNrSecondaryModel.value_or_default();
-    const auto model = selectedModel.empty() || selectedModel == "auto"
-        ? FindSelectedModel()
-        : DlssNr::Worker::ModelCatalog::Resolve({ g_dllDir, Util::ExePath().remove_filename() }, selectedModel);
-    std::optional<std::filesystem::path> worker;
-    for (const auto& candidate : { g_dllDir / L"OptiScaler" / L"NR-Worker" / L"dlssnr_worker.exe",
-                                   g_dllDir / L"NR-Worker" / L"dlssnr_worker.exe",
-                                   Util::ExePath().remove_filename() / L"OptiScaler" / L"NR-Worker" /
-                                       L"dlssnr_worker.exe" })
-    {
+        if (!ReadPlan(calibration->plan, plan, why))
+            return fail("the helper's calibration plan: " + why);
+        if (plan.layout != calibration->fingerprint)
+            return fail("the helper GPU's runtime lays the network out differently; pick a compatible "
+                        "SecondaryModel");
         std::error_code error;
-        if (std::filesystem::is_regular_file(candidate, error) && !error)
-        {
-            worker = candidate;
-            break;
-        }
+        std::filesystem::create_directories(calibration->cache.parent_path(), error);
+        std::filesystem::copy_file(calibration->plan, calibration->cache,
+                                   std::filesystem::copy_options::overwrite_existing, error);
+        LOG_INFO("DLSS-NR network split: calibrated: kernels ({}, {}) on the helper, {} KiB out, {} KiB back{}",
+                 plan.cut, plan.resume, plan.forwardBytes / 1024, plan.backwardBytes / 1024,
+                 error ? " (not cached)" : "");
+        calibration->client.Stop(5000);
+        calibration.reset();
+        if (error)
+            return fail("the calibrated plan could not be cached");
+        return nullptr; // the helper starts on the next frame, from the cache
     }
-    const auto coreDir = Util::NvngxPath();
-    if (!model || !worker || !coreDir || !g_nr.forwarder)
-        return fail("the worker, model or NVIDIA core is missing");
-    wchar_t forwarderPath[32768] {};
-    const DWORD length =
-        GetModuleFileNameW(g_nr.forwarder, forwarderPath, static_cast<DWORD>(std::size(forwarderPath)));
-    if (!length || length >= std::size(forwarderPath))
-        return fail("the model forwarder path is unavailable");
+    if (calibration)
+        calibration.reset(); // another configuration's run
+
+    std::string why;
+    auto helper = FindHelper(primary, cfg, why);
+    if (!helper)
+        return fail(why);
+    std::error_code sizeError;
+    const auto modelBytes = std::filesystem::file_size(helper->model, sizeError);
+    wchar_t name[64];
+    swprintf(name, std::size(name), L"%016llx-%llx.txt", static_cast<unsigned long long>(f.fingerprint),
+             static_cast<unsigned long long>(sizeError ? 0 : modelBytes));
+    const auto cache = CacheDir() / name;
+    const auto planPath = fixed ? *fixed : cache;
     std::error_code error;
-    auto data = std::filesystem::temp_directory_path(error) / L"OptiScaler-NR-Worker" /
-                (std::to_wstring(GetCurrentProcessId()) + L"-split");
-    if (!error)
-        std::filesystem::create_directories(data, error);
-    if (error)
-        return fail("the worker data directory could not be created");
-    auto next = std::make_shared<SplitGeneration>();
-    HRESULT hr = next->Create(primary, secondary.device.Get(), plan);
-    if (FAILED(hr))
-        return fail("the shared buffer, copy queue or staging could not be created");
-    InitialFrameWire wire {};
-    wire.width = width;
-    wire.height = height;
-    wire.applicationId = State::Instance().NVNGX_ApplicationId;
+    if (!fixed && !std::filesystem::is_regular_file(cache, error))
     {
-        const auto t = PassTuning(cfg, pass);
-        auto& p = wire.passes[0];
-        p.preset = static_cast<int>(PassPreset(cfg, pass));
-        p.style = static_cast<int>(PassStyle(cfg, pass));
-        p.intensity = t.intensity;
-        p.structure = t.structure;
-        p.tone = t.tone;
-        p.skin = t.skin;
-        p.autoMask = t.autoMask ? 1 : 0;
+        auto run = std::make_unique<Calibration>();
+        run->key = key;
+        run->fingerprint = f.fingerprint;
+        run->cache = cache;
+        run->plan = helper->data / L"split-plan.txt";
+        std::filesystem::remove(run->plan, error);
+        if (FAILED(DlssNr::MultiGpu::CrossAdapterBuffer::Create(primary, helper->adapter.device.Get(), 65536,
+                                                                run->transfer)))
+            return fail("the calibration handshake buffer could not be created");
+        auto wire = Wire(cfg, pass, width, height);
+        wire.frameCount = 0;
+        wire.passCount = 1;
+        wire.bytes = run->transfer.Size();
+        wire.primary = primary->GetAdapterLuid();
+        wire.secondary = helper->adapter.device->GetAdapterLuid();
+        wire.split.cut = -1;
+        const auto log = helper->data / L"worker.log";
+        if (FAILED(run->client.Start(primary, helper->worker.c_str(), helper->core.c_str(), helper->forwarder.c_str(),
+                                     helper->model.c_str(), helper->data.c_str(), log.c_str(), run->transfer, wire)))
+            return fail("the helper could not be started for calibration");
+        calibration = std::move(run);
+        LOG_INFO("DLSS-NR network split: calibrating pass {} at {}x{} on {} (one time for this model and size)",
+                 pass + 1, width, height, wstring_to_string(helper->adapter.description.Description));
+        return nullptr;
     }
-    const auto core = *coreDir / L"_nvngx.dll";
-    const auto log = data / L"worker.log";
-    hr = next->Start(worker->c_str(), core.c_str(), forwarderPath, model->c_str(), data.c_str(), log.c_str(), wire);
-    if (FAILED(hr))
+
+    DlssNr::NetworkSplit::Plan plan;
+    if (!ReadPlan(planPath, plan, why))
+        return fail("plan " + planPath.string() + ": " + why);
+    if (!plan.Fits(f.workspace.bytes))
+        return fail("plan " + planPath.string() + " does not fit this model's workspace (" +
+                    std::to_string(f.workspace.bytes) + " bytes)");
+    if (plan.layout && plan.layout != f.fingerprint)
+        return fail("plan " + planPath.string() + " was calibrated for another layout");
+    auto next = std::make_shared<SplitGeneration>();
+    if (FAILED(next->Create(primary, helper->adapter.device.Get(), plan)))
+        return fail("the shared buffer, copy queue or staging could not be created");
+    const auto log = helper->data / L"worker.log";
+    if (FAILED(next->Start(helper->worker.c_str(), helper->core.c_str(), helper->forwarder.c_str(),
+                           helper->model.c_str(), helper->data.c_str(), log.c_str(), Wire(cfg, pass, width, height))))
         return fail("the helper could not be started");
     current = std::move(next);
     currentKey = key;
     LOG_INFO("DLSS-NR network split: pass {} kernels ({}, {}) on {}, plan {} ({} KiB out, {} KiB back)", pass + 1,
-             plan.cut, plan.resume, wstring_to_string(secondary.description.Description), planPath->string(),
+             plan.cut, plan.resume, wstring_to_string(helper->adapter.description.Description), planPath.string(),
              plan.forwardBytes / 1024, plan.backwardBytes / 1024);
     return nullptr; // the helper loads its model asynchronously; this frame stays on the game GPU
 }

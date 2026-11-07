@@ -2,19 +2,20 @@
 // Where a DLSS-NR feature keeps its workspace. The network split (DlssNr_NetworkSplit.h) copies byte ranges in and out
 // of the model's workspace buffer, which the model allocates itself while a feature is created. With NGX's
 // ResourceAllocCallback installed on the capability parameters, those allocations come through here instead, so the
-// buffer is known: of the buffers one create allocates, the workspace is the smallest writable one (the weight copy
-// and its read-only twin are larger; the history is a texture).
+// buffers are known. Which one is the workspace is decided from the model's own launches: the buffer its first kernel
+// (cc_cb_clear) clears from (see DlssNr_SplitCalibration.h); the smallest writable buffer is not it at every size.
 //
 // ```cpp
 // DlssNr::ModelAllocations::Install(params);            // once, before the creates whose workspace is needed
 // DlssNr::ModelAllocations::BeginCreate(device);
 // feature = create(...);
-// auto ws = DlssNr::ModelAllocations::EndCreate();      // ws.address == 0 when nothing came through the callback
+// auto buffers = DlssNr::ModelAllocations::EndCreate(); // empty when nothing came through the callback
 // ```
 // Resources are created with the device given to BeginCreate (or the last one), which is the device NGX creates on.
 
 #include <d3d12.h>
 #include <mutex>
+#include <vector>
 #include <nvsdk_ngx_defs.h>
 #include <nvsdk_ngx_params.h>
 #include <wrl/client.h>
@@ -33,7 +34,7 @@ struct State
     std::mutex mutex;
     Microsoft::WRL::ComPtr<ID3D12Device> device;
     bool capturing = false;
-    Workspace smallest;
+    std::vector<Workspace> buffers;
 };
 inline State& S()
 {
@@ -54,10 +55,8 @@ inline void __cdecl Allocate(D3D12_RESOURCE_DESC* desc, int state, D3D12_HEAP_PR
                                                  static_cast<D3D12_RESOURCE_STATES>(state), nullptr,
                                                  IID_PPV_ARGS(&r))))
         return;
-    if (s.capturing && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
-        (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
-        (!s.smallest.address || desc->Width < s.smallest.bytes))
-        s.smallest = { r->GetGPUVirtualAddress(), desc->Width };
+    if (s.capturing && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+        s.buffers.push_back({ r->GetGPUVirtualAddress(), desc->Width });
     *out = r.Detach(); // NGX holds this reference and returns it through Release
 }
 inline void __cdecl Release(IUnknown* resource)
@@ -83,13 +82,21 @@ inline void BeginCreate(ID3D12Device* device)
     if (device)
         s.device = device;
     s.capturing = true;
-    s.smallest = {};
+    s.buffers.clear();
 }
-inline Workspace EndCreate()
+inline std::vector<Workspace> EndCreate()
 {
     auto& s = Detail::S();
     std::lock_guard<std::mutex> lock(s.mutex);
     s.capturing = false;
-    return s.smallest;
+    return std::move(s.buffers);
+}
+// The buffer that starts at `address`, or {} when none of `buffers` does.
+inline Workspace StartingAt(const std::vector<Workspace>& buffers, uint64_t address)
+{
+    for (const auto& b : buffers)
+        if (address && b.address == address)
+            return b;
+    return {};
 }
 } // namespace DlssNr::ModelAllocations
