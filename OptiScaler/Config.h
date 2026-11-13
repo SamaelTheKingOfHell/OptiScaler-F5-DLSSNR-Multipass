@@ -921,6 +921,8 @@ class Config
     CustomOptional<bool> DlssNrNetworkSplit { false };
     // The pass that is split, 1-based.
     CustomOptional<uint32_t> DlssNrNetworkSplitPass { 1 };
+    // Bit i splits pass i + 1 (each split pass has its own helper). Unset keeps NetworkSplitPass.
+    CustomOptional<uint32_t, NoDefault> DlssNrNetworkSplitPassMask;
     // Calibrated plan file; relative paths are under OptiScaler/NR-Split/. Empty picks <width>x<height>-<preset>.txt.
     CustomOptional<std::string> DlssNrNetworkSplitPlan { std::string() };
     CustomOptional<uint32_t> DlssNrPrimaryPasses { 1 };

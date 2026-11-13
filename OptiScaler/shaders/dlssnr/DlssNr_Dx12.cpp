@@ -57,6 +57,7 @@
 #include <dlssnr/DlssNr_MultiGpuPlan.h>
 #include <dlssnr/DlssNr_HelperShare.h>
 #include <dlssnr/worker/HelperShareStatus.h>
+#include <dlssnr/worker/SplitPassStatus.h>
 #include <dlssnr/DlssNr_AdaptiveBalance.h>
 #include <dlssnr/worker/AdaptiveBalanceStatus.h>
 #include <dlssnr/worker/WorkerModelCatalog.h>
@@ -4143,7 +4144,7 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
             g_nr.reset = true;
             ReportSkipOnce("the game kept switching back and forth between what the model is built for");
             device->Release();
-            return;
+            co_return;
         }
     }
 
@@ -6023,9 +6024,17 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
         !cfg.DlssNrNetworkSplit.value_or_default();
     // Network split (DlssNr_NetworkSplitRun.inl): one pass's network is shared with the helper GPU. It takes the place
     // of the pass handoff above, under the same conditions.
-    const unsigned splitPass = std::max(cfg.DlssNrNetworkSplitPass.value_or_default(), 1u) - 1u;
+    // Every pass chosen on the Passes page is split, each with its own helper (NetworkSplitRun::Select).
+    const uint32_t splitMask =
+        DlssNr::MultiGpu::SplitPassMask(cfg.DlssNrNetworkSplit.value_or_default(),
+                                        cfg.DlssNrNetworkSplitPassMask.has_value()
+                                            ? std::optional<uint32_t>(cfg.DlssNrNetworkSplitPassMask.value())
+                                            : std::nullopt,
+                                        cfg.DlssNrNetworkSplitPass.value_or_default()) &
+        DlssNr::MultiGpu::PassBits(effectivePasses);
+    bool splitSuspended = false; // a pipelined frame is continued once: only its first split pass suspends
     const bool splitEligible = workerContext && workerContext->chain && workerContext->queue &&
-        cfg.DlssNrNetworkSplit.value_or_default() && splitPass < effectivePasses && !g_multiRun && !superior &&
+        splitMask != 0 && !g_multiRun && !superior &&
         !spatial && !reusePlan.active && !cachePlan.runs && !fgActive && !reused && !cached;
     if (workerContext)
     {
@@ -6271,7 +6280,16 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
         };
         // Network split of this pass: Head here, the middle on the helper, End here once its tensors are back.
         // Reset pictures (scene cuts) stay whole: a reset evaluate is not the chain the plan was calibrated on.
-        const bool splitThisPass = splitEligible && pass == splitPass && !passReset;
+        const bool splitChosen = pass < 32 && (splitMask & (uint32_t { 1 } << pass)) != 0;
+        const bool splitThisPass = splitEligible && splitChosen && !passReset;
+        if (splitThisPass)
+            NetworkSplitRun::Select(pass);
+        else if (!splitChosen && workerContext && !g_multiRun)
+            NetworkSplitRun::Release(pass);
+        if (!g_multiRun)
+            DlssNr::Worker::SplitPassStatus::Set(pass, !splitChosen     ? DlssNr::Worker::SplitPassStatus::Off
+                                                       : !splitEligible ? DlssNr::Worker::SplitPassStatus::Unavailable
+                                                                        : DlssNr::Worker::SplitPassStatus::Preparing);
         const bool recordSplit = splitThisPass && NetworkSplitRun::NeedsRecord(passFeature);
         const auto splitWorkspace = splitThisPass ? NetworkSplitRun::WorkspaceOf(passFeature)
                                                   : DlssNr::ModelAllocations::Workspace {};
@@ -6324,7 +6342,9 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                 // The chain is split here: queries begun on the original list cannot end on the continuation.
                 if (g_gpuTime) g_gpuTime->Abandon();
                 if (g_ngxTime) g_ngxTime->Abandon();
-                workerContext->keepAlive = splitGeneration; // copy lists and staging live until the slot retires
+                // Copy lists and staging live until the slot retires; a second split pass keeps the first's too.
+                workerContext->keepAlive = std::make_shared<std::pair<std::shared_ptr<void>, std::shared_ptr<void>>>(
+                    std::move(workerContext->keepAlive), splitGeneration);
                 handoff = splitGeneration->Submit(*workerContext->chain, workerContext->queue, command);
                 cmdList = workerContext->chain->Current();
                 stateEnvelope.cmd = cmdList;
@@ -6334,8 +6354,9 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                     device->Release();
                     co_return;
                 }
-                if (SUCCEEDED(handoff) && workerContext->pipelineRequested)
+                if (SUCCEEDED(handoff) && workerContext->pipelineRequested && !splitSuspended)
                 {
+                    splitSuspended = true;
                     // The End half is recorded on the next continuation, so the game GPU's queue does not wait on
                     // the helper behind this frame's own work.
                     stateEnvelope.Pause();
@@ -6346,6 +6367,7 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                     g_dispatchSuspended = false;
                     cmdList = workerContext->chain->Current();
                     stateEnvelope.Resume(cmdList);
+                    NetworkSplitRun::Select(pass); // another picture may have handled another pass meanwhile
                 }
                 if (SUCCEEDED(handoff))
                 {
@@ -6370,7 +6392,10 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                 splitDone = DlssNrNative::EndSplitEvaluate();
                 splitGeneration->AfterEnd(cmdList);
                 if (splitDone)
+                {
                     NetworkSplitRun::Stats::Used(timerSlot, true, stamped);
+                    DlssNr::Worker::SplitPassStatus::Set(pass, DlssNr::Worker::SplitPassStatus::Running);
+                }
                 if (!splitDone)
                     LOG_WARN("DLSS-NR network split: the end of pass {} did not run as calibrated; the pass runs "
                              "whole on the game GPU and the split stops.", pass + 1);

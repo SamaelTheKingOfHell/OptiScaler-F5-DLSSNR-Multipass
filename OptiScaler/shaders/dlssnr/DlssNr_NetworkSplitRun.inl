@@ -82,7 +82,7 @@ void Used(unsigned slot, bool split, bool stamped = false)
     if (slot != ~0u)
         pending.push_back({ slot, split, stamped });
 }
-void Collect(double periodMs, const DlssNr::NetworkSplit::Plan* plan)
+void Collect(unsigned pass, double periodMs, const DlssNr::NetworkSplit::Plan* plan)
 {
     // Read slots used at least six frames ago (well past the frames in flight), never more than the ring holds.
     while (pending.size() > 6)
@@ -147,13 +147,14 @@ void Collect(double periodMs, const DlssNr::NetworkSplit::Plan* plan)
                           fgNow.second != fgBefore.second && miss ? miss : "");
         }
         fgBefore = fgNow;
-        LOG_INFO("DLSS-NR network split: frame {:.1f} ms; split pass on the game GPU {:.2f} + {:.2f} ms ({} frames){}"
-                 "{}{}; share ({}, {})",
-                 periodMs, head, end, splitCount, saving, wait, fg, plan ? plan->cut : 0, plan ? plan->resume : 0);
+        LOG_INFO("DLSS-NR network split: pass {}, frame {:.1f} ms; split pass on the game GPU {:.2f} + {:.2f} ms "
+                 "({} frames){}{}{}; share ({}, {})",
+                 pass + 1, periodMs, head, end, splitCount, saving, wait, fg, plan ? plan->cut : 0, plan ? plan->resume : 0);
     }
     else
-        LOG_INFO("DLSS-NR network split: frame {:.1f} ms; split pass whole on the game GPU {:.2f} ms ({} frames)",
-                 periodMs, whole, wholeCount);
+        LOG_INFO("DLSS-NR network split: pass {}, frame {:.1f} ms; split pass whole on the game GPU {:.2f} ms "
+                 "({} frames)",
+                 pass + 1, periodMs, whole, wholeCount);
     headSum = endSum = waitSum = 0;
     splitCount = waitCount = waitedCount = 0;
     // The whole-pass figure is kept: it is the baseline the halves are compared with.
@@ -408,6 +409,9 @@ std::optional<Helper> FindHelper(ID3D12Device* primary, const Config& cfg, std::
         return why = "the worker data directory could not be created", std::nullopt;
     return h;
 }
+std::wstring foundKey;
+std::optional<Helper> found;
+void Select(unsigned pass);
 InitialFrameWire Wire(const Config& cfg, unsigned pass, unsigned width, unsigned height)
 {
     InitialFrameWire wire {};
@@ -441,8 +445,9 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
     const auto info = features.find(feature);
     if (!primary || g_nr.isPort || info == features.end() || !info->second.fingerprint)
         return nullptr;
+    Select(pass);
     Observe();
-    Stats::Collect(PeriodMs(), current ? &currentPlan : nullptr);
+    Stats::Collect(pass, PeriodMs(), current ? &currentPlan : nullptr);
     const auto& f = info->second;
     const auto fixed = FixedPlanPath(cfg);
     std::wostringstream k;
@@ -568,8 +573,6 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
 
     // The helper (adapter, a device on it, the files) is looked up once per configuration: creating devices on every
     // frame under the NR lock can deadlock with the present thread, and it did after a step down.
-    static std::wstring foundKey;
-    static std::optional<Helper> found;
     std::string why;
     if (foundKey != key || !found)
     {
@@ -577,6 +580,15 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
         foundKey = key;
         if (!found)
             return fail(why);
+        // Each split pass has its own helper process, plan file and log.
+        std::error_code dirError;
+        found->data /= L"pass" + std::to_wstring(pass + 1);
+        std::filesystem::create_directories(found->data, dirError);
+        if (dirError)
+        {
+            found.reset();
+            return fail("the worker data directory could not be created");
+        }
     }
     auto& helper = found;
     std::error_code sizeError;
@@ -672,5 +684,86 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
              plan.cut, plan.resume, wstring_to_string(helper->adapter.description.Description), planPath.string(),
              plan.forwardBytes / 1024, plan.backwardBytes / 1024);
     return nullptr; // the helper loads its model asynchronously; this frame stays on the game GPU
+}
+
+// More than one pass can be split. Everything above that belongs to the split of one pass (its helper, plan,
+// measurements, timer and calibration) is the selected pass's; the other passes' are parked here and exchanged in
+// before a pass is handled. Select before touching any of it for a pass, and again after a suspension.
+struct PassState
+{
+    std::shared_ptr<SplitGeneration> current;
+    std::wstring currentKey, failedKey, foundKey;
+    std::optional<Helper> found;
+    std::vector<double> intervals;
+    std::chrono::steady_clock::time_point lastFrame {}, retryAt {};
+    DlssNr::NetworkSplit::Plan currentPlan;
+    uint64_t helperCap = ~0ull;
+    unsigned framesRunning = 0, lateChecks = 0, lateMisses = 0, gainCount = 0;
+    double periodBefore = 0.0, lateWaitSum = 0.0, gainSum = 0.0;
+    std::unique_ptr<Calibration> calibration;
+    DlssNr::PassTimer timer;
+    unsigned nextSlot = 0;
+    std::vector<Stats::Use> pending;
+    double wholeSum = 0, headSum = 0, endSum = 0, waitSum = 0;
+    unsigned wholeCount = 0, splitCount = 0, waitCount = 0, waitedCount = 0;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+std::array<PassState, DlssNr::MaxPassCount> parked;
+unsigned selected = 0;
+void Exchange(PassState& s)
+{
+    using std::swap;
+    swap(s.current, current);
+    swap(s.currentKey, currentKey);
+    swap(s.failedKey, failedKey);
+    swap(s.foundKey, foundKey);
+    swap(s.found, found);
+    swap(s.intervals, intervals);
+    swap(s.lastFrame, lastFrame);
+    swap(s.retryAt, retryAt);
+    swap(s.currentPlan, currentPlan);
+    swap(s.helperCap, helperCap);
+    swap(s.framesRunning, framesRunning);
+    swap(s.lateChecks, lateChecks);
+    swap(s.lateMisses, lateMisses);
+    swap(s.gainCount, gainCount);
+    swap(s.periodBefore, periodBefore);
+    swap(s.lateWaitSum, lateWaitSum);
+    swap(s.gainSum, gainSum);
+    swap(s.calibration, calibration);
+    swap(s.timer, Stats::timer);
+    swap(s.nextSlot, Stats::nextSlot);
+    swap(s.pending, Stats::pending);
+    swap(s.wholeSum, Stats::wholeSum);
+    swap(s.headSum, Stats::headSum);
+    swap(s.endSum, Stats::endSum);
+    swap(s.waitSum, Stats::waitSum);
+    swap(s.wholeCount, Stats::wholeCount);
+    swap(s.splitCount, Stats::splitCount);
+    swap(s.waitCount, Stats::waitCount);
+    swap(s.waitedCount, Stats::waitedCount);
+    swap(s.lastReport, Stats::lastReport);
+}
+void Select(unsigned pass)
+{
+    if (pass == selected || pass >= parked.size())
+        return;
+    Exchange(parked[selected]);
+    Exchange(parked[pass]);
+    selected = pass;
+}
+// A pass that is no longer split gives its helper back (its measurements start over when it is split again).
+void Release(unsigned pass)
+{
+    if (pass >= parked.size())
+        return;
+    Select(pass);
+    if (!current && !calibration)
+        return;
+    LOG_INFO("DLSS-NR network split: pass {} is no longer split; its helper stops", pass + 1);
+    calibration.reset();
+    Retire();
+    failedKey.clear();
+    helperCap = ~0ull;
 }
 } // namespace NetworkSplitRun
