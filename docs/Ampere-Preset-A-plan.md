@@ -25,6 +25,21 @@ all 15 kernel containers of the original 310.9.16.0 DLL, so the main model's ker
   multiply. That is the best use of Ampere's tensor cores that keeps the model's numbers; an INT8 path would change
   the picture and is out of scope.
 
+## Measured 2026-11-13 (step 1 done)
+
+`tests/run_nr_cross_process_neural.ps1`, 1280x720, one pass on the RTX 3060, 30 frames, RTX 5070 Ti as game GPU,
+median GPU time of the neural pass:
+
+| Runtime on the 3060 | Preset A | Preset B |
+|---|---|---|
+| NVIDIA 310.8 (`e16bcf15…`) | model creation fails | not applicable |
+| Compatibility 310.9 (`cdfa6c1e…`) | 33.2 ms (handoff median 42.0 ms) | not run |
+| Ampere v0.4.0 (`749daadb…`) | 46.6 ms | 7.6 ms |
+
+The Ampere v0.4.0 runtime does run Preset A, but slower than the compatibility runtime: its tuning does not reach the
+main model's kernels. The Preset A run had little free memory (8.3 GiB commit) and its copy times doubled, so treat
+46.6 ms as "not faster", not as an exact figure. Steps 2 to 5 are still needed.
+
 ## Steps
 
 1. **Test the existing Ampere runtime with Preset A first.** It was built from a DLL that contains both models, and

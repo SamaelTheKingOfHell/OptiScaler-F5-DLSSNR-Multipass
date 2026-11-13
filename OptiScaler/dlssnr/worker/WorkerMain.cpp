@@ -186,8 +186,9 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
     ComPtr<ID3D12Debug> debug;
     if (wire.enableDebug)
     {
-        Check(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)), "Worker D3D12 debug interface");
-        debug->EnableDebugLayer();
+        // The debug layer is a Windows optional feature (Graphics Tools). Without it the timings still run.
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))
+            debug->EnableDebugLayer();
     }
     ComPtr<IDXGIFactory4> factory;
     Check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "Worker factory");
