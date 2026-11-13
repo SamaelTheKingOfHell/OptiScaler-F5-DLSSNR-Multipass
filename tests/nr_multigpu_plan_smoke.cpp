@@ -64,7 +64,9 @@ int main()
     for (unsigned pass = 0; pass < 3; ++pass)
         assert(DeviceOf(masks, pass, 3) == PassDevice::Second);
     masks = ChooseDevice(masks, 2, PassDevice::Game, limit);
-    assert(masks.secondary == 0 && masks.split == 0);
+    assert(masks.secondary == 0b1000 && masks.split == 0); // only passes after it stay on the second GPU
+    for (unsigned pass = 0; pass < 3; ++pass)
+        assert(DeviceOf(masks, pass, 3) == PassDevice::Game);
     // Any number of passes can be split; a split clears whole second-GPU passes and the reverse.
     masks = ChooseDevice({ 0b10, 0 }, 0, PassDevice::Split, limit);
     masks = ChooseDevice(masks, 2, PassDevice::Split, limit);
