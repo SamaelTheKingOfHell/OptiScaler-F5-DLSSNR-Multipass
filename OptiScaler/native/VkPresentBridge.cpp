@@ -370,7 +370,7 @@ std::shared_ptr<ResizeHold> BeginResize()
     auto hold = std::make_shared<ResizeHold>();
 
     // The wrapped swapchain's present takes the shared side for XeFG only
-    if (state.activeFgOutput == FGOutput::XeFG)
+    if (UsesXeFGApi(state.activeFgOutput))
         hold->lock.lock();
 
     return hold;

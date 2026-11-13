@@ -126,6 +126,12 @@ class IFrameSource
 
     // The picture size or the device changed; drop what depends on them.
     virtual void OnResize() = 0;
+
+    // A present the producer does not run on (nothing uses the motion, NativeDriver's Idle), in place of Acquire: what
+    // the adapter must do each present anyway. Holds nothing afterwards, and leaves no state of an earlier frame that
+    // the present would act on (the Vulkan adapter's present waits). Bridged Vulkan still copies the picture in: the
+    // D3D12 swapchain presents it.
+    virtual void Skip() = 0;
 };
 
 } // namespace native

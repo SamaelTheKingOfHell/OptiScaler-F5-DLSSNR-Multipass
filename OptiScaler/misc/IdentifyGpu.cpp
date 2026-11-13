@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "IdentifyGpu.h"
+#include "Fsr4AsicRule.h"
 
 #include <magic_enum.hpp>
 #include <include/device_info/device_info.hpp>
@@ -625,11 +626,10 @@ void IdentifyGpu::updateD3d12Capabilities(D3d12Proxy::PFN_D3D12CreateDevice o_D3
                             {
                                 res.fsr4Support = FSR4Support::INT8Lite;
                             }
-                            // Phoenix, Hawk Point, Krackan, Navi 10 and Navi 12, not officially supported, we are
-                            // adding support for them. Navi 14 lacks hardware INT8
+                            // Phoenix, Hawk Point, Krackan, Navi 12 and Navi 14, not officially supported, we are
+                            // adding support for them. Navi 10 lacks hardware INT8
                             else if ((card.generation == HwGeneration::kGfx11 && card.is_apu) ||
-                                     card.asic_type == AsicType::kGfx11_5_2 || card.asic_type == AsicType::kGfx10_1_0 ||
-                                     card.asic_type == AsicType::kGfx10_1_0Xl || card.asic_type == AsicType::kGfx10_1_1)
+                                     card.asic_type == AsicType::kGfx11_5_2 || Fsr4Asic::Rdna1HasInt8(card.asic_type))
                             {
                                 res.fsr4Support = FSR4Support::INT8Lite;
                             }
@@ -871,60 +871,5 @@ bool IdentifyGpu::queryAmdAsicInfo(LUID luid, uint32_t vendorId, uint32_t device
 
 FSR4Support IdentifyGpu::getFsr4ModelForAsic(uint32_t family, uint32_t revision, uint32_t deviceId, bool asicInfoValid)
 {
-    // Family ids and revision ranges (min <= revision < max) from amdgpu_asic_addr.h
-    constexpr uint32_t familyNv = 143;  // Navi 1x/2x
-    constexpr uint32_t familyVgh = 144; // Van Gogh
-    constexpr uint32_t familyNv3 = 145; // Navi 3x
-    constexpr uint32_t familyPhx = 148; // Phoenix / Hawk Point
-    constexpr uint32_t familyStx = 150; // Strix
-    constexpr uint32_t familyNv4 = 152; // Navi 4x
-
-    struct Asic
-    {
-        uint32_t family, min, max;
-    };
-
-    constexpr Asic navi10 { familyNv, 0x01, 0x0A };
-    constexpr Asic navi12 { familyNv, 0x0A, 0x14 };
-    constexpr Asic navi21 { familyNv, 0x28, 0x32 };
-    constexpr Asic navi22 { familyNv, 0x32, 0x3C };
-    constexpr Asic navi23 { familyNv, 0x3C, 0x46 };
-    constexpr Asic navi24 { familyNv, 0x46, 0x50 };
-    constexpr Asic vanGogh { familyVgh, 0x01, 0x80 }; // Driver checks a narrower range than the header's 0x01-0xFF
-    constexpr Asic navi31 { familyNv3, 0x01, 0x10 };
-    constexpr Asic navi33 { familyNv3, 0x10, 0x20 };
-    constexpr Asic navi32 { familyNv3, 0x20, 0xFF };
-    constexpr Asic phoenix1 { familyPhx, 0x01, 0x80 };
-    constexpr Asic phoenix2 { familyPhx, 0x80, 0xC0 };
-    constexpr Asic hawkPoint1 { familyPhx, 0xC0, 0xF0 };
-    constexpr Asic hawkPoint2 { familyPhx, 0xF0, 0xFF };
-    constexpr Asic strix1 { familyStx, 0x01, 0x40 };
-    constexpr Asic krackan1 { familyStx, 0x40, 0x50 };
-    constexpr Asic strixHalo { familyStx, 0xC0, 0xD0 };
-
-    auto is = [&](const Asic& asic) { return family == asic.family && revision >= asic.min && revision < asic.max; };
-
-    // Checked in the same order as the driver
-    // GFX12 (RDNA4)
-    if (family == familyNv4)
-        return FSR4Support::FP8;
-
-    // Navi 3x (RDNA3) or Strix Halo
-    // Driver also falls back to it for device 0x7481 when it can't get the asic info
-    if (is(navi31) || is(navi32) || is(navi33) || is(strixHalo) || (!asicInfoValid && deviceId == 0x7481))
-        return FSR4Support::INT8;
-
-    // Navi 2x (RDNA2)
-    if (is(navi21) || is(navi22) || is(navi23) || is(navi24))
-        return FSR4Support::INT8_2;
-
-    if (is(strix1) || is(vanGogh))
-        return FSR4Support::INT8Lite;
-
-    // Not officially supported, we are adding support for them
-    // Navi 14 is left out as it lacks hardware INT8
-    if (is(phoenix1) || is(phoenix2) || is(hawkPoint1) || is(hawkPoint2) || is(krackan1) || is(navi10) || is(navi12))
-        return FSR4Support::INT8Lite;
-
-    return FSR4Support::None;
+    return Fsr4Asic::ModelForAsic(family, revision, deviceId, asicInfoValid);
 }

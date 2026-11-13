@@ -42,11 +42,13 @@ struct alignas(256) DlssNrLutConstants
     uint32_t ExposureTrimPreview;
     uint32_t ExposureTrimAnchorCount;
     float ExposureTrimAnchors[16]; // key, trim pairs, as DlssNrConstants' ExposureTrimAnchorExposure0..Trim7
+    uint32_t LatticeCoord; // DlssNr::Lut3D::latticeCoord: 0 even over display 0..1, 1 log-spaced Linear HDR light
 };
 static_assert(sizeof(DlssNrLutConstants) == 256);
 // The HLSL Params cbuffer reads these by position; the live white point block must sit where dlssnr_lut.hlsl puts it.
 static_assert(offsetof(DlssNrLutConstants, Trim) == 48);
 static_assert(offsetof(DlssNrLutConstants, ExposureTrimAnchors) == 80);
+static_assert(offsetof(DlssNrLutConstants, LatticeCoord) == 144);
 
 // The encode's white point fields into the LUT pass's constants. Templated on the encode's constants type
 // (DlssNrConstants) so this header stays free of it; its anchor table is eight key/trim float pairs in order.

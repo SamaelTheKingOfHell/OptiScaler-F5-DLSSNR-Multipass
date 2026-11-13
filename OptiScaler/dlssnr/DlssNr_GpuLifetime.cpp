@@ -129,6 +129,8 @@ struct GpuLifetime::Impl
     {
         Uses uses;
         std::function<void()> destroy;
+        std::weak_ptr<const void> owner;
+        bool owned = false;
     };
     std::vector<std::pair<const void*, std::shared_ptr<Recording>>> recordings;
     Uses currentGeneration;
@@ -268,6 +270,11 @@ void GpuLifetime::Retire(std::function<void()> destroy)
     std::lock_guard lock(impl->mutex);
     impl->retired.push_back({ impl->currentGeneration, std::move(destroy) });
 }
+void GpuLifetime::Retire(std::function<void()> destroy, std::weak_ptr<const void> owner)
+{
+    std::lock_guard lock(impl->mutex);
+    impl->retired.push_back({ impl->currentGeneration, std::move(destroy), std::move(owner), true });
+}
 void GpuLifetime::BeginGeneration()
 {
     std::lock_guard lock(impl->mutex);
@@ -287,6 +294,7 @@ void GpuLifetime::Collect()
     for (;;)
     {
         std::vector<std::function<void()>> ready;
+        std::erase_if(impl->retired, [](const auto& item) { return item.owned && item.owner.expired(); });
         std::erase_if(impl->retired,
                       [&](auto& item)
                       {

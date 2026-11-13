@@ -36,6 +36,8 @@ $cases = @(
     @{ Source = 'tests/nr_finished_color_smoke.cpp'; Libs = 'd3d11.lib d3dcompiler.lib dxgi.lib' },
     @{ Source = 'tests/nr_profiles_smoke.cpp'; Libs = ''; Args = @('OptiScaler/Config.cpp') },
     @{ Source = 'tests/nr_views_smoke.cpp'; Libs = '' },
+    @{ Source = 'tests/nr_native_blend_smoke.cpp'; Libs = '' },
+    @{ Source = 'tests/nr_native_blend_shader_smoke.cpp'; Libs = 'd3d11.lib d3dcompiler.lib'; Args = @('OptiScaler/shaders/dlssnr/precompile/dlssnr.hlsl') },
     @{ Source = 'tests/nr_active_color_smoke.cpp'; Libs = 'd3d12.lib dxgi.lib' }
 )
 Push-Location $repo

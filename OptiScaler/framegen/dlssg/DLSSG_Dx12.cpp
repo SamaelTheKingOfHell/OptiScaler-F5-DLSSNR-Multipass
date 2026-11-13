@@ -1,6 +1,7 @@
 #include "pch.h"
 
 #include "DLSSG_Dx12.h"
+#include <hooks/SwapchainCreateRule.h>
 #include "Kcd2Hdr.h"
 
 #include <hudfix/Hudfix_Dx12.h>
@@ -120,9 +121,10 @@ bool DLSSG_Dx12::CreateSwapchain(IDXGIFactory* factory, ID3D12CommandQueue* cmdQ
         result = factory->CreateSwapChain(cmdQueue, desc, swapChain);
     }
 
-    if (result != S_OK)
+    if (!SwapchainCreate::Created(result, swapChain))
     {
         LOG_ERROR("CreateSwapChain error: {:X}", (UINT) result);
+        SAFE_RELEASE(*swapChain);
         return false;
     }
 
@@ -234,9 +236,10 @@ bool DLSSG_Dx12::CreateSwapchain1(IDXGIFactory* factory, ID3D12CommandQueue* cmd
         factory2->Release();
         factory2 = nullptr;
 
-        if (result != S_OK)
+        if (!SwapchainCreate::Created(result, swapChain))
         {
             LOG_ERROR("CreateSwapChain error: {:X}", (UINT) result);
+            SAFE_RELEASE(*swapChain);
             return false;
         }
     }

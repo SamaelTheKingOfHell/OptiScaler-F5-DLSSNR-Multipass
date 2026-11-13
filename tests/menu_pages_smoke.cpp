@@ -38,12 +38,20 @@ int main()
               "NR pages are exactly the nr.* names ('" + name + "')");
     }
 
-    Check(kPageCount == 15, "8 categories plus 7 Neural Rendering sub-pages");
+    Check(kPageCount == 17, "10 categories plus 7 Neural Rendering sub-pages");
     Check(std::string(Name(Page::Plugins)) == "plugins" && std::string(Label(Page::Plugins)) == "Plugins",
           "the Plugins page has its name and label");
     Check(static_cast<int>(Page::Plugins) == static_cast<int>(Page::Misc) + 1 &&
-              static_cast<int>(Page::Plugins) + 1 == static_cast<int>(Page::NrF5Low),
-          "Plugins sits between Misc and the Neural Rendering group");
+              static_cast<int>(Page::Notifications) == static_cast<int>(Page::Plugins) + 1 &&
+              static_cast<int>(Page::F5Lut) == static_cast<int>(Page::Notifications) + 1 &&
+              static_cast<int>(Page::F5Lut) + 1 == static_cast<int>(Page::NrF5Low),
+          "Plugins, Notifications and F5LUT sit between Misc and the Neural Rendering group");
+    Check(std::string(Name(Page::F5Lut)) == "f5lut" && std::string(Label(Page::F5Lut)) == "F5LUT" &&
+              !IsNeuralRendering(Page::F5Lut) && PageFromName("f5lut") == Page::F5Lut,
+          "the F5LUT page has its name and label and is not in the Neural Rendering group");
+    Check(std::string(Name(Page::Notifications)) == "notifications" &&
+              std::string(Label(Page::Notifications)) == "Notifications" && !IsNeuralRendering(Page::Notifications),
+          "the Notifications page has its name and label");
     Check(!IsNeuralRendering(Page::Plugins), "Plugins is not a Neural Rendering page");
     Check(PageFromName("plugins") == Page::Plugins && PageFromName("misc") == Page::Misc,
           "saved page names still open the same pages");

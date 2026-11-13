@@ -821,6 +821,7 @@ struct CapInputs
     uint32_t shownPerRendered = 1;   // frames XeFG shows per frame the game renders (1 + generated); 1 when it generates none
     bool xefgVsync = false;          // frame generation presents with V-Sync (State::fgPresentVsync)
     bool xellCountsShown = true;     // XeLL counts shown frames: the XeFG library tells it about its own (XeFGProxy)
+    bool driverMultipliesCap = false; // DLSS-G behind XeFG's API: the driver multiplies the interval (XeFGProxy)
 };
 
 // Frames shown per frame the game renders: 1 + the generated ones, but only while frame generation generates. Stood
@@ -905,6 +906,10 @@ inline CapPlan PlanCap(const CapInputs& in)
 
         if (in.capFps <= 0.0f)
             return { CapOwner::LowLatency, 0 };
+
+        // DLSS-G behind XeFG's API: the driver turns the shown-frame interval into one per rendered frame itself
+        if (in.method == Method::RealReflexWithXefg && in.driverMultipliesCap)
+            return { CapOwner::LowLatency, IntervalUs(in.capFps) };
 
         return { CapOwner::LowLatency, IntervalUs(CapPerRenderedFrame(in.capFps, in.shownPerRendered)) };
     }

@@ -66,7 +66,7 @@ try {
         return $true
     }
 
-    $cpu = @('superior_policy', 'spatial_policy', 'interpass_policy', 'nr_guides_smoke', 'nr_surface_formats_smoke')
+    $cpu = @('superior_policy', 'spatial_policy', 'interpass_policy', 'nr_guides_smoke', 'nr_surface_formats_smoke', 'nr_contexts_smoke')
     $quality = @('superior_carrier', 'superior_prepare_quality', 'superior_input_quality',
                  'superior_exposure_quality', 'superior_softknee_quality', 'superior_tall_low_quality',
                  'interpass_low_cache_quality')

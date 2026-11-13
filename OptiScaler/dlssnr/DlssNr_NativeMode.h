@@ -13,7 +13,7 @@ enum class Mode
     NrAndFrameGeneration
 };
 
-// What the keys run. MotionOnly is not a mode: motion is estimated and nothing uses it.
+// What the keys run. MotionOnly is not a mode: nothing uses the motion, so none of it runs (MotionUsed below).
 enum class Shown
 {
     Off,
@@ -243,4 +243,20 @@ inline bool ModeEndsRoute(Mode mode) { return mode != Mode::Off; }
 
 // An ini (or profile) with the route on and a mode's keys as well: the route wins, as it always did.
 inline bool RouteOverridesModes(const Keys& keys, bool route) { return route && FromKeys(keys) != Shown::Off; }
+
+// What the frame step's motion (picture copy, optical flow, trust mask, guides: about a millisecond of GPU time a
+// frame) is for this frame. Only these read it; with none of them it is not run at all.
+struct MotionUsers
+{
+    bool virtualUpscaler = false; // NativeUpscaler: frame generation takes its motion and depth, NR on or off
+    bool nativeInput = false;     // NativeInput: NR on the picture with the motion...
+    bool nrEnabled = false;       // ... which runs only with Enable Neural Rendering...
+    bool finishedPicture = false; // ... and Finished Picture on (DlssNr::ApplyNativeInput refuses it otherwise)
+    bool debugView = false; // NativeDebugView: the menu's pictures, which need a warm flow history to show anything
+};
+
+inline bool MotionUsed(const MotionUsers& users)
+{
+    return users.virtualUpscaler || (users.nativeInput && users.nrEnabled && users.finishedPicture) || users.debugView;
+}
 } // namespace DlssNrNativeMode

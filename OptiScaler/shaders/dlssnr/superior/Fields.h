@@ -52,14 +52,17 @@ inline void SetMotionRegion(DlssNrConstants& c, uint32_t x, uint32_t y, uint32_t
 // The fields above, at the offsets both cbuffers (superior/precompile/dlssnr.hlsl and precompile/dlssnr.hlsl,
 // "cbuffer Params") declare them. Changing either struct or cbuffer requires changing these and rebuilding blobs.
 #define DLSSNR_SUPERIOR_PIN(Struct)                                                                                    \
-    static_assert(offsetof(Struct, Mode) == 0 && offsetof(Struct, Width) == 8 && offsetof(Struct, Height) == 12);     \
-    static_assert(offsetof(Struct, TransferStrength) == 16 && offsetof(Struct, ColourStrength) == 20);              \
-    static_assert(offsetof(Struct, DebugView) == 24 && offsetof(Struct, Passthrough) == 32);                        \
-    static_assert(offsetof(Struct, MvScaleX) == 36 && offsetof(Struct, MvScaleY) == 40);                            \
-    static_assert(offsetof(Struct, GuideWidth) == 44 && offsetof(Struct, GuideHeight) == 48);                       \
-    static_assert(offsetof(Struct, CompareMode) == 52 && offsetof(Struct, CompareSwap) == 64);                      \
-    static_assert(offsetof(Struct, Transfer) == 68 && sizeof(Struct) == 256);
+    static_assert(offsetof(Struct, Mode) == 0 && offsetof(Struct, Width) == 8 && offsetof(Struct, Height) == 12);      \
+    static_assert(offsetof(Struct, TransferStrength) == 16 && offsetof(Struct, ColourStrength) == 20);                 \
+    static_assert(offsetof(Struct, DebugView) == 24 && offsetof(Struct, Passthrough) == 32);                           \
+    static_assert(offsetof(Struct, MvScaleX) == 36 && offsetof(Struct, MvScaleY) == 40);                               \
+    static_assert(offsetof(Struct, GuideWidth) == 44 && offsetof(Struct, GuideHeight) == 48);                          \
+    static_assert(offsetof(Struct, CompareMode) == 52 && offsetof(Struct, CompareSwap) == 64);                         \
+    static_assert(offsetof(Struct, Transfer) == 68);
 DLSSNR_SUPERIOR_PIN(DlssNr::Superior::DlssNrConstants)
 DLSSNR_SUPERIOR_PIN(::DlssNrConstants)
+// The Superior blobs read the first 256 bytes of whatever buffer they are given; the live struct is longer (the depth
+// fade) and keeps the same first 256 bytes.
+static_assert(sizeof(DlssNr::Superior::DlssNrConstants) == 256 && sizeof(::DlssNrConstants) >= 256);
 #undef DLSSNR_SUPERIOR_PIN
 } // namespace DlssNr::Superior::Fields

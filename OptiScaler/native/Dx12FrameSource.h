@@ -24,6 +24,7 @@ class Dx12FrameSource : public IFrameSource
     AcquireStatus Acquire(FrameInput& input) override;
     void Return(const FrameInput& input, const FrameOutput& output) override;
     void OnResize() override {}
+    void Skip() override { Release(); }
 
   private:
     void Release();

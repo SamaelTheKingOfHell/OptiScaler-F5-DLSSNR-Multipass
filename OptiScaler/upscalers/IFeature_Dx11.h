@@ -6,6 +6,7 @@
 #include <shaders/output_scaling/OS_Dx11.h>
 #include <shaders/bias/Bias_Dx11.h>
 #include <shaders/magnifier/Magnifier_Dx11.h>
+#include <shaders/f5lut/F5Lut_Dx11.h>
 #include <gpu_time/GpuTime_Dx11.h>
 
 class IFeature_Dx11 : public virtual IFeature
@@ -32,6 +33,7 @@ class IFeature_Dx11 : public virtual IFeature
     std::unique_ptr<RCAS_Dx11> RCAS = nullptr;
     std::unique_ptr<Bias_Dx11> Bias = nullptr;
     std::unique_ptr<Magnifier_Dx11> Magnifier = nullptr;
+    std::unique_ptr<F5Lut_Dx11> F5Lut = nullptr;
 
     std::unique_ptr<GpuTime_Dx11> UpscalerTime = nullptr;
 

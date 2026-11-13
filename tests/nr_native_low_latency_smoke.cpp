@@ -474,8 +474,40 @@ int main()
         cap.method = Method::RealReflexWithXefg;
         CHECK(PlanCap(cap).owner == CapOwner::LowLatency);
         CHECK(PlanCap(cap).minimumIntervalUs == 8333);
+
+        // ... per rendered frame (3x: 40 fps), except DLSS-G behind XeFG's API (xefg_cuda Generator=dlssg): the driver
+        // multiplies the interval itself, the shown cap goes in. XeLL is not the driver: still per rendered frame there
+        {
+            const uint32_t shown = cap.shownPerRendered;
+            cap.shownPerRendered = 3;
+            CHECK(PlanCap(cap).minimumIntervalUs == 25000);
+            cap.driverMultipliesCap = true;
+            CHECK(PlanCap(cap).owner == CapOwner::LowLatency);
+            CHECK(PlanCap(cap).minimumIntervalUs == 8333);
+            cap.driverMultipliesCap = false;
+            cap.shownPerRendered = shown;
+        }
         cap.method = Method::XellWithXefg;
         cap.xefgVsync = false;
+
+        // ... driverMultipliesCap belongs to Reflex alone: XeLL (not counting shown frames) and Anti-Lag 2 still
+        // divide (3x, cap 120: 40 fps per rendered frame)
+        {
+            const uint32_t shown = cap.shownPerRendered;
+            const bool countsShown = cap.xellCountsShown;
+            cap.shownPerRendered = 3;
+            cap.xellCountsShown = false;
+            cap.driverMultipliesCap = true;
+            CHECK(PlanCap(cap).owner == CapOwner::LowLatency);
+            CHECK(PlanCap(cap).minimumIntervalUs == 25000);
+            cap.method = Method::FakenvapiWithXefg;
+            CHECK(PlanCap(cap).owner == CapOwner::LowLatency);
+            CHECK(PlanCap(cap).minimumIntervalUs == 25000);
+            cap.method = Method::XellWithXefg;
+            cap.driverMultipliesCap = false;
+            cap.xellCountsShown = countsShown;
+            cap.shownPerRendered = shown;
+        }
 
         // ... on Intel XeLL works without XeFG generating
         cap.xefgGenerating = false;

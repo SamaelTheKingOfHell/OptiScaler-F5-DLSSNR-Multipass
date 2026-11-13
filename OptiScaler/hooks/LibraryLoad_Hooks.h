@@ -9,7 +9,8 @@ class LibraryLoadHooks
 
   public:
     static HMODULE LoadLibraryCheckA(std::string libName, LPCSTR lpLibFullPath);
-    static HMODULE LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibFullPath);
+    // dataOnly: the load only maps the file as data (LoadLibraryEx's AS_DATAFILE flags); nothing of it is blocked
+    static HMODULE LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibFullPath, bool dataOnly = false);
     static std::optional<NTSTATUS> FreeLibrary(PVOID library);
 
     static HMODULE LoadNvApi();

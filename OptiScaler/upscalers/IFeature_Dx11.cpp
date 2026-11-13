@@ -33,6 +33,7 @@ bool IFeature_Dx11::Init(ID3D11Device* InDevice, ID3D11DeviceContext* InContext,
         RCAS = std::make_unique<RCAS_Dx11>("RCAS", InDevice);
         Bias = std::make_unique<Bias_Dx11>("Bias", InDevice); // TODO: not needed on DLSS/DLSSD
         Magnifier = std::make_unique<Magnifier_Dx11>("Magnifier", InDevice);
+        F5Lut = std::make_unique<F5Lut_Dx11>("F5LUT", InDevice);
 
         UpscalerTime = std::make_unique<GpuTime_Dx11>(InDevice);
     }
@@ -229,6 +230,44 @@ bool IFeature_Dx11::Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NGX_Par
                              } });
     }
 
+    // F5LUT: the LUT stack on the upscaler's output, after sharpening, while NR is not grading it (F5Lut_Common.h)
+    if (F5Lut != nullptr && F5Lut->ShouldRun(IsHdr()))
+    {
+        pipeline.push_back(
+            { // Setup
+              [&](ID3D11Resource* nextOutput) -> ID3D11Resource*
+              {
+                  if (F5Lut->CreateBufferResource(Device, nextOutput))
+                      return F5Lut->Buffer();
+                  return nullptr;
+              },
+
+              // Dispatch
+              [&](ID3D11Resource* input, ID3D11Resource* output) -> bool
+              {
+                  // The game's exposure sets the white point of a linear HDR frame (none with auto
+                  // exposure)
+                  ID3D11Resource* exposure = nullptr;
+                  float preExposure = 1.0f;
+                  if (IsHdr() && !AutoExposure())
+                  {
+                      if (InParameters->Get(NVSDK_NGX_Parameter_ExposureTexture, &exposure) != NVSDK_NGX_Result_Success)
+                          InParameters->Get(NVSDK_NGX_Parameter_ExposureTexture, (void**) &exposure);
+                      InParameters->Get(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, &preExposure);
+
+                      // Only a 2D texture can stand as the exposure; anything else reads as none
+                      D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+                      if (exposure != nullptr)
+                          exposure->GetType(&dimension);
+                      if (dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+                          exposure = nullptr;
+                  }
+
+                  return F5Lut->Dispatch(InDeviceContext, (ID3D11Texture2D*) input, (ID3D11Texture2D*) output, IsHdr(),
+                                         (ID3D11Texture2D*) exposure, preExposure);
+              } });
+    }
+
     if (Magnifier->ShouldRun())
     {
         pipeline.push_back({ // Setup
@@ -377,6 +416,12 @@ void IFeature_Dx11::ReadDetailedGpuTimes(void* deviceContextVoid, std::vector<De
 
     if (magnifierTime)
         detailedGpuTimes.emplace_back(DetailedGpuTime { Magnifier->Name(), magnifierTime.value(), false });
+
+    if (F5Lut != nullptr)
+    {
+        if (auto f5LutTime = F5Lut->ReadGpuTime(deviceContext))
+            detailedGpuTimes.emplace_back(DetailedGpuTime { F5Lut->Name(), f5LutTime.value(), false });
+    }
 }
 
 IFeature_Dx11::~IFeature_Dx11()
@@ -388,4 +433,5 @@ IFeature_Dx11::~IFeature_Dx11()
     OutputScaler.reset();
     RCAS.reset();
     Bias.reset();
+    F5Lut.reset();
 }

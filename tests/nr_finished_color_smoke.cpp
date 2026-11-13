@@ -35,7 +35,7 @@ try
 {
     // The shader's cbuffer reads the first 32 bytes: mode, exposureScale, width, height, sceneIsLinear, (colour),
     // (debug), maxRatio.
-    static_assert(sizeof(DlssNrConstants) == 256);
+    static_assert(sizeof(DlssNrConstants) % 256 == 0); // a whole number of 256-byte slots (the depth fade made it two)
     static_assert(offsetof(DlssNrConstants, Mode) == 0);
     static_assert(offsetof(DlssNrConstants, WhitePoint) == 4);
     static_assert(offsetof(DlssNrConstants, Width) == 8);

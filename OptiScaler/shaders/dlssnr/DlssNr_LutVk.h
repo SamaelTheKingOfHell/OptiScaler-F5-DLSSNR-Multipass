@@ -36,6 +36,7 @@ class DlssNr_LutVk
 
     VkDevice _device = VK_NULL_HANDLE;
     VkPhysicalDevice _physicalDevice = VK_NULL_HANDLE;
+    bool _anyFormatTarget = false;
 
     // Pipeline and its rings. Built together on the first Dispatch.
     bool _built = false;
@@ -73,7 +74,10 @@ class DlssNr_LutVk
                       VkDeviceMemory* memory) const;
 
   public:
-    DlssNr_LutVk(VkDevice device, VkPhysicalDevice physicalDevice);
+    // `anyFormatTarget`: the target is not our RGBA16F image but one of any format (the post-NR stack grades the
+    // game's own image in place); the shader then declares no storage format, which the device must allow
+    // (shaderStorageImageWriteWithoutFormat, DlssNr::VkExt::WritesWithoutFormat).
+    DlssNr_LutVk(VkDevice device, VkPhysicalDevice physicalDevice, bool anyFormatTarget = false);
     ~DlssNr_LutVk();
 
     // True once the pipeline and rings exist; builds them on first use. False, and not tried again, if that failed.
@@ -94,9 +98,10 @@ class DlssNr_LutVk
     // Frees the 3D image and the staging buffer (LutFile cleared). The device must be idle.
     void ReleaseLutImage();
 
-    // Grades `sourceView` (in `sourceLayout`) into `targetView` (GENERAL, RGBA16F) and records the barrier that makes
-    // the result readable by the next compute dispatch. `constants` is copied into the next ring slot. `exposureView`
-    // is the live 1x1 exposure the encode reads, when its constants say it is used (VK_NULL_HANDLE: none bound).
+    // Grades `sourceView` (in `sourceLayout`) into `targetView` (GENERAL; RGBA16F unless anyFormatTarget) and records
+    // the barrier that makes the result readable by the next compute dispatch. `constants` is copied into the next ring
+    // slot. `exposureView` is the live 1x1 exposure the encode reads, when its constants say it is used
+    // (VK_NULL_HANDLE: none bound).
     bool Dispatch(VkCommandBuffer cmd, VkImageView sourceView, VkImageLayout sourceLayout, VkImageView targetView,
                   const DlssNrLutConstants& constants, VkImageView exposureView = VK_NULL_HANDLE,
                   VkImageLayout exposureLayout = VK_IMAGE_LAYOUT_GENERAL);

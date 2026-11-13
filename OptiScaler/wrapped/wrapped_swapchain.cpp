@@ -14,6 +14,7 @@
 #include <with_dx12/with_dx12.h>
 
 #include <menu/menu_overlay_dx.h>
+#include <menu/menu_overlay_base.h>
 #include <output/SdrToHdr_Dx11Present.h>
 #include <native/NativeDriverDx12.h>
 #include <native/NativeLowLatency.h>
@@ -324,7 +325,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     // (VkPresentBridge BeginResize): it would wait for itself. A native Vulkan game's present takes none either.
     std::shared_lock<std::shared_mutex> dx11wDx12PresentLock(Dx11wDx12Sync::PresentResizeMutex(), std::defer_lock);
     if (State::Instance().swapchainInteropApi != SwapchainInteropApi::None &&
-        State::Instance().activeFgOutput == FGOutput::XeFG && !VkPresentBridge::DxvkThroughVulkan())
+        UsesXeFGApi(State::Instance().activeFgOutput) && !VkPresentBridge::DxvkThroughVulkan())
     {
         dx11wDx12PresentLock.lock();
     }
@@ -652,7 +653,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
             InputAntiLag2::injectAl2Context(pSwapChain, fgIsActive);
         }
 #else
-        if (State::Instance().activeFgOutput == FGOutput::FSRFG || State::Instance().activeFgOutput == FGOutput::XeFG)
+        if (State::Instance().activeFgOutput == FGOutput::FSRFG || UsesXeFGApi(State::Instance().activeFgOutput))
         {
             LOG_DEBUG("Calling fakenvapi");
 
@@ -696,7 +697,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     // DLSSG reports them, with the frame id of the batch XeFG marked (out of band present markers; Anti-Lag 2 takes the
     // frame type from them). InputCommon::fg_output_present does nothing while XeLL is the output.
     const bool xefgPresent = willPresent && cq != nullptr && fg != nullptr &&
-                             State::Instance().activeFgOutput == FGOutput::XeFG && fg->IsGenerating();
+                             UsesXeFGApi(State::Instance().activeFgOutput) && fg->IsGenerating();
 
     if (xefgPresent)
         InputCommon::fg_output_present(cq, false);
@@ -984,6 +985,16 @@ IUnknown* WrappedIDXGISwapChain4::ApiDevice(bool& d3d11) const
 
 WrappedIDXGISwapChain4::~WrappedIDXGISwapChain4() {}
 
+bool WrappedIDXGISwapChain4::PassesThrough() const
+{
+    return _otherWindow && State::Instance().currentFGSwapchain != nullptr;
+}
+
+bool WrappedIDXGISwapChain4::OwnsMenuCleanup() const
+{
+    return !_otherWindow || (_presentedAsMain && !PassesThrough() && MenuOverlayBase::Handle() == _handle);
+}
+
 //
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::QueryInterface(REFIID riid, void** ppvObject)
 {
@@ -1114,7 +1125,7 @@ ULONG STDMETHODCALLTYPE WrappedIDXGISwapChain4::Release()
         if (_libraryWindowed)
             FGHooks::ReleaseBorderless(this);
 
-        if (!bridgeOwns)
+        if (!bridgeOwns && OwnsMenuCleanup())
             MenuOverlayDx::CleanupRenderTarget(true, _handle);
 
         if (State::Instance().currentSwapchain == this)
@@ -1123,8 +1134,10 @@ ULONG STDMETHODCALLTYPE WrappedIDXGISwapChain4::Release()
         if (State::Instance().currentRealSwapchain == this)
             State::Instance().currentRealSwapchain = nullptr;
 
+        // Not for a chain on another window (MarkOtherWindow): frame generation lives on its own window's chain
         auto fg = State::Instance().currentFG;
-        if (!bridgeOwns && fg != nullptr && fg->Mutex.getOwner() != 1 && fg->SwapchainContext() != nullptr)
+        if (!bridgeOwns && !_otherWindow && fg != nullptr && fg->Mutex.getOwner() != 1 &&
+            fg->SwapchainContext() != nullptr)
         {
             fg->Deactivate();
             fg->ReleaseSwapchain(_handle);
@@ -1213,6 +1226,11 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present(UINT SyncInterval, UIN
     if (_composition && _handle == nullptr)
         return _real->Present(SyncInterval, Flags);
 
+    if (PassesThrough())
+        return _real->Present(SyncInterval, Flags);
+
+    _presentedAsMain = true;
+
     HRESULT result;
 
     if ((Flags & DXGI_PRESENT_TEST) == 0)
@@ -1257,6 +1275,10 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::SetFullscreenState(BOOL Fullsc
     // game-facing chain, whose hook answers them.)
     if (_upgraded)
         return EmulateFullscreen(Fullscreen, pTarget);
+
+    // Another window's chain (MarkOtherWindow): neither frame generation's mutex nor State's full-screen flag are its
+    if (PassesThrough())
+        return _real->SetFullscreenState(Fullscreen, pTarget);
 
     HRESULT result = S_OK;
 
@@ -1355,6 +1377,11 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetDesc(DXGI_SWAP_CHAIN_DESC* 
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers(UINT BufferCount, UINT Width, UINT Height,
                                                                 DXGI_FORMAT NewFormat, UINT SwapChainFlags)
 {
+    // Another window's chain (MarkOtherWindow): no HDR proxy, no frame generation, menu or State work (the menu's
+    // cleanup is global, see OwnsMenuCleanup)
+    if (PassesThrough())
+        return _real->ResizeBuffers(BufferCount, Width, Height, NewFormat, SwapChainFlags);
+
     // HDR output: a resize inside a resize on this thread (a window message the game answers with its own ResizeBuffers) is
     // refused; one from another thread waits for the running one (SdrToHdr::ProxyChainBase::Resize)
     if (auto* proxy = Proxy(); proxy != nullptr && proxy->InResizeOnThisThread())
@@ -1437,7 +1464,7 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers(UINT BufferCount
     /*
 
     const bool outputRequiresRelease =
-        State::Instance().activeFgOutput == FGOutput::FSRFG || State::Instance().activeFgOutput == FGOutput::XeFG;
+        State::Instance().activeFgOutput == FGOutput::FSRFG || UsesXeFGApi(State::Instance().activeFgOutput);
 
     if (outputRequiresRelease && State::Instance().currentFG != nullptr)
     {
@@ -1624,6 +1651,11 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present1(UINT SyncInterval, UI
         _handle = FindCompositionWindow();
     if (_composition && _handle == nullptr)
         return _real1->Present1(SyncInterval, Flags, pPresentParameters);
+
+    if (PassesThrough())
+        return _real1->Present1(SyncInterval, Flags, pPresentParameters);
+
+    _presentedAsMain = true;
 
     HRESULT result;
 
@@ -1840,6 +1872,11 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers1(UINT BufferCoun
                                                                  const UINT* pCreationNodeMask,
                                                                  IUnknown* const* ppPresentQueue)
 {
+    // As in ResizeBuffers
+    if (PassesThrough())
+        return _real3->ResizeBuffers1(BufferCount, Width, Height, Format, SwapChainFlags, pCreationNodeMask,
+                                      ppPresentQueue);
+
     // HDR output: a resize inside a resize on this thread (a window message the game answers with its own ResizeBuffers) is
     // refused; one from another thread waits for the running one (SdrToHdr::ProxyChainBase::Resize)
     if (auto* proxy = Proxy(); proxy != nullptr && proxy->InResizeOnThisThread())
@@ -1963,7 +2000,7 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::ResizeBuffers1(UINT BufferCoun
 
     // Release swapchain backbuffers to prevent errors when resizing
     const bool isUsingOptiFgFeature =
-        State::Instance().activeFgOutput == FGOutput::FSRFG || State::Instance().activeFgOutput == FGOutput::XeFG;
+        State::Instance().activeFgOutput == FGOutput::FSRFG || UsesXeFGApi(State::Instance().activeFgOutput);
 
     if (isUsingOptiFgFeature && State::Instance().currentFG != nullptr)
     {

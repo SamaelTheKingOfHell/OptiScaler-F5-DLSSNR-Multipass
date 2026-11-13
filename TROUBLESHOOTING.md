@@ -259,6 +259,24 @@ The port is a separate optional download (`Optional-Vendor-Neutral-DLSS5-Forward
 - Log signs: `XeFG_Dx12::CreateSwapchain Max supported interpolations: 1`, and later
   `Requested interpolation count is higher than max supported, setting to max: 1`.
 - Cause: XeFG reports its own maximum for the card and refuses more. Only an unlock plugin can raise it.
+- On an NVIDIA GPU: FG Output F5Low (our own frame generation from the plugins folder) offers up to 6x;
+  see docs/F5LOW-FRAME-GENERATION.md.
+
+### F5Low is greyed out, or falls back to no frame generation
+- Log signs: `F5Low: F5Low frame generation needs an NVIDIA GPU ...; FG Output set to None for this session` or
+  `F5Low: f5low.dll is not in the plugins folder; FG Output set to None for this session`.
+- Cause: F5Low's XeFG Tensor generator runs on NVIDIA tensor cores, and its library must be at
+  `OptiScaler\plugins\f5low.dll` (the plugins folder of OptiScaler's folder; `[Plugins] Path` moves it). f5low.dll is in the release zip; if you removed it, put it back.
+- `F5Low: libxess_fg.dll is missing`: F5Low builds its frame generator from Intel's libxess_fg.dll. The zip ships
+  version 1.3.4.95 in OptiScaler's folder; keep it there.
+- The Frame Generation page says "running on Intel's XeFG (up to 4x)": f5low.dll could not build its own generator
+  (the hover text gives the reason). Only libxess_fg.dll 1.3.4.95 and 1.3.1.78 work; put the shipped 1.3.4.95 back.
+- `F5Low could not start its frame generation` (toast): switch FG Output to XeFG and restart; the log has the reason.
+- On every start f5low.dll builds its frame generator from libxess_fg.dll in memory, in the background (about half a
+  second); frame generation starts by itself when it is ready. Nothing is written to disk. The Frame Generation page
+  says "building its frame generator in the background" meanwhile; it should clear within about a second. If it stays,
+  the status hover text and f5low.log say why. Old `f5low_cache` folders from earlier versions are removed by f5low
+  itself. `f5low.log` goes to `%LOCALAPPDATA%\f5low` when the plugins folder is not writable.
 
 ### "Slow motion", or the frame rate far below the cap with XeFG 3x or 4x
 - Expected: the frame cap counts all shown frames, real and generated. A cap of 120 at 4x means 30 rendered frames per

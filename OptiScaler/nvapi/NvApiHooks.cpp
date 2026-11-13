@@ -302,7 +302,7 @@ void NvApiHooks::Hook(HMODULE nvapiModule)
         constexpr bool leanMode = true;
         if (fakenvapi::isUsingAsMainNvapi())
             fakenvapi::init(!leanMode);
-        else if (State::Instance().activeFgOutput == FGOutput::XeFG)
+        else if (UsesXeFGApi(State::Instance().activeFgOutput))
             fakenvapi::init(leanMode);
 
         DetourTransactionBegin();

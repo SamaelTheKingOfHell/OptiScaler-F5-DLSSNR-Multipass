@@ -3,13 +3,14 @@
 #include "DlssNr_LutVk.h"
 
 #include "precompile/dlssnr_lut_Shader_Vk.h"
+#include "precompile/dlssnr_lut_anyformat_Shader_Vk.h"
 #include <dlssnr/DlssNr_LutPack.h>
 
 #include <algorithm>
 #include <cstring>
 
-DlssNr_LutVk::DlssNr_LutVk(VkDevice device, VkPhysicalDevice physicalDevice)
-    : _device(device), _physicalDevice(physicalDevice)
+DlssNr_LutVk::DlssNr_LutVk(VkDevice device, VkPhysicalDevice physicalDevice, bool anyFormatTarget)
+    : _device(device), _physicalDevice(physicalDevice), _anyFormatTarget(anyFormatTarget)
 {
 }
 
@@ -172,8 +173,8 @@ bool DlssNr_LutVk::Build()
 
     VkShaderModuleCreateInfo moduleInfo {};
     moduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    moduleInfo.codeSize = sizeof(dlssnr_lut_spv);
-    moduleInfo.pCode = reinterpret_cast<const uint32_t*>(dlssnr_lut_spv);
+    moduleInfo.codeSize = _anyFormatTarget ? sizeof(dlssnr_lut_anyformat_spv) : sizeof(dlssnr_lut_spv);
+    moduleInfo.pCode = reinterpret_cast<const uint32_t*>(_anyFormatTarget ? dlssnr_lut_anyformat_spv : dlssnr_lut_spv);
 
     VkShaderModule module = VK_NULL_HANDLE;
     if (vkCreateShaderModule(_device, &moduleInfo, nullptr, &module) != VK_SUCCESS)
@@ -266,16 +267,15 @@ bool DlssNr_LutVk::EnsureLutImage(VkCommandBuffer cmd, const float* rgb, int siz
         return false;
     };
 
-    const VkFormat format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    // Full float texels, read point by point: the shader interpolates them itself (dlssnr_lut.hlsl LutTrilinear), so
+    // the device needs no linear filtering of this format.
+    const VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT;
 
-    // Linear filtering between lattice points is the whole feature; without it the grade would be a stepped lookup.
     VkFormatProperties formatProps {};
     vkGetPhysicalDeviceFormatProperties(_physicalDevice, format, &formatProps);
-    const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
-                                        VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
-                                        VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
     if ((formatProps.optimalTilingFeatures & needed) != needed)
-        return fail("RGBA16F cannot be linearly sampled as a 3D image on this device");
+        return fail("RGBA32F cannot be read as a 3D image on this device");
 
     VkImageFormatProperties imageProps {};
     if (vkGetPhysicalDeviceImageFormatProperties(_physicalDevice, format, VK_IMAGE_TYPE_3D, VK_IMAGE_TILING_OPTIMAL,
@@ -323,8 +323,8 @@ bool DlssNr_LutVk::EnsureLutImage(VkCommandBuffer cmd, const float* rgb, int siz
     if (vkCreateImageView(_device, &viewInfo, nullptr, &_lutView) != VK_SUCCESS)
         return fail("image view");
 
-    // Tightly packed half4 texels, w = 1.0, red fastest -- exactly a 3D image's own order.
-    const VkDeviceSize bytes = (VkDeviceSize) DlssNrLutPack::TightBytes(size);
+    // Tightly packed float4 texels, w = 1.0, red fastest -- exactly a 3D image's own order.
+    const VkDeviceSize bytes = (VkDeviceSize) DlssNrLutPack::TightBytesFloat4(size);
 
     void* mapped = nullptr;
     if (!CreateBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -333,8 +333,8 @@ bool DlssNr_LutVk::EnsureLutImage(VkCommandBuffer cmd, const float* rgb, int siz
         vkMapMemory(_device, _stagingMemory, 0, bytes, 0, &mapped) != VK_SUCCESS)
         return fail("staging buffer");
 
-    const size_t rowPitch = (size_t) size * 4u * sizeof(uint16_t);
-    DlssNrLutPack::PackHalf4(rgb, size, static_cast<uint8_t*>(mapped), rowPitch, rowPitch * (size_t) size);
+    const size_t rowPitch = (size_t) size * 4u * sizeof(float);
+    DlssNrLutPack::PackFloat4(rgb, size, static_cast<uint8_t*>(mapped), rowPitch, rowPitch * (size_t) size);
     vkUnmapMemory(_device, _stagingMemory);
 
     VkImageMemoryBarrier toCopy {};

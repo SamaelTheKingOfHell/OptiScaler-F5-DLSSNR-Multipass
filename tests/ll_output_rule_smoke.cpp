@@ -542,6 +542,35 @@ int main()
         in.xefgShownPerRendered = 3;
         CHECK(CapForGame(in).fps == 25.0f);
 
+        // ... DLSS-G behind XeFG's API (xefg_cuda Generator=dlssg): the driver multiplies the interval by DLSS-G's
+        // multiplier itself, so the shown cap goes in; fakenvapi does not multiply
+        {
+            const bool real = in.realNvapi;
+            in.driverMultipliesCap = true;
+            in.realNvapi = true;
+            c = CapForGame(in);
+            CHECK(c.outputHoldsCap && c.fps == 75.0f);
+            // ... no later rule divides it, XeLL's cap-per-rendered rule included
+            const bool xellCounts = in.xellCountsShown;
+            const bool xellHolds = in.xellHoldsCap;
+            in.xellCountsShown = false;
+            in.xellHoldsCap = true;
+            CHECK(CapForGame(in).fps == 75.0f);
+            in.xellCountsShown = xellCounts;
+            in.xellHoldsCap = xellHolds;
+            in.realNvapi = false;
+            CHECK(CapForGame(in).fps == 25.0f);
+            in.realNvapi = real;
+            // ... Anti-Lag 2 is not Reflex: it still divides
+            const auto side = in.side;
+            in.side = XefgLatency::AntiLag2;
+            in.realNvapi = true;
+            CHECK(CapForGame(in).fps == 25.0f);
+            in.realNvapi = real;
+            in.side = side;
+            in.driverMultipliesCap = false;
+        }
+
         // ... not when the game's Reflex is off, nor for a game that only marks frames
         in.gameLowLatencyOn = false;
         CHECK(!CapForGame(in).outputHoldsCap);
@@ -589,6 +618,43 @@ int main()
         CHECK(CapForGame(in).outputHoldsCap);
         in.outputRunning = false;
         CHECK(!CapForGame(in).outputHoldsCap);
+    }
+
+    // Async markers: the frame generation library's own calls are recognised by module, and only when a library is loaded
+    {
+        int libraryModule = 0, gameModule = 0;
+        CHECK(IsFgLibraryMarker(&libraryModule, &libraryModule));
+        CHECK(!IsFgLibraryMarker(&gameModule, &libraryModule));
+        CHECK(!IsFgLibraryMarker(nullptr, nullptr));
+        CHECK(!IsFgLibraryMarker(&gameModule, nullptr));
+    }
+
+    // Input latency: simulation start to GPU done, else to the end of Present, else none
+    {
+        auto none = InputLatencyFromReport(0, 5000, 9000);
+        CHECK(!none.valid);
+        auto gpu = InputLatencyFromReport(1000, 30000, 52000); // 51 ms, not the report's span
+        CHECK(gpu.valid && gpu.reachesGpu && gpu.ms > 50.99 && gpu.ms < 51.01);
+        auto gpuSameAsPresent = InputLatencyFromReport(1000, 4000, 4000);
+        CHECK(gpuSameAsPresent.valid && gpuSameAsPresent.reachesGpu && gpuSameAsPresent.ms > 2.99 && gpuSameAsPresent.ms < 3.01);
+        auto gpuBeforePresent = InputLatencyFromReport(1000, 30000, 20000);
+        CHECK(gpuBeforePresent.valid && !gpuBeforePresent.reachesGpu && gpuBeforePresent.ms > 28.99 && gpuBeforePresent.ms < 29.01);
+        auto noGpu = InputLatencyFromReport(1000, 12000, 0);
+        CHECK(noGpu.valid && !noGpu.reachesGpu && noGpu.ms > 10.99 && noGpu.ms < 11.01);
+        CHECK(!InputLatencyFromReport(5000, 5000, 0).valid);
+        CHECK(!InputLatencyFromReport(5000, 0, 0).valid);
+        CHECK(!InputLatencyFromReport(5000, 3000, 0).valid);
+        CHECK(!InputLatencyFromReport(5000, 3000, 2000).valid);
+    }
+
+    // Which reads count toward the shown input latency: a new frame and 500 ms or less; the first read counts
+    {
+        CHECK(InputLatencySampleCounts(false, 0, 100, 40.0));
+        CHECK(InputLatencySampleCounts(true, 100, 101, 40.0));
+        CHECK(!InputLatencySampleCounts(true, 100, 100, 40.0));   // the frame did not change (loading screen)
+        CHECK(!InputLatencySampleCounts(true, 100, 101, 22233.0)); // too long
+        CHECK(!InputLatencySampleCounts(false, 0, 100, 500.5));
+        CHECK(InputLatencySampleCounts(true, 100, 101, 500.0));
     }
 
     static_assert(IntervalUs(75.0f) == 13333);

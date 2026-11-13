@@ -29,6 +29,7 @@ class NativeDriver
     enum class Status
     {
         Off,
+        Idle,              // nothing uses the motion this frame (DlssNrNativeMode::MotionUsed): none of it runs
         Waiting,           // the game calls an upscaler
         PausedForNativeFg, // lower display buffers may contain generated frames
         Failed,
@@ -52,6 +53,10 @@ class NativeDriver
     // The first thing a present does: false while [DlssNr] NativeMotion is off (the virtual upscaler is released and
     // the status goes back to Off).
     bool Enabled();
+
+    // Whether anything reads the motion this frame (DlssNrNativeMode::MotionUsed on the config): without, RunFrame runs
+    // none of it (Status::Idle).
+    static bool MotionUsed();
 
     // Break native flow/NR history before standing aside for the game's native DLSS-G.
     void PauseForNativeFg();
@@ -107,6 +112,7 @@ class NativeDriver
     std::atomic<bool> _pictureHdr10 { false }; // the last picture handed to NR was HDR10 (read by the menu thread)
     uint64_t _trustFrame = 0; // the last frame the trust mask was recorded in
     uint64_t _cuts = 0;       // scene cuts the mask reported
+    uint32_t _queueChanges = 0; // producer lists that went to another queue than the last (logged the first few)
     Status _status = Status::Off;
     std::string _failure;
 

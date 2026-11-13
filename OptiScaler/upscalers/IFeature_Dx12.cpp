@@ -44,6 +44,7 @@ bool IFeature_Dx12::Init(ID3D12Device* InDevice, ID3D12GraphicsCommandList* InCo
         RCAS = std::make_unique<RCAS_Dx12>("RCAS", InDevice);
         Bias = std::make_unique<Bias_Dx12>("Bias", InDevice); // TODO: not needed on DLSS/DLSSD
         Magnifier = std::make_unique<Magnifier_Dx12>("Magnifier", InDevice);
+        F5Lut = std::make_unique<F5Lut_Dx12>("F5LUT", InDevice);
 
         UpscalerTime = std::make_unique<GpuTime_Dx12>(InDevice);
     }
@@ -206,6 +207,40 @@ bool IFeature_Dx12::Evaluate(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX
               } });
     }
 
+    // F5LUT: the LUT stack on the upscaler's output, after sharpening, while NR is not grading it (F5Lut_Common.h)
+    if (F5Lut != nullptr && F5Lut->ShouldRun(IsHdr()))
+    {
+        pipeline.push_back(
+            { // Setup
+              [&](ID3D12Resource* nextOutput) -> ID3D12Resource*
+              {
+                  if (F5Lut->CreateBufferResource(Device, nextOutput, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+                  {
+                      F5Lut->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                      return F5Lut->Buffer();
+                  }
+                  return nullptr;
+              },
+
+              // Dispatch
+              [&](ID3D12Resource* input, ID3D12Resource* output) -> bool
+              {
+                  F5Lut->SetBufferState(InCommandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+                  // The game's exposure sets the white point of a linear HDR frame (none with auto exposure)
+                  ID3D12Resource* exposure = nullptr;
+                  float preExposure = 1.0f;
+                  if (IsHdr() && !AutoExposure())
+                  {
+                      if (InParameters->Get(NVSDK_NGX_Parameter_ExposureTexture, &exposure) != NVSDK_NGX_Result_Success)
+                          InParameters->Get(NVSDK_NGX_Parameter_ExposureTexture, (void**) &exposure);
+                      InParameters->Get(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, &preExposure);
+                  }
+
+                  return F5Lut->Dispatch(InCommandList, input, output, IsHdr(), exposure, preExposure);
+              } });
+    }
+
     if (Magnifier->ShouldRun())
     {
         pipeline.push_back(
@@ -341,6 +376,12 @@ void IFeature_Dx12::ReadDetailedGpuTimes(void* commandQueueVoid, std::vector<Det
 
     if (magnifierTime)
         detailedGpuTimes.emplace_back(DetailedGpuTime { Magnifier->Name(), magnifierTime.value(), false });
+
+    if (F5Lut != nullptr)
+    {
+        if (auto f5LutTime = F5Lut->ReadGpuTime(commandQueue))
+            detailedGpuTimes.emplace_back(DetailedGpuTime { F5Lut->Name(), f5LutTime.value(), false });
+    }
 }
 
 IFeature_Dx12::IFeature_Dx12(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters) { ++LiveFeatures; }
@@ -379,6 +420,7 @@ IFeature_Dx12::~IFeature_Dx12()
         RCAS.release();
         Bias.release();
         Magnifier.release();
+        F5Lut.release();
         UpscalerTime.release();
         return;
     }
@@ -394,4 +436,6 @@ IFeature_Dx12::~IFeature_Dx12()
     OutputScaler.reset();
     RCAS.reset();
     Bias.reset();
+    // Its lattice and buffer may still be read by lists on the GPU
+    Util::DelayedDestroy(std::move(F5Lut));
 }

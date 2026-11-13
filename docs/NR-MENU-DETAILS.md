@@ -116,16 +116,18 @@ under Status.
 
 A profile is made to be shared for one game. It holds how NR looks and what it costs (everything the preset rows set,
 the passes and their overrides, colour, output, input style, detail reuse, the LUT) and the game's own settings: the
-exposure source and its trims and calibration points, Colour Encoding, NR Only (Finished Picture), Optical F5Low and
-Compress screen edges. It leaves out what is yours or only for this session: Enable Neural Rendering, the toggle key,
-the display's paper white, Compare and the debug views, and the diagnostic switches.
+exposure source and its trims and calibration points, Colour Encoding, NR Only (Finished Picture), the Optical F5Low
+tuning (depth size and offsets, motion profile) and Compress screen edges. It leaves out what is yours or only for this
+session: Enable Neural Rendering, the toggle key, the display's paper white, the Optical F5Low Mode (Off, NR only, NR +
+frame generation) and the game's-upscaler route, Compare and the debug views, and the diagnostic switches. Loading a
+profile never turns the upscaler or frame generation off.
 
 - Files are `OptiScaler\NRProfiles\<name>.ini`. To share one, send the file; the other player puts it in the same
   folder of their install and presses Rescan.
 - Load sets every setting the profile holds. One the file does not have goes to its default, so a profile gives the
   same picture whatever was set before.
-- A profile records the game it was saved in. Picking one saved in another game shows that in amber: its exposure and
-  Optical F5Low settings are for that game.
+- A profile records the game it was saved in. Picking one saved in another game shows that in amber: its exposure
+  settings are for that game. Loading it keeps this game's Optical F5Low tuning.
 - The LUT is saved by its file name only and loaded only from this game's `OptiScaler\LUTs`. If the file is not there,
   the LUT is turned off and the menu says so.
 - Some Optical F5Low settings take effect after a restart; after a load that changed them the menu links to the Optical

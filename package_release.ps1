@@ -12,6 +12,16 @@
 # same nvngx.dll_dlssnr.dll interface that runs the model itself (no NVIDIA NGX core needed, so it
 # works on AMD/Intel). This script does not build it. Supplying the path is what opts it in; it never
 # replaces the default forwarder at the package root, only adds it under Optional\.
+#
+# -F5LowKit is the f5low kit: a folder or a zip (then -F5LowKitSha256 is required), made by the f5low-fg repo
+# (tools/make_kit.ps1, f5low-kit-<ver>.zip, also a release asset there). It holds f5low.dll, Intel's libxess_fg.dll
+# 1.3.4.95, LICENSE, XeSS_LICENSE.txt, README-KIT.txt and kit_hashes.txt (lines "<sha256>  <file>"; f5low.dll and
+# libxess_fg.dll must be listed and match). Default: the git-ignored folder external\f5low. F5Low ships by default: a
+# release without a kit FAILS unless -NoF5Low is given. f5low.dll goes into OptiScaler\plugins\ (OptiScaler's default [Plugins] Path), where FG Output F5Low loads it
+# by itself; it carries no Intel content and builds its frame generator on first use from the player's
+# libxess_fg.dll (1.3.4.95 or 1.3.1.78). The package therefore ships the kit's libxess_fg.dll 1.3.4.95 as
+# OptiScaler\libxess_fg.dll, replacing the 1.3.1.78 that a local MSBuild output still copies from external\xess\bin.
+# No DLL of the kit is ever committed to this repository.
 
 param(
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]*$')]
@@ -22,7 +32,10 @@ param(
     [string]$HybridAssetsDirectory,
     [string]$StreamlineArchive,
     [string]$PortBackendDll,
-    [string]$PortBackendIni
+    [string]$PortBackendIni,
+    [string]$F5LowKit,
+    [string]$F5LowKitSha256,
+    [switch]$NoF5Low
 )
 
 $ErrorActionPreference = "Stop"
@@ -57,6 +70,115 @@ if ($IncludeDlssFrameGeneration) {
     Write-Warning 'LOCAL USE ONLY: this DLL-containing package has not been cleared for redistribution. Publish the downloader-only variant instead; see docs/DLSS-FRAME-GENERATION.md.'
 }
 
+# ---- f5low kit: resolve and validate BEFORE anything is built or staged ----------------------------------------------
+# A refused kit must leave no release\<version> folder behind (the version would be burned) and cost no build.
+# The libxess_fg.dll F5Low ships. f5low.dll builds its frame generator from the player's copy and knows only this build
+# and 1.3.1.78. To bump it: put the new Intel file in the kit, then change BOTH values (version and SHA-256) here.
+$f5lowIntelVersion = '1.3.4.95'
+$f5lowIntelSha256 = '752B1491350A29FB2850FA4D0D14F62D79980E0B3CD067D147BB2469C1EC3182'
+
+$kitData = $null
+$kitPlugins = @()
+$kitLicenses = [ordered]@{}
+$kitIntelVersion = $f5lowIntelVersion
+if ($NoF5Low -and $F5LowKit) { throw '-NoF5Low and -F5LowKit contradict each other' }
+if (-not $F5LowKit -and -not $NoF5Low) { $F5LowKit = "$root\external\f5low" }
+if ($F5LowKit) {
+    if (-not (Test-Path -LiteralPath $F5LowKit)) {
+        throw "REFUSING: no f5low kit at $F5LowKit. Put the kit (f5low-kit-<ver>.zip from f5low-fg, unpacked) there, pass -F5LowKit, or pass -NoF5Low to package without F5Low."
+    }
+    $isZip = Test-Path -LiteralPath $F5LowKit -PathType Leaf
+    if ($isZip) {
+        if ($F5LowKitSha256 -notmatch '^[0-9A-Fa-f]{64}$') { throw 'A kit zip needs -F5LowKitSha256 (64 hex digits)' }
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $F5LowKit).Hash -ne $F5LowKitSha256.ToUpperInvariant()) {
+            throw 'REFUSING: the f5low kit zip does not match -F5LowKitSha256'
+        }
+    }
+    elseif ($F5LowKitSha256) {
+        throw '-F5LowKitSha256 belongs to a kit zip; a kit folder is checked through its kit_hashes.txt'
+    }
+
+    $kitTemp = $null
+    try {
+        $kitDir = $F5LowKit
+        if ($isZip) {
+            $kitTemp = Join-Path ([System.IO.Path]::GetTempPath()) ("f5lowkit_" + [guid]::NewGuid().ToString('N'))
+            Expand-Archive -LiteralPath $F5LowKit -DestinationPath $kitTemp
+            $dll = @(Get-ChildItem -LiteralPath $kitTemp -Recurse -File -Filter 'f5low.dll')
+            if ($dll.Count -ne 1) { throw "REFUSING: expected one f5low.dll in the kit zip, found $($dll.Count)" }
+            $kitDir = $dll[0].DirectoryName
+        }
+
+        foreach ($f in @('f5low.dll', 'libxess_fg.dll', 'LICENSE', 'XeSS_LICENSE.txt', 'zstd_LICENSE.txt', 'kit_hashes.txt')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $kitDir $f) -PathType Leaf)) {
+                throw "REFUSING: the f5low kit is missing ${f}: $F5LowKit"
+            }
+        }
+
+        # Every file the kit lists must match; the two DLLs and zstd's licence must be listed
+        $listed = @{}
+        foreach ($line in Get-Content -LiteralPath (Join-Path $kitDir 'kit_hashes.txt')) {
+            if ($line -match '^\s*([0-9A-Fa-f]{64})\s+\*?(\S+)\s*$') { $listed[$Matches[2]] = $Matches[1].ToUpperInvariant() }
+        }
+        foreach ($f in @('f5low.dll', 'libxess_fg.dll', 'zstd_LICENSE.txt')) {
+            if (-not $listed.ContainsKey($f)) { throw "REFUSING: kit_hashes.txt does not list $f" }
+        }
+        foreach ($f in $listed.Keys) {
+            $path = Join-Path $kitDir $f
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "REFUSING: kit_hashes.txt lists $f, which is not in the kit" }
+            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash -ne $listed[$f]) {
+                throw "REFUSING: $f does not match kit_hashes.txt"
+            }
+        }
+
+        # libxess_fg.dll: exactly the pinned build, and Intel's own unmodified file (its signature says so)
+        $intel = Join-Path $kitDir 'libxess_fg.dll'
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $intel).Hash -ne $f5lowIntelSha256) {
+            throw "REFUSING: the kit's libxess_fg.dll is not Intel's $f5lowIntelVersion ($f5lowIntelSha256)"
+        }
+        if ((Get-Item -LiteralPath $intel).VersionInfo.FileVersion -ne $f5lowIntelVersion) {
+            throw "REFUSING: the kit's libxess_fg.dll does not report file version $f5lowIntelVersion"
+        }
+        $intelSignature = Get-AuthenticodeSignature -LiteralPath $intel
+        if ($intelSignature.Status -ne 'Valid' -or $intelSignature.SignerCertificate.Subject -notmatch '(^|,\s*)O=Intel Corporation(,|$)') {
+            throw "REFUSING: the kit's libxess_fg.dll is not validly signed by Intel ($($intelSignature.Status))"
+        }
+
+        # XeFG's API plus our own export, so Intel's library or an unrelated file under the wrong name is caught.
+        $cudaText = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes((Join-Path $kitDir 'f5low.dll')))
+        $cudaMissing = @(@('xefgSwapChainD3D12CreateContext', 'xefgCudaXellCountsRenderedOnly') | Where-Object { $cudaText.IndexOf($_) -lt 0 })
+        if ($cudaMissing.Count -gt 0) {
+            throw "REFUSING: f5low.dll is missing required exports: $($cudaMissing -join ', ')"
+        }
+        # Same rule as the port backend: no PDB path or local build path in a public binary.
+        $cudaLeaks = @(@('.pdb', ('\Users\' + [Environment]::UserName + '\'), $root) |
+            Where-Object { $cudaText.IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -ge 0 })
+        if ($cudaLeaks.Count -gt 0) {
+            throw "REFUSING: f5low.dll appears to contain a local path or identifying string ($($cudaLeaks -join ', '))."
+        }
+
+        # Read what will be staged into memory, so the extracted copy can go as soon as this block ends
+        $kitData = @{}
+        $kitPlugins = @('f5low.dll')
+        if (Test-Path -LiteralPath (Join-Path $kitDir 'f5low.ini') -PathType Leaf) { $kitPlugins += 'f5low.ini' }
+        $names = @($kitPlugins) + @('libxess_fg.dll', 'LICENSE', 'XeSS_LICENSE.txt', 'README-KIT.txt')
+        $names += @($listed.Keys | Where-Object { $_ -like '*_LICENSE.txt' -and $_ -ne 'XeSS_LICENSE.txt' })
+        foreach ($f in ($names | Select-Object -Unique)) {
+            $path = Join-Path $kitDir $f
+            if (Test-Path -LiteralPath $path -PathType Leaf) { $kitData[$f] = [System.IO.File]::ReadAllBytes($path) }
+        }
+        $kitLicenses['f5low_LICENSE.txt'] = 'LICENSE'
+        $kitLicenses['XeSS_LICENSE.txt'] = 'XeSS_LICENSE.txt'
+        if ($kitData.ContainsKey('README-KIT.txt')) { $kitLicenses['f5low_README-KIT.txt'] = 'README-KIT.txt' }
+        foreach ($f in ($kitData.Keys | Where-Object { $_ -like '*_LICENSE.txt' -and $_ -ne 'XeSS_LICENSE.txt' } | Sort-Object)) {
+            $kitLicenses["f5low_$f"] = $f
+        }
+    }
+    finally {
+        if ($kitTemp -and (Test-Path -LiteralPath $kitTemp)) { Remove-Item -LiteralPath $kitTemp -Recurse -Force }
+    }
+}
+
 if (-not $SkipBuild) {
     $msb = (Get-Command MSBuild.exe -ErrorAction SilentlyContinue).Source
     if (-not $msb) {
@@ -81,18 +203,15 @@ if (-not $SkipBuild) {
 
 $src = "$root\x64\Release\a"
 
-# The forwarder is taken from its own build output, not from the shared folder. The solution build
-# does not reliably rebuild it, and a stale one here would ship silently.
-#
-# A fresh checkout has no per-project output directory until that project has been built on its own,
-# so fall back to the shared folder rather than failing. The export check below is what actually
-# guards against a stale one, and it runs either way.
-$forwarder = "$root\OptiScaler\dlssnr\forwarder\x64\Release\a\nvngx.dll_dlssnr.dll"
-
-if (-not (Test-Path $forwarder)) {
-    $forwarder = "$root\x64\Release\a\nvngx.dll_dlssnr.dll"
-    Write-Host "forwarder: using the shared build output ($forwarder)"
-}
+# The forwarder has two possible outputs: the shared folder when built through the solution, its own folder when its
+# project is built alone. Take the newer one, so an old build left in either cannot ship. The export check below and the
+# version check further down guard against a stale one too.
+$forwarder = @("$root\OptiScaler\dlssnr\forwarder\x64\Release\a\nvngx.dll_dlssnr.dll", "$root\x64\Release\a\nvngx.dll_dlssnr.dll") |
+    Where-Object { Test-Path -LiteralPath $_ } |
+    Sort-Object { (Get-Item -LiteralPath $_).LastWriteTimeUtc } -Descending |
+    Select-Object -First 1
+if (-not $forwarder) { throw 'REFUSING: nvngx.dll_dlssnr.dll is not built' }
+Write-Host "forwarder: $forwarder"
 
 $exports = @("dlssnr_call_create", "dlssnr_call_evaluate_v2", "dlssnr_call_set_extras",
              "dlssnr_vk_probe", "dlssnr_vk_init", "dlssnr_vk_create", "dlssnr_vk_evaluate_v2", "dlssnr_vk_release")
@@ -329,6 +448,34 @@ Not validated on real AMD or Intel hardware.
     Write-Host "vendor-neutral port backend: staged under Optional\ (not the default)"
 }
 
+if ($kitData) {
+    # Kit checks ran at the top, before anything was built or staged; only the copying is left
+    $pluginsDir = "$stage\OptiScaler\plugins"
+    New-Item -ItemType Directory -Force -Path $pluginsDir | Out-Null
+    foreach ($f in $kitPlugins) {
+        [System.IO.File]::WriteAllBytes("$pluginsDir\$f", $kitData[$f])
+    }
+    [System.IO.File]::WriteAllBytes("$stage\OptiScaler\libxess_fg.dll", $kitData['libxess_fg.dll'])
+    foreach ($entry in $kitLicenses.GetEnumerator()) {
+        [System.IO.File]::WriteAllBytes("$stage\Licenses\$($entry.Key)", $kitData[$entry.Value])
+    }
+    # Self-check: OptiScaler loads f5low.dll from <OptiScaler folder>\plugins, never from a plugins folder at the zip root
+    if (-not (Test-Path -LiteralPath "$stage\OptiScaler\plugins\f5low.dll" -PathType Leaf) -or
+        (Test-Path -LiteralPath "$stage\plugins")) {
+        throw 'REFUSING: f5low.dll must be staged as OptiScaler\plugins\f5low.dll (and no plugins folder at the package root)'
+    }
+    Write-Host "f5low kit: OptiScaler\plugins\ ($($kitPlugins -join ', ')), Intel library OptiScaler\libxess_fg.dll $kitIntelVersion, licences: $($kitLicenses.Keys -join ', ')"
+}
+
+# Frame generation ships off and F5Low on its default generator: OptiScaler\plugins\f5low.dll is only loaded when a player
+# picks FG Output F5Low.
+$packagedIni = Get-Content -LiteralPath "$stage\OptiScaler.ini" -Raw
+foreach ($key in @('FGOutput', 'FrameGenerator')) {
+    if ($packagedIni -notmatch "(?m)^$key=auto\r?$") {
+        throw "REFUSING: the packaged ini must ship $key=auto"
+    }
+}
+
 # The shipped DLL is unsigned, and a scanner's static model reads these properties. They are all correct
 # today and cost nothing to keep that way; what this catches is a future build configuration quietly
 # dropping one -- a debug build's PDB path, or ASLR turned off -- and adding an avoidable signal on top of
@@ -356,6 +503,14 @@ foreach ($field in 'CompanyName', 'FileDescription', 'ProductName', 'OriginalFil
     if ([string]::IsNullOrWhiteSpace($versionInfo.$field)) {
         throw "REFUSING: staged OptiScaler.dll has an empty $field in its version resource"
     }
+}
+# The forwarder carries the release number too, so a player can tell which release a game folder's copy came from.
+$forwarderVersion = (Get-Item -LiteralPath "$stage\nvngx.dll_dlssnr.dll").VersionInfo.FileVersion
+if ([string]::IsNullOrWhiteSpace($forwarderVersion)) {
+    throw 'REFUSING: staged nvngx.dll_dlssnr.dll has no version in its version resource'
+}
+if ($forwarderVersion -ne $versionInfo.FileVersion) {
+    throw "REFUSING: staged nvngx.dll_dlssnr.dll is version $forwarderVersion, OptiScaler.dll is $($versionInfo.FileVersion): a stale build"
 }
 Write-Host ("binary hygiene: DllCharacteristics 0x{0:X4}, version resource complete, no PDB path" -f $dllCharacteristics)
 

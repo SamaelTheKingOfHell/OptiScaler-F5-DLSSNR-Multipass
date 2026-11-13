@@ -39,7 +39,7 @@ void InputUeLowLatency::tickStart(int64_t frameId, float DeltaSeconds, bool bIdl
 
     const auto owner =
         ueinput::OtherOwner(ReflexHooks::gameCalledReflex(), native::lowlatency::Running(),
-                            native::lowlatency::FrameGenerationNeedsReflex() || state.activeFgOutput == FGOutput::XeFG);
+                            native::lowlatency::FrameGenerationNeedsReflex() || UsesXeFGApi(state.activeFgOutput));
 
     const auto previousOwner = memory.owner;
     const auto step = ueinput::Next(memory, device, owner, InputCommon::active_output() == LowLatencyMode::Reflex,

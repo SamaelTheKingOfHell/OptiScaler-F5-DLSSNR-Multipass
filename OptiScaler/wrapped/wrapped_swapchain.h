@@ -29,6 +29,11 @@ class DECLSPEC_UUID("3af622a3-82d0-49cd-994f-cce05122c222") WrappedIDXGISwapChai
                           bool isComposition = false, const SdrToHdr::Plan* plan = nullptr);
     virtual ~WrappedIDXGISwapChain4();
 
+    // Made on another window while frame generation's swapchain lived (FGHooks::IsOtherWindowThanFG): while that one
+    // lives, this chain only presents, resizes and switches full screen (no State, frame generation, low latency or
+    // menu work), and its release never tears frame generation down
+    void MarkOtherWindow() { _otherWindow = true; }
+
     // implement IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
     ULONG STDMETHODCALLTYPE AddRef() override;
@@ -114,6 +119,16 @@ class DECLSPEC_UUID("3af622a3-82d0-49cd-994f-cce05122c222") WrappedIDXGISwapChai
     IUnknown* _device = nullptr;
 
     HWND _handle = nullptr;
+
+    bool _otherWindow = false;
+    // Presented through LocalPresent (frame generation was away): the menu may have drawn on this chain. Written by the
+    // presenting thread, read by Release's
+    std::atomic<bool> _presentedAsMain { false };
+    bool PassesThrough() const;
+    // The menu's buffers go with this chain (MenuOverlayDx::CleanupRenderTarget is global: it deactivates frame
+    // generation and frees the menu's objects whatever the window): never for another window's chain while frame
+    // generation lives, nor for one the menu never drew on or has since left
+    bool OwnsMenuCleanup() const;
 
     // HDR output (output/SdrToHdr_*): null until the chain is first proxied, then set once and never reset or replaced
     // (GetBuffer / GetDesc read it on any thread). While it is Active the game's GetBuffer returns the proxies and the real

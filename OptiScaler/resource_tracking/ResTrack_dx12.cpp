@@ -2601,13 +2601,13 @@ void ResTrack_Dx12::HookCommandList(ID3D12Device* InDevice)
     }
 }
 
-void ResTrack_Dx12::HookLateNrQueue(ID3D12Device* device)
+bool ResTrack_Dx12::HookLateNrQueue(ID3D12Device* device)
 {
     static std::mutex hookMutex;
     std::lock_guard<std::mutex> lock(hookMutex);
     HookToQueue(device);
     if (o_LateReset)
-        return;
+        return o_ExecuteCommandLists != nullptr;
     ID3D12CommandAllocator* allocator = nullptr;
     ID3D12GraphicsCommandList* cmd = nullptr;
     if (SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))))
@@ -2633,6 +2633,7 @@ void ResTrack_Dx12::HookLateNrQueue(ID3D12Device* device)
         }
         allocator->Release();
     }
+    return o_ExecuteCommandLists != nullptr && o_LateReset != nullptr;
 }
 
 void ResTrack_Dx12::HookToQueue(ID3D12Device* InDevice)

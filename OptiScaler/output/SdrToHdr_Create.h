@@ -117,6 +117,7 @@ inline FgBackend FgBackendOf(FGOutput output)
     switch (output)
     {
     case FGOutput::XeFG:
+    case FGOutput::F5Low:
         return FgBackend::XeFG;
     case FGOutput::FSRFG:
         return FgBackend::FsrFG;

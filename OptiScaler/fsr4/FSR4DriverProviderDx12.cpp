@@ -3,6 +3,7 @@
 
 #include "FSR4Models.h"
 
+#include <misc/Fsr4AsicRule.h>
 #include <misc/IdentifyGpu.h>
 #include <proxies/FfxApi_Proxy.h>
 
@@ -237,7 +238,7 @@ HRESULT STDMETHODCALLTYPE AmdExtFfxApi::UpdateFfxApiProvider(void* pData, uint32
         return E_NOINTERFACE;
 
     // Prevents the use of FP8 FG on unsupported cards
-    if (effectType == FFXStructType::FG && realFsr4Support != FSR4Support::FP8)
+    if (effectType == FFXStructType::FG && !Fsr4Asic::DriverFgAllowed(realFsr4Support))
         return E_NOINTERFACE;
 
     // Frame generation and its swapchain are only given out when enabled through the options

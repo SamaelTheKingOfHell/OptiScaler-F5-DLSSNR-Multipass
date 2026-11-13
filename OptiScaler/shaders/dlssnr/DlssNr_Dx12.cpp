@@ -30,6 +30,8 @@
 #include "DlssNr_SurfaceFormats.h"
 #include "DlssNr_ActiveColor.h"
 #include "DlssNr_Views.h"
+#include "DlssNr_Contexts.h"
+#include "DlssNr_Retire.h"
 #include "DlssNr_Guides.h"
 #include "DlssNr_SeamClock.h"
 #include "DlssNr_GameScale.h"
@@ -47,6 +49,7 @@
 #include "DlssNr_ExposureFoundBlend.h"
 #include "DlssNr_ExposureMeter.h"
 #include "DlssNr_FinishedReady.h"
+#include <native/NativeLowLatencyRule.h>
 #include <dlssnr/DlssNr_StreamlinePicture.h>
 #include <dlssnr/DlssNr_GameDefaults.h>
 #include <dlssnr/DlssNr_OwnedCommandChain.h>
@@ -346,6 +349,13 @@ struct NrState
     ID3D12Resource* lutScratch = nullptr;
     bool lutScratchFailed = false;
 
+    // hdrCopy (without a UAV), activeColor and lutScratch keep the game's exact format. A game that alternates two
+    // formats (Neverness to Everness: RGBA16F and R11G11B10F) would park one and make another of each on every call,
+    // each parked one held for 32 epochs; the one of the other format waits here instead (KeepExactFormat).
+    ID3D12Resource* hdrCopySpare = nullptr;
+    ID3D12Resource* activeColorSpare = nullptr;
+    ID3D12Resource* lutScratchSpare = nullptr;
+
     // The frame shrunk for the model, when it is working below full resolution.
     ID3D12Resource* colorSmall = nullptr;
 
@@ -582,15 +592,25 @@ struct NrState
 
     // The game's last output format, to say once that it swaps RGBA8 and BGRA8 (the surfaces and model are kept)
     DXGI_FORMAT lastGameFormat = DXGI_FORMAT_UNKNOWN;
+    bool lastBeforeUpscale = false; // where lastGameFormat was taken: before or after SR
     bool saidFormatSwap = false;
+    // The game has flipped between RGBA16F and R11G11B10F: our surfaces stay RGBA16F for both (DlssNr_SurfaceFormats.h)
+    bool floatFlipSeen = false;
+
+    // Stands NR down while the game's frames would rebuild the model on every call (DlssNr_SurfaceFormats.h)
+    DlssNr::RebuildGuard rebuildGuard;
 };
 
 NrState g_nr;
 
+// Some view's RebuildGuard stands NR down, for the menu (read off the render thread)
+std::atomic<bool> g_rebuildStandDown { false };
+
 // DlssNr_SurfaceFormats.h takes no Windows headers and spells these formats as numbers
 static_assert(DXGI_FORMAT_R8G8B8A8_TYPELESS == 27 && DXGI_FORMAT_R8G8B8A8_UNORM == 28 &&
               DXGI_FORMAT_R8G8B8A8_UNORM_SRGB == 29 && DXGI_FORMAT_B8G8R8A8_UNORM == 87 &&
-              DXGI_FORMAT_B8G8R8A8_TYPELESS == 90 && DXGI_FORMAT_B8G8R8A8_UNORM_SRGB == 91);
+              DXGI_FORMAT_B8G8R8A8_TYPELESS == 90 && DXGI_FORMAT_B8G8R8A8_UNORM_SRGB == 91 &&
+              DXGI_FORMAT_R16G16B16A16_FLOAT == 10 && DXGI_FORMAT_R11G11B10_FLOAT == 26);
 
 // Automatic's own base white point (PreExposure / its metered exposure, never the followed game's), from the CPU
 // readbacks a few frames behind the shader's live value. 0 when there is no reading yet.
@@ -965,10 +985,10 @@ void DiscoverFloatSlot(NVSDK_NGX_Parameter* params)
 // clamps linear HDR into an 8-bit texture -- wrong brightness until something forces a rebuild -- or
 // hands CopyResource mismatched formats, which fails silently and makes the whole pass appear to do
 // nothing. So the set is torn down whenever the format it was built for is not the format needed now.
-// Retired model features and surfaces are parked and freed a comfortable number of evaluates later.
+// Retired model features and surfaces are parked and freed once the GPU is done with them (DlssNr_Retire.h).
 // Releasing them immediately was the device hang: with frame generation the GPU runs several frames
-// behind, this work rides the game's own queue that no module fence covers, and an NGX feature or
-// scratch texture freed under in-flight work kills the device.
+// behind, this work rides the game's own queue, and an NGX feature or scratch texture freed under
+// in-flight work kills the device.
 struct NrRetired
 {
     void* feature = nullptr;
@@ -983,10 +1003,82 @@ struct NrRetired
     // out the usual 32-frame delay is the same use-after-free this whole retirement list exists to
     // prevent. DlssNr_DeferredSr.inl's ~Generation tears both down together for the same reason.
     NVSDK_NGX_Parameter* parameters = nullptr;
-    int framesLeft = 32;
+    // Set by NrLifetime once every list NR recorded before this was parked has finished on the GPU. Shared by
+    // everything parked in one Dispatch; null when the command list hooks were not on (the item waits for
+    // kStuckFrames).
+    std::shared_ptr<std::atomic_bool> gpuDone;
 };
 
-std::vector<NrRetired> g_nrRetired;
+// When they are freed: DlssNr_Retire.h.
+DlssNr::Retire::List<NrRetired> g_nrRetired;
+
+// A recorded list was destroyed: the submit and reset hooks need not hear about it any more.
+void NrListDestroyed(const void* identity) { DlssNrWatchedLists::Remove(1, &identity); }
+
+// Every list NR records on, and the queues they ran on (Dispatch, FinishedPictureSubmitted,
+// FinishedPictureResetCommandList). Kept for the process's life, like Superior Scaling's tracker.
+DlssNr::GpuLifetime& NrLifetime()
+{
+    static auto* value = new DlssNr::GpuLifetime(&NrListDestroyed);
+    return *value;
+}
+
+// NrLifetime hears about every list NR records on: the submit and the reset hook are both on. Without the submit hook
+// a list that is reset would count as finished with no GPU work, so then nothing is recorded at all.
+bool g_nrListsReported = false;
+// What everything parked since the last WatchNrList shares: one Retire per Dispatch, not one per item.
+std::shared_ptr<std::atomic_bool> g_nrParkDone;
+
+// A list NR is about to record on, at the top of Dispatch, before anything can be parked. The hooks go on first (and
+// are asked again every time: HookLateNrQueue returns at once when they are on).
+void WatchNrList(ID3D12GraphicsCommandList* cmdList)
+{
+    g_nrParkDone.reset();
+
+    ID3D12Device* device = nullptr;
+
+    if (cmdList == nullptr || FAILED(cmdList->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr)
+        return;
+
+    const bool reported = ResTrack_Dx12::HookLateNrQueue(device);
+    device->Release();
+
+    if (!reported && g_nrListsReported != reported)
+        LOG_WARN("DLSS-NR: the command list hooks are not on, parked models and textures are freed by time");
+
+    g_nrListsReported = reported;
+
+    if (!reported)
+        return;
+
+    NrLifetime().Record(cmdList);
+    // The list the hooks report is the real one, not a Streamline proxy (as DlssNrGpuTime::Start and Late::Arm do).
+    DlssNrWatchedLists::Add(Util::RealObjectIdentity(cmdList));
+}
+
+void ParkNr(NrRetired& r)
+{
+    if (g_nrListsReported)
+    {
+        if (g_nrParkDone == nullptr)
+        {
+            g_nrParkDone = std::make_shared<std::atomic_bool>(false);
+            // Owned by the flag: once every item sharing it is gone (freed by time when a list never finishes), the
+            // tracker drops this without running it.
+            NrLifetime().Retire(
+                [done = std::weak_ptr<std::atomic_bool>(g_nrParkDone)]
+                {
+                    if (auto flag = done.lock())
+                        *flag = true;
+                },
+                g_nrParkDone);
+        }
+
+        r.gpuDone = g_nrParkDone;
+    }
+
+    g_nrRetired.Park(r);
+}
 
 void ParkNrFeature(void*& feature, void (*releaseFn)(void*) = nullptr,
                   NVSDK_NGX_Parameter** parameters = nullptr)
@@ -1005,7 +1097,7 @@ void ParkNrFeature(void*& feature, void (*releaseFn)(void*) = nullptr,
         *parameters = nullptr;
     }
 
-    g_nrRetired.push_back(r);
+    ParkNr(r);
 }
 
 void ParkNrResource(ID3D12Resource*& res)
@@ -1016,7 +1108,35 @@ void ParkNrResource(ID3D12Resource*& res)
     NrRetired r;
     r.resource = res;
     res = nullptr;
-    g_nrRetired.push_back(r);
+    ParkNr(r);
+}
+
+// A surface that keeps the game's exact format (copied to or from its texture) and no longer matches it: the one in
+// `spare` is taken if it has that format and the same size, and the old one waits in `spare` for the game to switch
+// back. Otherwise `current` is left empty for the caller to make.
+void KeepExactFormat(ID3D12Resource*& current, ID3D12Resource*& spare, DXGI_FORMAT format)
+{
+    if (current == nullptr)
+        return;
+
+    const D3D12_RESOURCE_DESC have = current->GetDesc();
+    if (have.Format == format)
+        return;
+
+    ID3D12Resource* old = current;
+    current = nullptr;
+
+    if (spare != nullptr)
+    {
+        const D3D12_RESOURCE_DESC other = spare->GetDesc();
+
+        if (other.Format == format && other.Width == have.Width && other.Height == have.Height)
+            current = spare;
+        else
+            ParkNrResource(spare);
+    }
+
+    spare = old;
 }
 
 void ReleaseNrFeature(const NrRetired& r)
@@ -1034,23 +1154,33 @@ void ReleaseNrFeature(const NrRetired& r)
         NVNGXProxy::D3D12_DestroyParameters()(r.parameters);
 }
 
-void TickNrRetired()
+void FreeNrRetiredNow(const NrRetired& r)
 {
-    for (size_t i = 0; i < g_nrRetired.size();)
+    ReleaseNrFeature(r);
+
+    if (r.resource != nullptr)
+        r.resource->Release();
+}
+
+void FreeNrRetired(const NrRetired& r, bool gpuConfirmed)
+{
+    static bool said = false;
+
+    if (!gpuConfirmed && !said && r.gpuDone != nullptr)
     {
-        if (--g_nrRetired[i].framesLeft > 0)
-        {
-            ++i;
-            continue;
-        }
-
-        ReleaseNrFeature(g_nrRetired[i]);
-
-        if (g_nrRetired[i].resource != nullptr)
-            g_nrRetired[i].resource->Release();
-
-        g_nrRetired.erase(g_nrRetired.begin() + i);
+        said = true;
+        LOG_WARN("DLSS-NR: a parked {} was freed by time, its command lists were never reported finished",
+                 r.feature != nullptr ? "model" : "texture");
     }
+
+    FreeNrRetiredNow(r);
+}
+
+void TickNrRetired(unsigned long long epoch)
+{
+    NrLifetime().Collect();
+    g_nrRetired.Tick(
+        epoch, [](const NrRetired& r) { return r.gpuDone != nullptr && r.gpuDone->load(); }, FreeNrRetired);
 }
 
 // The inject point decides which buffer is being measured -- the upscaler's linear output or the
@@ -1096,9 +1226,9 @@ void ReleaseSurfacesIfFormatChanged(DXGI_FORMAT modelFormat, DXGI_FORMAT colourF
         g_nr.passPendingSubmission[i] = false;
     }
 
-    for (ID3D12Resource** r :
-         { &g_nr.output, &g_nr.passScratch, &g_nr.passClampScratch, &g_nr.passClampScratch2, &g_nr.colorCopy,
-           &g_nr.hdrCopy, &g_nr.colorSmall, &g_nr.outputNative, &g_nr.activeColor, &g_nr.lutScratch })
+    for (ID3D12Resource** r : { &g_nr.output, &g_nr.passScratch, &g_nr.passClampScratch, &g_nr.passClampScratch2,
+                                &g_nr.colorCopy, &g_nr.hdrCopy, &g_nr.colorSmall, &g_nr.outputNative, &g_nr.activeColor,
+                                &g_nr.lutScratch, &g_nr.hdrCopySpare, &g_nr.activeColorSpare, &g_nr.lutScratchSpare })
         ParkNrResource(*r);
 
     g_nr.passScratchFailed = false;
@@ -1914,12 +2044,20 @@ DXGI_FORMAT TypedGuideFormat(DXGI_FORMAT f)
 
 bool IsTypeless(DXGI_FORMAT f) { return TypedGuideFormat(f) != f; }
 
-// Creates a typed twin of a guide buffer, matching everything but the format.
-ID3D12Resource* CreateGuideClone(ID3D12Device* device, ID3D12Resource* source)
+// Creates a typed twin of a guide buffer, matching everything but the format. With `topLevelOnly` the twin holds just
+// the source's first subresource (mip 0 of slice 0): a game may keep a depth pyramid in its depth buffer's lower mips
+// (Resonance: A Plague Tale Legacy, 11 mips), and only the top level is the guide.
+ID3D12Resource* CreateGuideClone(ID3D12Device* device, ID3D12Resource* source, bool topLevelOnly = false)
 {
     D3D12_RESOURCE_DESC desc = source->GetDesc();
     desc.Format = TypedGuideFormat(desc.Format);
     desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    if (topLevelOnly)
+    {
+        desc.MipLevels = 1;
+        desc.DepthOrArraySize = 1;
+        desc.Alignment = 0;
+    }
 
     D3D12_HEAP_PROPERTIES heap {};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -2202,6 +2340,7 @@ void ReportSkipOnce(const char* reason)
 }
 
 namespace Views = DlssNr::Views;
+namespace Contexts = DlssNr::Contexts;
 
 // A game that draws several views into one colour allocation (a triple-screen rig) calls the upscaler once per view,
 // each with its own active rectangle, and often once more for the combined picture. This module has one model feature
@@ -2216,8 +2355,19 @@ Views::Detector g_views;
 // scene cut, the scan, frame statistics) are taken on the first view NR runs on in the frame only.
 bool g_multiRun = false;
 bool g_viewSecondary = false;
+
+// The game's DLSS features (DlssNr_Contexts.h). g_contextRun: this evaluate is a secondary feature with a model of its
+// own, which stands aside from the same one-picture state as a multi-view run and takes the main picture's
+// measurements. The counts are for the menu.
+Contexts::Map g_contexts;
+bool g_contextRun = false;
+std::atomic<unsigned> g_contextsAside { 0 }, g_contextsOwn { 0 };
 unsigned long long g_sceneCuts = 0; // cuts the first view found; each other view resets once per cut
-unsigned long long g_viewSceneCuts[Views::kSlots] = {}; // ... and remembers the last one it took
+// The view slots: one per screen of a multi-monitor layout (Views::kSlots), then one per game DLSS feature with a
+// model of its own (DlssNr_Contexts.h, SecondaryFeatures = Own model), at kContextSlot + k.
+constexpr unsigned kContextSlot = Views::kSlots;
+constexpr unsigned kAllSlots = Views::kSlots + Contexts::kOwnSlots;
+unsigned long long g_viewSceneCuts[kAllSlots] = {}; // ... and remembers the last one it took
 
 // The first view is the leftmost ticked view that is still being drawn, picked by slot, not by the present count: AC
 // EVO records its views on a render thread while presents go on elsewhere, so a present can fall between two views of
@@ -2339,7 +2489,7 @@ struct ViewState
 };
 
 ViewState g_mainView;
-ViewState g_viewSlots[Views::kSlots];
+ViewState g_viewSlots[kAllSlots];
 int g_loadedSlot = -1;
 
 void SwapView(ViewState& v)
@@ -2369,6 +2519,9 @@ void SwapView(ViewState& v)
     NR_VIEW_SWAP(activeColor);
     NR_VIEW_SWAP(lutScratch);
     NR_VIEW_SWAP(lutScratchFailed);
+    NR_VIEW_SWAP(hdrCopySpare);
+    NR_VIEW_SWAP(activeColorSpare);
+    NR_VIEW_SWAP(lutScratchSpare);
     NR_VIEW_SWAP(colorSmall);
     NR_VIEW_SWAP(superUp);
     NR_VIEW_SWAP(outputNative);
@@ -2411,6 +2564,9 @@ void SwapView(ViewState& v)
     NR_VIEW_SWAP(builtAutoMask);
     NR_VIEW_SWAP(settledAt);
     NR_VIEW_SWAP(lastGameFormat);
+    NR_VIEW_SWAP(lastBeforeUpscale);
+    NR_VIEW_SWAP(floatFlipSeen);
+    NR_VIEW_SWAP(rebuildGuard);
 #undef NR_VIEW_SWAP
 
     namespace ec = EdgeCompression;
@@ -2434,11 +2590,11 @@ ViewState& SlotState(int slot) { return slot < 0 ? g_mainView : g_viewSlots[slot
 // When each view last ran (index slot + 1). A view's model is kept while the game switches layouts (AC EVO: the cockpit
 // camera draws one view per screen, the outside cameras one wide view) and released after kKeepIdle without a run.
 constexpr auto kKeepIdle = std::chrono::minutes(2);
-std::chrono::steady_clock::time_point g_viewLastUsed[Views::kSlots + 1] {};
+std::chrono::steady_clock::time_point g_viewLastUsed[kAllSlots + 1] {};
 
 void UseViewSlot(int slot)
 {
-    if (slot >= (int) Views::kSlots)
+    if (slot >= (int) kAllSlots)
         return;
 
     const auto now = std::chrono::steady_clock::now();
@@ -2469,7 +2625,8 @@ void ParkLoadedView()
     for (ID3D12Resource** r :
          { &g_nr.output, &g_nr.passScratch, &g_nr.passClampScratch, &g_nr.passClampScratch2, &g_nr.colorCopy,
            &g_nr.hdrCopy, &g_nr.colorSmall, &g_nr.outputNative, &g_nr.activeColor, &g_nr.lutScratch, &g_nr.styled,
-           &g_nr.styledB, &g_nr.heldColor, &g_nr.depthClone, &g_nr.motionClone, &g_nr.depthConstant })
+           &g_nr.styledB, &g_nr.heldColor, &g_nr.depthClone, &g_nr.motionClone, &g_nr.depthConstant, &g_nr.hdrCopySpare,
+           &g_nr.activeColorSpare, &g_nr.lutScratchSpare })
         ParkNrResource(*r);
 
     // The scalers are deleted on the spot wherever this module drops them (a filter change); the same here.
@@ -2548,7 +2705,7 @@ void ParkIdleViews()
     checked = now;
 
     unsigned int parked = 0;
-    for (int slot = -1; slot < (int) Views::kSlots; ++slot)
+    for (int slot = -1; slot < (int) kAllSlots; ++slot)
     {
         if (slot == g_loadedSlot || !SlotHolds(slot) || now - g_viewLastUsed[slot + 1] < kKeepIdle)
             continue;
@@ -2758,6 +2915,8 @@ DlssNr_Dx12::~DlssNr_Dx12()
         _lutRootSignature->Release();
     if (_lutTexture)
         _lutTexture->Release();
+    if (_postLutTexture)
+        _postLutTexture->Release();
     for (auto& buffer : _lutConstantBuffers)
     {
         if (buffer != nullptr)
@@ -2861,22 +3020,33 @@ void DlssNr_Dx12::ReleaseLutTexture()
 
 bool DlssNr_Dx12::EnsureLutTexture(ID3D12GraphicsCommandList* InCmdList)
 {
-    if (!_lutState.Loaded() || InCmdList == nullptr || _device == nullptr)
+    if (!_lutState.Loaded())
         return false;
 
-    const int size = _lutState.lut.size;
+    return EnsureLutTextureFrom(InCmdList, _lutState.lut, _lutState.loadedPath, _lutTexture, _lutTextureSize,
+                                _lutTextureSourcePath);
+}
+
+bool DlssNr_Dx12::EnsureLutTextureFrom(ID3D12GraphicsCommandList* InCmdList, const DlssNr::Lut3D& Lut,
+                                       const std::string& Key, ID3D12Resource*& Texture, int& TextureSize,
+                                       std::string& TextureKey)
+{
+    if (Lut.size < 2 || InCmdList == nullptr || _device == nullptr)
+        return false;
+
+    const int size = Lut.size;
 
     // Keyed on the loaded path, not the lattice size: two different .cube files sharing a size (17/33/65
     // are near-universal) must not read as "nothing changed" just because neither resized the texture --
     // that was the bug (Review Pass, 2026-10-04): switching between two same-size LUTs silently kept
     // sampling whichever uploaded first.
-    if (_lutTexture != nullptr && _lutTextureSize == size && _lutTextureSourcePath == _lutState.loadedPath)
+    if (Texture != nullptr && TextureSize == size && TextureKey == Key)
         return true; // already uploaded, and it is still this exact file
 
-    if (_lutTexture != nullptr)
-        ParkNrResource(_lutTexture);
-    _lutTextureSize = 0;
-    _lutTextureSourcePath.clear();
+    if (Texture != nullptr)
+        ParkNrResource(Texture);
+    TextureSize = 0;
+    TextureKey.clear();
 
     D3D12_HEAP_PROPERTIES heapProps {};
     heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -2887,21 +3057,22 @@ bool DlssNr_Dx12::EnsureLutTexture(ID3D12GraphicsCommandList* InCmdList)
     texDesc.Height = (UINT) size;
     texDesc.DepthOrArraySize = (UINT16) size;
     texDesc.MipLevels = 1;
-    texDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    // Full float: the shader interpolates the texels itself (dlssnr_lut.hlsl LutTrilinear), at full precision.
+    texDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
     texDesc.SampleDesc.Count = 1;
     texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 
     HRESULT hr = _device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &texDesc,
-                                                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&_lutTexture));
-    if (FAILED(hr) || _lutTexture == nullptr)
+                                                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&Texture));
+    if (FAILED(hr) || Texture == nullptr)
     {
         LOG_ERROR("DLSS-NR: the LUT texture could not be allocated ({0}x{0}x{0})", size);
         return false;
     }
 
     // Pack the parsed lattice (red-fastest, matching .cube's own order, which is already x-fastest-then-y-
-    // then-z -- exactly a 3D texture's own row-major layout) into half4, honouring the destination's row
-    // pitch -- GetCopyableFootprints is the only correct source for it, rather than assuming size*8 bytes is
+    // then-z -- exactly a 3D texture's own row-major layout) into float4, honouring the destination's row
+    // pitch -- GetCopyableFootprints is the only correct source for it, rather than assuming size*16 bytes is
     // already 256-byte aligned.
     UINT64 totalBytes = 0;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint {};
@@ -2917,7 +3088,7 @@ bool DlssNr_Dx12::EnsureLutTexture(ID3D12GraphicsCommandList* InCmdList)
     if (FAILED(hr) || uploadBuffer == nullptr)
     {
         LOG_ERROR("DLSS-NR: the LUT texture's upload buffer could not be allocated");
-        ParkNrResource(_lutTexture);
+        ParkNrResource(Texture);
         return false;
     }
 
@@ -2927,17 +3098,17 @@ bool DlssNr_Dx12::EnsureLutTexture(ID3D12GraphicsCommandList* InCmdList)
     {
         LOG_ERROR("DLSS-NR: the LUT texture's upload buffer could not be mapped");
         uploadBuffer->Release();
-        ParkNrResource(_lutTexture);
+        ParkNrResource(Texture);
         return false;
     }
 
-    DlssNrLutPack::PackHalf4(_lutState.lut.rgb.data(), size, mapped, (size_t) footprint.Footprint.RowPitch,
-                             (size_t) footprint.Footprint.RowPitch * (size_t) size);
+    DlssNrLutPack::PackFloat4(Lut.rgb.data(), size, mapped, (size_t) footprint.Footprint.RowPitch,
+                              (size_t) footprint.Footprint.RowPitch * (size_t) size);
 
     uploadBuffer->Unmap(0, nullptr);
 
     D3D12_TEXTURE_COPY_LOCATION dst {};
-    dst.pResource = _lutTexture;
+    dst.pResource = Texture;
     dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     dst.SubresourceIndex = 0;
 
@@ -2947,15 +3118,15 @@ bool DlssNr_Dx12::EnsureLutTexture(ID3D12GraphicsCommandList* InCmdList)
     src.PlacedFootprint = footprint;
 
     InCmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    Barrier(InCmdList, _lutTexture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Barrier(InCmdList, Texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
     // The copy above is only recorded, not yet executed -- the upload buffer must outlive it, which
     // ParkNrResource's deferred release (rather than an immediate one here) already guarantees for every
     // other scratch resource in this file.
     ParkNrResource(uploadBuffer);
 
-    _lutTextureSize = size;
-    _lutTextureSourcePath = _lutState.loadedPath;
+    TextureSize = size;
+    TextureKey = Key;
     return true;
 }
 
@@ -2979,13 +3150,22 @@ bool DlssNr_Dx12::DispatchLut(ID3D12GraphicsCommandList* InCmdList, ID3D12Resour
     if (!EnsureLutTexture(InCmdList))
         return false;
 
+    return DispatchLutWith(InCmdList, InSource, OutTarget, Width, Height, Strength, InputEncoding, ColourIsLinearHdr,
+                           White, ExposureTex, _lutState.lut, _lutTexture);
+}
+
+bool DlssNr_Dx12::DispatchLutWith(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InSource,
+                                  ID3D12Resource* OutTarget, unsigned int Width, unsigned int Height, float Strength,
+                                  uint32_t InputEncoding, bool ColourIsLinearHdr, const DlssNrConstants& White,
+                                  ID3D12Resource* ExposureTex, const DlssNr::Lut3D& Lut, ID3D12Resource* Texture)
+{
     const uint32_t slot = _lutHeapIndex;
     _lutHeapIndex = (_lutHeapIndex + 1) % kLutHeapCount;
 
     FrameDescriptorHeap& heap = _lutHeaps[slot];
 
     CreateShaderResourceView(_device, InSource, heap.GetSrvCPU(0));
-    CreateShaderResourceView(_device, _lutTexture, heap.GetSrvCPU(1));
+    CreateShaderResourceView(_device, Texture, heap.GetSrvCPU(1));
     // The source stands in when there is no live exposure; the constants then say not to read it.
     CreateShaderResourceView(_device, ExposureTex != nullptr ? ExposureTex : InSource, heap.GetSrvCPU(2));
     CreateUnorderedAccessView(_device, OutTarget, heap.GetUavCPU(0), 0);
@@ -2994,13 +3174,14 @@ bool DlssNr_Dx12::DispatchLut(ID3D12GraphicsCommandList* InCmdList, ID3D12Resour
     constants.Width = Width;
     constants.Height = Height;
     constants.Strength = Strength;
-    constants.DomainMinR = _lutState.lut.domainMin[0];
-    constants.DomainMinG = _lutState.lut.domainMin[1];
-    constants.DomainMinB = _lutState.lut.domainMin[2];
-    constants.DomainMaxR = _lutState.lut.domainMax[0];
-    constants.DomainMaxG = _lutState.lut.domainMax[1];
-    constants.DomainMaxB = _lutState.lut.domainMax[2];
-    constants.LutSize = (uint32_t) _lutState.lut.size;
+    constants.DomainMinR = Lut.domainMin[0];
+    constants.DomainMinG = Lut.domainMin[1];
+    constants.DomainMinB = Lut.domainMin[2];
+    constants.DomainMaxR = Lut.domainMax[0];
+    constants.DomainMaxG = Lut.domainMax[1];
+    constants.DomainMaxB = Lut.domainMax[2];
+    constants.LutSize = (uint32_t) Lut.size;
+    constants.LatticeCoord = (uint32_t) Lut.latticeCoord;
     constants.InputEncoding = InputEncoding;
     constants.ColourIsLinearHdr = ColourIsLinearHdr ? 1u : 0u;
     CopyLiveWhitePoint(constants, White);
@@ -3021,6 +3202,38 @@ bool DlssNr_Dx12::DispatchLut(ID3D12GraphicsCommandList* InCmdList, ID3D12Resour
     InCmdList->Dispatch((Width + 7) / 8, (Height + 7) / 8, 1);
 
     return true;
+}
+
+bool DlssNr_Dx12::DispatchPostLut(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InSource,
+                                  ID3D12Resource* OutTarget, unsigned int Width, unsigned int Height,
+                                  uint32_t InputEncoding, bool ColourIsLinearHdr, const DlssNrConstants& White,
+                                  ID3D12Resource* ExposureTex, const std::vector<DlssNr::ChainEntry>& Entries)
+{
+    if (!DlssNr_LutChainEnsure(&_postLut, Entries, DlssNr::FrameDecodeFor(InputEncoding, ColourIsLinearHdr)))
+        return false;
+
+    if (InCmdList == nullptr || _device == nullptr || InSource == nullptr || OutTarget == nullptr || Width == 0 ||
+        Height == 0)
+        return false;
+
+    if (!LutPipelineReady())
+        return false;
+
+    if (!EnsureLutTextureFrom(InCmdList, _postLut.baked, _postLut.key, _postLutTexture, _postLutTextureSize,
+                              _postLutTextureKey))
+        return false;
+
+    return DispatchLutWith(InCmdList, InSource, OutTarget, Width, Height, _postLut.strength, InputEncoding,
+                           ColourIsLinearHdr, White, ExposureTex, _postLut.baked, _postLutTexture);
+}
+
+void DlssNr_Dx12::ReleasePostLut()
+{
+    if (_postLutTexture != nullptr)
+        ParkNrResource(_postLutTexture);
+    _postLutTextureSize = 0;
+    _postLutTextureKey.clear();
+    DlssNr_LutChainEnsure(&_postLut, {});
 }
 
 bool DlssNr_Dx12::DispatchDetailStats(ID3D12GraphicsCommandList* InCmdList, const DlssNrConstants& InConstants,
@@ -3529,18 +3742,14 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                                            keepOutput = output;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> keepQueue = timingQueue;
 
-    // Parked features and scratch textures are released 32 frames after they were parked. This used to tick only where an
-    // evaluate completed, after the return for a feature just created and the one for a feature still waiting for its first
-    // submission: a game that makes the model build again on every call (views of different sizes alternating) never reached
-    // it, and each build's resources piled up. One tick per submission epoch, before any return.
-    {
-        static unsigned long long lastRetiredEpoch = ~0ull;
-        if (frame.SubmissionEpoch != lastRetiredEpoch)
-        {
-            lastRetiredEpoch = frame.SubmissionEpoch;
-            TickNrRetired();
-        }
-    }
+    // Parked features and scratch textures are released once the GPU finished every list recorded before they were
+    // parked, and no sooner than 32 epochs (DlssNr_Retire.h): this list is one of them from here on. This used to tick
+    // only where an evaluate completed, after the return for a feature just created and the one for a feature still
+    // waiting for its first submission: a game that makes the model build again on every call (views of different sizes
+    // alternating) never reached it, and each build's resources piled up. One tick per submission epoch, before any
+    // return.
+    WatchNrList(cmdList);
+    TickNrRetired(frame.SubmissionEpoch);
 
     // Superior Scaling (superior/Pipeline.inl) runs only while selected and not given up on this session; otherwise the
     // ordinary path runs, with Matched residual in its place. Selecting it again retries.
@@ -3551,8 +3760,9 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
         superiorState.wasSelected = superiorSelected;
         superiorState.unavailable.clear();
     }
-    const bool superior = superiorSelected && superiorState.unavailable.empty() && !g_multiRun;
-    if (superiorState.wasActive != superior)
+    const bool superior = superiorSelected && superiorState.unavailable.empty() && !g_multiRun && !g_contextRun;
+    // A secondary game feature's own model never runs it: that is no change of the main picture's choice
+    if (!g_contextRun && superiorState.wasActive != superior)
     {
         superiorState.wasActive = superior;
         g_nr.reset = true;
@@ -3611,10 +3821,10 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
     }
 
     const D3D12_RESOURCE_DESC desc = target->GetDesc();
-    // Our surfaces' colour format: the game's, with BGRA8 made RGBA8 (DlssNr_SurfaceFormats.h). A game that swaps the
-    // two keeps one set of surfaces, one model feature and its history. Only the surfaces copied straight to or from
-    // `target` use desc.Format and check it themselves (activeColor, lutScratch, heldColor, hdrCopy without a UAV).
-    const auto colourFormat = (DXGI_FORMAT) DlssNr::CanonicalColourFormat((int) desc.Format);
+    // Our surfaces' colour format: the game's, with BGRA8 made RGBA8, and R11G11B10F made RGBA16F once the game flipped
+    // between the two (DlssNr_SurfaceFormats.h). A game that swaps them keeps one set of surfaces, one model feature
+    // and its history. Only the surfaces copied straight to or from `target` use desc.Format and check it themselves
+    // (activeColor, lutScratch, heldColor, hdrCopy without a UAV).
     {
         auto& lastGameFormat = g_nr.lastGameFormat;
 
@@ -3627,8 +3837,20 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                      (int) lastGameFormat, (int) desc.Format);
         }
 
+        // Moving NR before or after SR also changes the format (R11G11B10F colour, RGBA16F upscaler output): no flip
+        if (!g_nr.floatFlipSeen && g_nr.lastBeforeUpscale == frame.BeforeUpscale &&
+            DlssNr::IsFloatFlip((int) lastGameFormat, (int) desc.Format))
+        {
+            g_nr.floatFlipSeen = true;
+            LOG_INFO("DLSS-NR: the game's colour changes between format {} and {} (RGBA16F/R11G11B10F); NR's surfaces "
+                     "stay RGBA16F for both, the model is built once more and then kept",
+                     (int) lastGameFormat, (int) desc.Format);
+        }
+
         lastGameFormat = desc.Format;
+        g_nr.lastBeforeUpscale = frame.BeforeUpscale;
     }
+    const auto colourFormat = (DXGI_FORMAT) DlssNr::CanonicalColourFormat((int) desc.Format, g_nr.floatFlipSeen);
     const auto active =
         frame.BeforeUpscale
             ? DlssNr::PreSrColorExtent(desc, frame.RenderSubrectWidth, frame.RenderSubrectHeight,
@@ -3727,7 +3949,7 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
     };
 
     // One per view: two views of different sizes would otherwise log every evaluate.
-    static GuideReport loggedPerView[Views::kSlots + 1] {};
+    static GuideReport loggedPerView[kAllSlots + 1] {};
     GuideReport& loggedGuides = loggedPerView[g_loadedSlot + 1];
 
     const GuideReport guidesNow { true,
@@ -3879,13 +4101,55 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
     const bool replaceCorrection =
         spatial && !superiorPacked && DlssNrProxyCurve::IsReplace(cfg.DlssNrReversibleMode.value_or_default());
 
-    ReleaseSurfacesIfFormatChanged(modelFormat, colourFormat);
-
+    // What would rebuild the model below: a stale surface format (ReleaseSurfacesIfFormatChanged), a new size or a new
+    // placement. Tuning is left out, it is the user's doing.
     const bool resolutionChanged = g_nr.width != width || g_nr.height != height ||
                                    g_nr.workWidth != modelWidth || g_nr.workHeight != modelHeight;
-    const bool placementChanged = g_nr.feature != nullptr &&
-        (g_nr.beforeUpscale != frame.BeforeUpscale ||
-         g_nr.rayReconstruction != frame.RayReconstruction);
+    const bool placementDiffers =
+        g_nr.beforeUpscale != frame.BeforeUpscale || g_nr.rayReconstruction != frame.RayReconstruction;
+
+    // A game alternating two set-ups (two formats or sizes) would have the model rebuilt on every call, a long stall
+    // each: NR stands down until the game settles on one (DlssNr_SurfaceFormats.h). Before anything is parked or made.
+    // Compress screen edges has already been set up for this call; it keeps that state for the next call that runs.
+    {
+        const DXGI_FORMAT haveModel = g_nr.output != nullptr ? g_nr.output->GetDesc().Format : DXGI_FORMAT_UNKNOWN;
+        const DXGI_FORMAT haveColour =
+            g_nr.colorCopy != nullptr ? g_nr.colorCopy->GetDesc().Format : DXGI_FORMAT_UNKNOWN;
+        const bool wouldRebuild =
+            DlssNr::SurfacesStale((int) haveModel, (int) modelFormat, (int) haveColour, (int) colourFormat) ||
+            (g_nr.feature != nullptr && (resolutionChanged || placementDiffers));
+        const DlssNr::Setup setup { (int) modelFormat,   (int) colourFormat,     width, height, modelWidth, modelHeight,
+                                    frame.BeforeUpscale, frame.RayReconstruction };
+
+        auto& guard = g_nr.rebuildGuard;
+        const bool wasStanding = guard.standing;
+        const bool run = guard.Allow(setup, wouldRebuild);
+        // Every call, so a view parked or swapped out while standing does not leave the menu saying so
+        g_rebuildStandDown.store(guard.standing, std::memory_order_relaxed);
+
+        if (guard.standing != wasStanding)
+        {
+            if (guard.standing)
+                LOG_WARN("DLSS-NR: the game keeps switching back and forth between what the model is built for "
+                         "(format {}, {}x{}, model {}x{}); NR stands down until it settles",
+                         (int) colourFormat, width, height, modelWidth, modelHeight);
+            else
+                LOG_INFO("DLSS-NR: the game settled, NR runs again");
+        }
+
+        if (!run)
+        {
+            // The frames passed untouched break the history
+            g_nr.reset = true;
+            ReportSkipOnce("the game kept switching back and forth between what the model is built for");
+            device->Release();
+            return;
+        }
+    }
+
+    ReleaseSurfacesIfFormatChanged(modelFormat, colourFormat);
+
+    const bool placementChanged = g_nr.feature != nullptr && placementDiffers;
 
     // The model reads its tuning once, while the feature is built, so a changed setting only takes
     // effect when the feature is rebuilt. TuningMatchesFeature was written to notice that and then
@@ -3925,6 +4189,9 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
             ParkNrResource(g_nr.outputNative);
             ParkNrResource(g_nr.activeColor);
             ParkNrResource(g_nr.lutScratch);
+            ParkNrResource(g_nr.hdrCopySpare);
+            ParkNrResource(g_nr.activeColorSpare);
+            ParkNrResource(g_nr.lutScratchSpare);
             ParkNrResource(g_nr.styled);
             g_nr.styledState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             ParkNrResource(g_nr.styledB);
@@ -3946,8 +4213,7 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                                        ? DXGI_FORMAT_R16G16B16A16_FLOAT
                                        : colourFormat;
 
-    if (g_nr.hdrCopy != nullptr && g_nr.hdrCopy->GetDesc().Format != keepFormat)
-        ParkNrResource(g_nr.hdrCopy);
+    KeepExactFormat(g_nr.hdrCopy, g_nr.hdrCopySpare, keepFormat);
 
     if (g_nr.output == nullptr)
     {
@@ -3961,8 +4227,7 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
         g_nr.hdrCopy = CreateScratch(device, keepFormat, width, height);
 
     // The crop is a CopyTextureRegion from the game's colour: exact format
-    if (g_nr.activeColor != nullptr && g_nr.activeColor->GetDesc().Format != desc.Format)
-        ParkNrResource(g_nr.activeColor);
+    KeepExactFormat(g_nr.activeColor, g_nr.activeColorSpare, desc.Format);
 
     if (cropColor && g_nr.activeColor == nullptr)
         g_nr.activeColor = CreateScratch(device, desc.Format, width, height);
@@ -4397,7 +4662,9 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
     // finished, sRGB-encoded frames. The white point is what maps one to the other, and it is a property
     // of the game's exposure rather than a number worth asking anyone to guess: measured means of 0.065,
     // 1.8 and 185 have all been seen in this one game.
-    ++g_frames;
+    // Counted on the main picture only: the exposure easing and frame statistics need one step per frame of it
+    if (!g_contextRun)
+        ++g_frames;
     CheckCaptureTrigger();
 
     if (g_captureWriteAtFrame != 0 && g_frames >= g_captureWriteAtFrame)
@@ -4684,13 +4951,14 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
     // "Tune for this scene" (DlssNr_ExposureCalibrate_Dx12.inl): before the white point is resolved, so a run's
     // pinned white point (CalibrationWhitePoint) reaches the encode and resolve below. While no run is on and the menu
     // is not looking, only a timestamp.
-    if (CalibrationWanted())
+    // Measured on the main picture only: another view or game feature has its own size, which would stop a run
+    if (!g_viewSecondary && CalibrationWanted())
         CalibrationBeginFrame(cfg, device, width, height,
                               CalibrationSituation(cfg, usingAutoExposure, isHdrBuffer, frame.FinishedPicture,
                                                    frame.ExposureTexture != nullptr,
                                                    DlssNrColourEncoding::ShaderConverts(frame.InputEncoding)),
                               CalibrationBase(cfg));
-    else
+    else if (!g_viewSecondary)
         CalibrationIdleFrame();
 
     g_nr.gamePreExposure = frame.PreExposure;
@@ -4797,6 +5065,10 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
     // this epic existed; only the model and everything after it see the grade. Writes back onto
     // `target` itself (via lutScratch and a GPU copy) rather than reassigning the pointer, so codec,
     // model and resolve all still run exactly as they did before the epic existed, LUT loaded or not.
+    const auto postLutEntries = DlssNr::PostLutEntries(cfg);
+    const bool postLutWanted = std::any_of(postLutEntries.begin(), postLutEntries.end(),
+                                           [](const DlssNr::ChainEntry& e) { return !e.path.empty(); });
+
     {
         const std::string lutPath = cfg.DlssNrLutFile.value_or_default();
 
@@ -4805,7 +5077,7 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
             // Copied back onto `target` (CopyTextureRegion): exact format
             if (g_nr.lutScratch != nullptr && g_nr.lutScratch->GetDesc().Format != desc.Format)
             {
-                ParkNrResource(g_nr.lutScratch);
+                KeepExactFormat(g_nr.lutScratch, g_nr.lutScratchSpare, desc.Format);
                 g_nr.lutScratchFailed = false;
             }
 
@@ -4870,7 +5142,14 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
             // Fixed (Review Pass, 2026-10-04): this used to park only the scratch target, so _lutTexture
             // stayed resident for the rest of the session once any LUT had ever loaded. A no-op once
             // already released/parked.
-            ParkNrResource(g_nr.lutScratch);
+            // The post-NR stack shares the scratch, so it stays while that stack wants it.
+            if (!postLutWanted)
+            {
+                ParkNrResource(g_nr.lutScratch);
+            }
+            // Also when making the scratch failed after its old format moved to the spare
+            if (!postLutWanted)
+                ParkNrResource(g_nr.lutScratchSpare);
             ReleaseLutTexture();
             DlssNr::ReportLutStatus(false, "", 0, false, "", "", cfg.DlssNrLutStrength.value_or_default());
         }
@@ -5607,7 +5886,7 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
     // and measures Reuse bottleneck as it runs.
     // A capture shows the model on every frame: before/after are a control, and an edit cache dump measures carrying
     // the model's real answers
-    reuseFrame.blocked = calibrationPinned || g_nr.heldActive || g_capture.isActive() || g_multiRun;
+    reuseFrame.blocked = calibrationPinned || g_nr.heldActive || g_capture.isActive() || g_multiRun || g_contextRun;
     reuseFrame.frameNumber = frame.SubmissionEpoch != 0 ? frame.SubmissionEpoch : g_frames;
     {
         // The motion size is left out on purpose: saved vectors are uv displacements, so a render-size change does not
@@ -5650,10 +5929,12 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
         ci.workAbove100 = workScale > 1.0f;
         ci.edgeCompression = spatial;
         ci.convertedEncoding = frame.InputEncoding != 0;
-        ci.blocked = calibrationPinned || g_nr.heldActive || g_capture.isActive() || CalibrationActive() || g_multiRun;
+        ci.blocked = calibrationPinned || g_nr.heldActive || g_capture.isActive() || CalibrationActive() ||
+                     g_multiRun || g_contextRun;
         // The skin mask preview is painted by the resolve: carried, it would be taken for the model's edit
+        // The depth fade is applied by the resolve, which a carried edit skips
         ci.debugOrCompare = cfg.DlssNrDebugView.value_or_default() != 0 || cfg.DlssNrCompare.value_or_default() != 0 ||
-                            cfg.DlssNrShowSkinMask.value_or_default();
+                            cfg.DlssNrShowSkinMask.value_or_default() || cfg.DlssNrDepthFade.value_or_default();
         ci.reset = g_nr.reset;
         ci.revision = reuseFrame.revision;
         ci.width = width;
@@ -6509,6 +6790,15 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
         resolveParams.CompareZoom = std::max(1.0f, cfg.DlssNrCompareZoom.value_or_default());
         resolveParams.CompareSwap = cfg.DlssNrCompareSwap.value_or_default() ? 1u : 0u;
 
+        // The depth fade (DlssNr_DepthFade.h). Off, or with no depth from the game this frame, the block stays zero and
+        // the resolve is the one it always was. depthIn is the game's depth as a readable twin; the valid region and
+        // direction are the ones the model's own depth input uses.
+        const DlssNrDepthFade::Settings depthFade = DlssNrDepthFade::SettingsFrom(cfg);
+        const bool fadeDepthReadable = depthIn != nullptr && guideWidth != 0 && guideHeight != 0;
+        resolveParams.DepthFade = DlssNrDepthFade::MakeBlock(depthFade, fadeDepthReadable, g_nr.guideDepthInverted,
+                                                             { guideWidth, guideHeight, depthBaseX, depthBaseY });
+        DlssNrDepthFade::Report(depthFade, fadeDepthReadable);
+
         // The numbers the composition actually ran with, logged when any of them changes.
         //
         // A colour report without these cannot be read. Paper white alone decides whether the model
@@ -6753,8 +7043,10 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
         }
         else
         {
-            const bool dispatched = DispatchPass(cmdList, resolveParams, resolveProxy, resolveAnswer, resolveOriginal,
-                                                 motionIn, exposureTex, resolveTarget, nullptr);
+            // The game's depth rides in the sixth slot (t5, the resolve's depth fade); the stand-in is the source.
+            const bool dispatched = DispatchPass(
+                cmdList, resolveParams, resolveProxy, resolveAnswer, resolveOriginal, motionIn, exposureTex,
+                resolveTarget, nullptr, (resolveParams.DepthFade.Flags & DlssNrDepthFade::kActive) ? depthIn : nullptr);
             // Without Superior the frame counts as composed whatever the dispatch says, exactly as before.
             composed = dispatched || !superior;
         }
@@ -6786,7 +7078,7 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
             Barrier(cmdList, g_nr.hdrCopy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-        if (CalibrationActive())
+        if (CalibrationActive() && !g_viewSecondary)
         {
             const D3D12_RESOURCE_STATES priorTargetState = targetState;
             TransitionTarget(D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -6906,6 +7198,88 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
             for (ID3D12Resource* unpacked : { EdgeCompression::proxy, EdgeCompression::answer })
                 Barrier(cmdList, unpacked, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+
+    // The post-NR LUT stack (memory/plans/2026-10-31-nr-lut-chain.md): grades NR's returned picture, which the model
+    // never sees, so it cannot move the exposure meter, skin detection or reuse. Same scratch / dispatch / copy-back as
+    // the Inputs LUT above, with the same white point so a linear HDR frame lands in the LUT's 0-1 domain the same way.
+    // Only on a frame NR composed: a failed evaluation leaves the game's own image untouched. In Finished Picture mode
+    // this is the picture at the present seam, so the grade lands on it as it is shown.
+    {
+        DlssNr::PostLutStatus status;
+        status.wanted = postLutWanted;
+        bool graded = false;
+
+        if (!postLutWanted)
+        {
+            ReleasePostLut();
+            if (g_nr.lutScratch != nullptr && cfg.DlssNrLutFile.value_or_default().empty())
+                ParkNrResource(g_nr.lutScratch);
+            // Also when making the scratch failed after its old format moved to the spare
+            if (cfg.DlssNrLutFile.value_or_default().empty())
+                ParkNrResource(g_nr.lutScratchSpare);
+        }
+        else if (composed)
+        {
+            if (g_nr.lutScratch != nullptr && g_nr.lutScratch->GetDesc().Format != desc.Format)
+            {
+                KeepExactFormat(g_nr.lutScratch, g_nr.lutScratchSpare, desc.Format);
+                g_nr.lutScratchFailed = false;
+            }
+
+            if (g_nr.lutScratch == nullptr && !g_nr.lutScratchFailed)
+            {
+                g_nr.lutScratch = CreateScratch(device, desc.Format, width, height);
+                g_nr.lutScratchFailed = g_nr.lutScratch == nullptr;
+
+                if (g_nr.lutScratchFailed)
+                    LOG_ERROR("DLSS-NR: could not allocate the LUT pass's scratch target; the post-NR LUT is ignored");
+            }
+
+            if (g_nr.lutScratch != nullptr)
+            {
+                const D3D12_RESOURCE_STATES priorTargetState = targetState;
+                TransitionTarget(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+                DlssNrConstants lutWhite {};
+                fillLiveWhitePoint(lutWhite);
+                graded = DispatchPostLut(cmdList, target, g_nr.lutScratch, width, height, frame.InputEncoding,
+                                         isHdrBuffer, lutWhite, exposureTex, postLutEntries);
+
+                if (graded)
+                {
+                    TransitionTarget(D3D12_RESOURCE_STATE_COPY_DEST);
+                    Barrier(cmdList, g_nr.lutScratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    DlssNr::CopyActiveColor(cmdList, target, g_nr.lutScratch, DlssNr::ColorExtent { width, height });
+                    Barrier(cmdList, g_nr.lutScratch, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                }
+
+                TransitionTarget(priorTargetState);
+            }
+            else
+                status.error = "could not allocate the scratch target";
+        }
+
+        // A frame NR did not compose says nothing new: the last report stands.
+        if (!postLutWanted || composed)
+        {
+            const DlssNr_LutChainState& chain = PostLut();
+            status.loaded = graded && chain.Loaded();
+            status.chain = chain.description;
+            static_assert(std::size(decltype(status.inputs) {}) == DlssNr::kMaxLutChainLayers);
+            std::copy(std::begin(chain.inputs), std::end(chain.inputs), status.inputs);
+            status.endsIn = chain.endsIn;
+            if (postLutWanted && !chain.error.empty())
+            {
+                status.failedPath = chain.failedLayer >= 0 ? chain.failedPath : std::string();
+                status.error = chain.error;
+            }
+            if (status.loaded && frame.FinishedPicture)
+                status.note = "Graded on the finished picture (Finished Picture mode).";
+            DlssNr::ReportPostLutStatus(status);
+        }
     }
 
     // Failed evaluations leave the game's original image intact. A successful copy-back writes
@@ -7044,9 +7418,9 @@ void RetryAfterFailure()
 // This is the call site's job, not the pass's. A caller that has the resources in hand -- a
 // reprojection stage, a frame generation path, anything that is not the upscaler seam -- calls
 // RunPass directly and never touches an NGX parameter block.
-void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
-                      bool beforeUpscale, ID3D12CommandQueue* timingQueue, bool rayReconstruction,
-                      unsigned long long submissionEpoch)
+void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params, bool beforeUpscale,
+                      ID3D12CommandQueue* timingQueue, bool rayReconstruction, unsigned long long submissionEpoch,
+                      uint32_t gameFeature)
 {
     std::lock_guard<std::recursive_mutex> nrLock(g_nrMutex);
     const Config& cfg = *Config::Instance();
@@ -7073,13 +7447,125 @@ void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* p
     }
     DlssNrNative::SetPrecision(precision);
 
+    // A game with several DLSS features alive (DlssNr_Contexts.h): the main one goes on as before, another stands aside
+    // or works in a view slot of its own. First of all, since everything below keeps one model and one history.
+    bool contextSlot = false;
+    uint32_t ownFeature = 0;
+    // A failure on a secondary feature's own model must not turn NR off for the main picture: that feature stands
+    // aside from then on, and the failure is forgotten (g_nr.failed is shared by every slot).
+    struct OwnFailureGuard
+    {
+        const uint32_t& feature;
+        ~OwnFailureGuard()
+        {
+            if (feature == 0 || !g_nr.failed)
+                return;
+            LOG_WARN("DLSS-NR: the model of DLSS feature {} failed ({}); it is left as it is from now on", feature,
+                     g_nr.reason);
+            const int slot = g_contexts.Failed(feature);
+            g_nr.failed = false;
+            g_nr.reason = "";
+            g_nr.reset = true;
+            if (slot >= 0)
+                ParkSlot((int) kContextSlot + slot);
+            g_contextsAside.store(g_contexts.AsideCount(), std::memory_order_relaxed);
+            g_contextsOwn.store(g_contexts.OwnCount(), std::memory_order_relaxed);
+        }
+    } ownFailureGuard { ownFeature };
+    if (cfg.DlssNrEnabled.value_or_default() && cmdList != nullptr && params != nullptr)
+    {
+        const auto mode = (Contexts::Mode) std::min(cfg.DlssNrSecondaryFeatures.value_or_default(), 2u);
+
+        // The colour this call works on, as the views detector reads it
+        Contexts::Picture picture;
+        if (ID3D12Resource* color = GetResource(params, NVSDK_NGX_Parameter_Color, "DLSSD.Color"))
+        {
+            const D3D12_RESOURCE_DESC desc = color->GetDesc();
+            picture.resource = (uint64_t) (uintptr_t) color;
+            picture.width = (unsigned) desc.Width;
+            picture.height = desc.Height;
+            picture.format = (int) desc.Format;
+            params->Get(NVSDK_NGX_Parameter_OutWidth, &picture.outputWidth);
+            params->Get(NVSDK_NGX_Parameter_OutHeight, &picture.outputHeight);
+            // Not said: the output resource's size, as the pass takes it
+            if (picture.outputWidth == 0 || picture.outputHeight == 0)
+                if (ID3D12Resource* output = GetResource(params, NVSDK_NGX_Parameter_Output, "DLSSD.Output"))
+                {
+                    picture.outputWidth = (unsigned) output->GetDesc().Width;
+                    picture.outputHeight = output->GetDesc().Height;
+                }
+        }
+
+        const Contexts::Role role = g_contexts.Acquire(gameFeature, mode, picture);
+
+        // Once per game feature: what it hands in and what NR makes of it (multi-view rigs and previews told apart)
+        {
+            static std::set<uint32_t> described; // under g_nrMutex
+            if (gameFeature != 0 && described.size() < 64 && described.insert(gameFeature).second)
+                LOG_INFO("DLSS-NR: game DLSS feature {}: colour {:X} {}x{} format {}, output {}x{}: {}", gameFeature,
+                         picture.resource, picture.width, picture.height, picture.format, picture.outputWidth,
+                         picture.outputHeight,
+                         role.kind == Contexts::Kind::StandAside ? "left as it is"
+                         : role.kind == Contexts::Kind::Own      ? "a model of its own"
+                                                                 : "main picture");
+        }
+        g_contextsAside.store(g_contexts.AsideCount(), std::memory_order_relaxed);
+        g_contextsOwn.store(g_contexts.OwnCount(), std::memory_order_relaxed);
+
+        // An own model this feature gave up (it took main, or the setting moved off Own model)
+        if (role.freedSlot >= 0)
+            ParkSlot((int) kContextSlot + role.freedSlot);
+
+        if (role.first && role.kind == Contexts::Kind::StandAside)
+            LOG_INFO("DLSS-NR: the game uses another DLSS feature ({}) besides the main one; NR leaves it as it is "
+                     "(SecondaryFeatures)",
+                     gameFeature);
+        else if (role.first && role.kind == Contexts::Kind::Own)
+            LOG_INFO(
+                "DLSS-NR: the game uses another DLSS feature ({}) besides the main one; it gets a model of its own",
+                gameFeature);
+        else if (role.tookMain)
+            LOG_INFO("DLSS-NR: DLSS feature {} is the main one now (a larger picture, the old main gone quiet or "
+                     "released)",
+                     gameFeature);
+
+        if (role.kind == Contexts::Kind::StandAside)
+            return;
+
+        if (role.kind == Contexts::Kind::Own)
+        {
+            // One picture's modes cannot run on a second one
+            if (cfg.DlssNrFinishedPicture.value_or_default() || cfg.DlssNrDeferredDlss.value_or_default())
+            {
+                ReportSkipOnce("another DLSS feature of the game: Finished picture and Deferred DLSS work on the main "
+                               "one only");
+                return;
+            }
+
+            UseViewSlot((int) (kContextSlot + role.slot));
+            contextSlot = true;
+            // NR already off for the main picture: not this feature's failure to take over
+            ownFeature = g_nr.failed ? 0 : gameFeature;
+        }
+        else
+        {
+            if (g_loadedSlot >= (int) kContextSlot)
+                UseViewSlot(-1);
+            // Another picture's state: its history does not carry over
+            if (role.tookMain)
+                g_nr.reset = true;
+        }
+    }
+    g_contextRun = contextSlot;
+
     // Several views in one allocation: only the ticked ones go on, each with its own model (the view slots). Before
     // every placement and mode below, since all of them keep one model feature and one history.
     bool viewNeedsBeforeSr = false;
     bool viewLatched = false;
     bool onePicture = false; // all screens as one picture: once per frame, after SR, on the whole shared output
     unsigned long long viewEpoch = 0;
-    if (cfg.DlssNrEnabled.value_or_default() && cmdList != nullptr && params != nullptr && !rayReconstruction)
+    if (cfg.DlssNrEnabled.value_or_default() && cmdList != nullptr && params != nullptr && !rayReconstruction &&
+        !contextSlot)
     {
         viewEpoch = timingQueue != nullptr ? submissionEpoch : State::Instance().frameCount;
         const auto view = JudgeViews(cfg, params, viewEpoch);
@@ -7314,7 +7800,9 @@ void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* p
         return;
 
     // The first view takes the frame's measurements; the others read them.
-    g_viewSecondary = viewLatched && IsSecondaryView(g_loadedSlot, cfg.DlssNrMultiViewScreens.value_or_default());
+    // A secondary game feature with a model of its own reads the main one's too.
+    g_viewSecondary =
+        contextSlot || (viewLatched && IsSecondaryView(g_loadedSlot, cfg.DlssNrMultiViewScreens.value_or_default()));
 
     // Which of the game's APIs this evaluate arrived through.
     //
@@ -7574,17 +8062,17 @@ void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* p
 }
 
 void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
-                          ID3D12CommandQueue* timingQueue, bool rayReconstruction,
-                          unsigned long long submissionEpoch)
+                          ID3D12CommandQueue* timingQueue, bool rayReconstruction, unsigned long long submissionEpoch,
+                          uint32_t gameFeature)
 {
-    EvaluateInternal(cmdList, params, false, timingQueue, rayReconstruction, submissionEpoch);
+    EvaluateInternal(cmdList, params, false, timingQueue, rayReconstruction, submissionEpoch, gameFeature);
 }
 
 void EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
-                           ID3D12CommandQueue* timingQueue, unsigned long long submissionEpoch,
-                           bool rayReconstruction)
+                           ID3D12CommandQueue* timingQueue, unsigned long long submissionEpoch, bool rayReconstruction,
+                           uint32_t gameFeature)
 {
-    EvaluateInternal(cmdList, params, true, timingQueue, rayReconstruction, submissionEpoch);
+    EvaluateInternal(cmdList, params, true, timingQueue, rayReconstruction, submissionEpoch, gameFeature);
 }
 
 // The pass. Resources in, nothing read from anywhere the caller cannot see.
@@ -7778,6 +8266,29 @@ int CurrentModelResolutionPercent() { return (int) lroundf(g_nr.appliedWorkScale
 
 Views::Snapshot MultiViewStatus() { return g_views.Status(); }
 
+bool StoodDownForRebuilds() { return g_rebuildStandDown.load(std::memory_order_relaxed); }
+
+void ReleaseGameFeature(uint32_t gameFeature)
+{
+    std::lock_guard<std::recursive_mutex> nrLock(g_nrMutex);
+    const Contexts::Released released = g_contexts.Release(gameFeature);
+
+    if (released.own)
+    {
+        ParkSlot((int) (kContextSlot + released.slot));
+        LOG_INFO("DLSS-NR: the game released DLSS feature {}; its own model is released", gameFeature);
+    }
+
+    g_contextsAside.store(g_contexts.AsideCount(), std::memory_order_relaxed);
+    g_contextsOwn.store(g_contexts.OwnCount(), std::memory_order_relaxed);
+}
+
+void GameFeatureStatus(unsigned& standingAside, unsigned& ownModels)
+{
+    standingAside = g_contextsAside.load(std::memory_order_relaxed);
+    ownModels = g_contextsOwn.load(std::memory_order_relaxed);
+}
+
 Spatial::Published EdgeCompressionStatus()
 {
     std::lock_guard<std::mutex> lock(EdgeCompression::publishedLock);
@@ -7825,27 +8336,28 @@ void Shutdown()
     // Every view's model into the retired list, which is emptied below
     LeaveMultiView(true);
     g_views.Reset();
+    for (unsigned k = 0; k < Contexts::kOwnSlots; ++k)
+        ParkSlot((int) (kContextSlot + k));
+    g_contexts.Reset();
+    g_contextRun = false;
+    g_contextsAside.store(0, std::memory_order_relaxed);
+    g_contextsOwn.store(0, std::memory_order_relaxed);
     DeferredSr::Shutdown();
     if (SuperiorRun::g_used)
         SuperiorRun::Shutdown();
     CalibrationShutdown();
     EdgeCompression::Shutdown();
 
-    for (auto& r : g_nrRetired)
-    {
-        ReleaseNrFeature(r);
-
-        if (r.resource != nullptr)
-            r.resource->Release();
-    }
-
-    g_nrRetired.clear();
+    g_nrRetired.FreeAll(FreeNrRetiredNow);
 
     if (g_nr.feature != nullptr && g_nr.release != nullptr)
         g_nr.release(g_nr.feature);
 
     g_nr.feature = nullptr;
     g_nr.featurePendingSubmission = false;
+    g_nr.rebuildGuard = {};
+    g_nr.floatFlipSeen = false;
+    g_rebuildStandDown.store(false, std::memory_order_relaxed);
 
     for (unsigned int pass = 1; pass < DlssNr::MaxPassCount; ++pass)
     {
@@ -7914,6 +8426,15 @@ void Shutdown()
         g_nr.lutScratch = nullptr;
     }
     g_nr.lutScratchFailed = false;
+
+    for (ID3D12Resource** spare : { &g_nr.hdrCopySpare, &g_nr.activeColorSpare, &g_nr.lutScratchSpare })
+    {
+        if (*spare != nullptr)
+        {
+            (*spare)->Release();
+            *spare = nullptr;
+        }
+    }
 
     if (g_nr.colorSmall != nullptr)
     {

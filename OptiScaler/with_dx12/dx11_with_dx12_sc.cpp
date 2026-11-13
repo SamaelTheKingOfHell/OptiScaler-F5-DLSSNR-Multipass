@@ -194,7 +194,7 @@ void TearDownOverlayForResize(HWND handle, bool barrierHeld)
     }
 
     std::unique_lock<std::shared_mutex> overlayLock(Dx11wDx12Sync::PresentResizeMutex(), std::defer_lock);
-    if (!barrierHeld && State::Instance().activeFgOutput == FGOutput::XeFG)
+    if (!barrierHeld && UsesXeFGApi(State::Instance().activeFgOutput))
         overlayLock.lock();
 
     MenuOverlayDx::CleanupRenderTarget(true, handle);
@@ -212,7 +212,7 @@ Dx11wDx12SC::Dx11wDx12SC(IDXGISwapChain* real, IDXGISwapChain4* fgSC, ID3D11Devi
     // borderless override here, same as the per-game ForceBorderlessWhenUsingXeFG quirk does; an explicit
     // ForceBorderless in the ini still wins. FGHooks::hkSetFullscreenState reads this live, so it applies to the
     // game's first SetFullscreenState right after this swapchain is handed back.
-    if (State::Instance().activeFgOutput == FGOutput::XeFG && !Config::Instance()->FGXeFGForceBorderless.has_value())
+    if (UsesXeFGApi(State::Instance().activeFgOutput) && !Config::Instance()->FGXeFGForceBorderless.has_value())
     {
         LOG_INFO("XeFG through Dx11wDx12: forcing borderless instead of exclusive fullscreen");
         Config::Instance()->FGXeFGForceBorderless.set_volatile_value(true);
@@ -617,7 +617,7 @@ HRESULT STDMETHODCALLTYPE Dx11wDx12SC::ResizeBuffers(UINT BufferCount, UINT Widt
 
     const auto fgArgs = ResizeArgsForFg(_fgSwapChain, BufferCount, NewFormat, SwapChainFlags);
     const bool skipFgResize = IsSame(_fgSwapChain, fgArgs.bufferCount, Width, Height, fgArgs.format, fgArgs.flags);
-    const bool synchronizeXeFGPresent = skipFgResize && State::Instance().activeFgOutput == FGOutput::XeFG &&
+    const bool synchronizeXeFGPresent = skipFgResize && UsesXeFGApi(State::Instance().activeFgOutput) &&
                                         State::Instance().swapchainInteropApi == SwapchainInteropApi::Dx11wDx12;
 
     std::unique_lock<std::shared_mutex> presentResizeLock(Dx11wDx12Sync::PresentResizeMutex(), std::defer_lock);
@@ -893,7 +893,7 @@ HRESULT STDMETHODCALLTYPE Dx11wDx12SC::ResizeBuffers1(UINT BufferCount, UINT Wid
 
     const auto fgArgs = ResizeArgsForFg(_fgSwapChain, BufferCount, Format, SwapChainFlags);
     const bool skipFgResize = IsSame(_fgSwapChain, fgArgs.bufferCount, Width, Height, fgArgs.format, fgArgs.flags);
-    const bool synchronizeXeFGPresent = skipFgResize && State::Instance().activeFgOutput == FGOutput::XeFG &&
+    const bool synchronizeXeFGPresent = skipFgResize && UsesXeFGApi(State::Instance().activeFgOutput) &&
                                         State::Instance().swapchainInteropApi == SwapchainInteropApi::Dx11wDx12;
 
     std::unique_lock<std::shared_mutex> presentResizeLock(Dx11wDx12Sync::PresentResizeMutex(), std::defer_lock);

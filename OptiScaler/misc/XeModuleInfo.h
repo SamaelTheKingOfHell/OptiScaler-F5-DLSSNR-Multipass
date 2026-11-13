@@ -16,4 +16,8 @@ void Describe();
 // calls Describe, so a module loaded after start is picked up while the menu shows.
 std::string XeFGLine();
 std::string XeLLLine();
+
+// Once per run, after the first attempt to load libxess_fg.dll: when the ini's XeFGPath names a file that is missing or
+// was not the one loaded, says so in the log and with a toast (the loader quietly uses another copy otherwise).
+void CheckXeFGPath();
 } // namespace XeModuleInfo

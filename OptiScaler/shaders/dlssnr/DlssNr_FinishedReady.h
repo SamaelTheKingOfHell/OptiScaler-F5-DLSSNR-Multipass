@@ -53,6 +53,32 @@ inline uint64_t PresentsSince(uint64_t now, uint64_t then)
     return then == UINT64_MAX ? UINT64_MAX : then > now ? 0 : now - then;
 }
 
+// Age of a finished-picture capture, in presents (State::frameCount). Frames OptiScaler's own frame generation makes
+// up are presents too, so one game frame is `presentsPerGameFrame` presents, not one.
+// A capture and the present batch it lands in are not in phase, so it may be first used up to almost two game frames of
+// presents later: 2n - 1. It must stay under two game frames, or it would reach the frame after next.
+inline uint64_t FinishedPresentWindow(uint32_t presentsPerGameFrame)
+{
+    return presentsPerGameFrame <= 1 ? 1 : 2ull * presentsPerGameFrame - 1;
+}
+
+inline bool FinishedStale(uint64_t epoch, uint64_t captureEpoch, uint32_t presentsPerGameFrame)
+{
+    return epoch < captureEpoch || epoch - captureEpoch > FinishedPresentWindow(presentsPerGameFrame);
+}
+
+// NR drops its history when nothing was applied yet (`lastAppliedEpoch` 0) or more than one game frame of presents
+// went by between the captures of two applied pictures. The same epoch, or an earlier one, is no gap. Not for the
+// Streamline handoff: the chain NR composes on sits below Streamline, so generated presents count there while
+// `presentsPerGameFrame` is 1, and the rule would reset every frame.
+inline bool FinishedHistoryGap(uint64_t lastAppliedEpoch, uint64_t captureEpoch, uint32_t presentsPerGameFrame)
+{
+    if (lastAppliedEpoch == 0)
+        return true;
+    return captureEpoch > lastAppliedEpoch &&
+           captureEpoch - lastAppliedEpoch > 2ull * (presentsPerGameFrame < 1 ? 1 : presentsPerGameFrame);
+}
+
 // A DLSS-G evaluate this many presents ago still counts as running: each real frame is followed by at most
 // a handful of generated presents.
 inline constexpr uint64_t DlssgEvaluateWindow = 16;

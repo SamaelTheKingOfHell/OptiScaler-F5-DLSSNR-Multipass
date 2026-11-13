@@ -6,6 +6,7 @@
 #include "motion/MotionProfiles.h"
 #include "shaders/dlssnr/DlssNr_InputStyles.h"
 #include "framegen/mfgunlock/Mode.h"
+#include "framegen/f5low/F5LowRules.h"
 #include "dlssnr/DlssNr_Profiles.h"
 
 #include <optional>
@@ -282,6 +283,10 @@ class Config
     // picture (shaders/dlssnr/DlssNr_Views.h). 0: NR stands down while that happens (default). Not part of an NR
     // profile: it describes the rig.
     CustomOptional<uint32_t> DlssNrMultiViewScreens { 0 };
+    // A game that keeps several DLSS features alive (a 3D character preview next to the world): what NR does with the
+    // ones besides the main feature (shaders/dlssnr/DlssNr_Contexts.h). 0 = stand aside (default), 1 = a model of
+    // their own, 2 = share the main one (the old behaviour). Not part of an NR profile.
+    CustomOptional<uint32_t> DlssNrSecondaryFeatures { 0 };
     CustomOptional<bool> DlssNrResidualFg { false }; // forced off: not read from the ini, not in the menu
     CustomOptional<uint32_t> DlssNrPrecision { 0 }; // 0 NVIDIA FP8 (default), 4 Experimental NVFP4 hybrid
     CustomOptional<uint32_t> DlssNrVitEvery { 2 };  // NVIDIA model: compute the ViT bottleneck every N-th frame (1 = always; 2 = every other frame, default), reuse it in between
@@ -370,6 +375,18 @@ class Config
     CustomOptional<float> DlssNrEnvironmentDetail { 1.0f };
     CustomOptional<float> DlssNrEnvironmentColour { 1.0f };
     CustomOptional<bool> DlssNrShowSkinMask { false };
+    // Depth fade: the final resolve keeps less of NR's result on faraway surfaces, very near ones and sky, from the
+    // game's depth (off by default, and a no-op on a frame without depth). Distances are 0..1 on a log scale from the
+    // near plane (see shaders/dlssnr/precompile/dlssnr_depthfade.hlsli); strengths are the share of NR's result kept,
+    // 0..1.
+    CustomOptional<bool> DlssNrDepthFade { false };
+    CustomOptional<float> DlssNrDepthFadeFarStart { 0.5f };
+    CustomOptional<float> DlssNrDepthFadeFarEnd { 0.85f };
+    CustomOptional<float> DlssNrDepthFadeFarStrength { 0.5f };
+    CustomOptional<float> DlssNrDepthFadeNearStart { 0.0f };
+    CustomOptional<float> DlssNrDepthFadeNearEnd { 0.1f };
+    CustomOptional<float> DlssNrDepthFadeNearStrength { 1.0f };
+    CustomOptional<float> DlssNrDepthFadeSkyStrength { 1.0f };
     CustomOptional<float, NoDefault> DlssNrPass2Intensity;
     CustomOptional<float, NoDefault> DlssNrPass2LocalStructure;
     CustomOptional<float, NoDefault> DlssNrPass2LocalTone;
@@ -400,6 +417,17 @@ class Config
     // way the composed modes do. 0 = today's behaviour, unchanged.
     CustomOptional<float> DlssNrReplaceDetailStrength { 0.5f };
 
+    // Native blend (the Neural Rendering page's "Native blend"): NR on the finished picture with Replace, no skin
+    // protection and no Replace detail, the model's answer written as it is. NativeBlend is whether it is on; the Was
+    // keys hold the four settings it replaced (FinishedPicture, ReversibleMode, SkinProtection, ReplaceDetailStrength)
+    // so turning it off puts them back, across a restart too. They have no default: auto (unset) comes back as auto,
+    // not as the default number. Rules in dlssnr/DlssNr_NativeBlend.h.
+    CustomOptional<bool> DlssNrNativeBlend { false };
+    CustomOptional<bool, NoDefault> DlssNrNativeBlendWasFinishedPicture;
+    CustomOptional<uint32_t, NoDefault> DlssNrNativeBlendWasReversibleMode;
+    CustomOptional<bool, NoDefault> DlssNrNativeBlendWasSkinProtection;
+    CustomOptional<float, NoDefault> DlssNrNativeBlendWasReplaceDetail;
+
     // The proxy curve (Final Image Composition), values in shaders/dlssnr/DlssNr_ProxyCurve.h. 0 = soft
     // knee + our composition (default); 1/2 = unclipped Neutwo proxy + composition / pure-inverse replace;
     // 3/4 = the balanced (hybrid) curve, the same two ways; 5 HLG and 6 PQ + composition; 7 linear +
@@ -421,6 +449,22 @@ class Config
     CustomOptional<std::string> DlssNrLutFile { std::string() };
     // How much of the LUT's grade reaches the image, 0..1. Default is fully graded once a LutFile is set.
     CustomOptional<float> DlssNrLutStrength { 1.0f };
+
+    // Post-NR LUT stack (memory/plans/2026-10-31-nr-lut-chain.md): up to four .cube files graded onto the picture NR
+    // returns, applied in order 1..4 with their own strength each. Unlike LutFile above the model never sees this
+    // grade. Dense: an empty slot is an absent layer, and an all-empty stack is the feature not existing.
+    static constexpr int kPostLutLayers = 4;
+    CustomOptional<std::string> DlssNrPostLutFile[kPostLutLayers] { std::string(), std::string(), std::string(),
+                                                                    std::string() };
+    CustomOptional<float> DlssNrPostLutStrength[kPostLutLayers] { 1.0f, 1.0f, 1.0f, 1.0f };
+    // Each layer's look input (Story 6): -1 = Auto (DlssNr::kLookInputAuto), else a DlssNr::LutSpace value, 0 = None.
+    // The ini holds words (DlssNr::LookInputKey).
+    CustomOptional<int> DlssNrPostLutInput[kPostLutLayers] { -1, -1, -1, -1 };
+    // Each layer's on/off: off keeps the layer (file, strength, look input) in the stack without applying it, as if its
+    // strength were 0 (DlssNr::PostLutEntries).
+    CustomOptional<bool> DlssNrPostLutEnabled[kPostLutLayers] { true, true, true, true };
+    // The whole stack on/off: off is every layer off, each layer's own setting kept.
+    CustomOptional<bool> DlssNrPostLutStackEnabled { true };
 
     // Whether the model's edit is applied. Off keeps the pass running (so Hold frame works) but shows
     // the clean upscaler frame -- for A/B'ing NR on/off on a frozen frame. Default true.
@@ -1202,6 +1246,11 @@ class Config
     bool RemovedAdaMfgUnlockSet = false;
     bool RemovedAmpereMfgUnlockSet = false;
     CustomOptional<FGOutput> FGOutput { FGOutput::NoFG };
+    // [F5Low] FrameGenerator: who makes the frames in FG Output F5Low
+    CustomOptional<F5Low::Generator> F5LowGenerator { F5Low::kDefaultGenerator };
+    // [F5Low] KeepGameDlssg: with the DLSS-G generator the game's own nvngx_dlssg.dll is kept from loading (two DLSS-G
+    // copies fault the GPU); true lets it load
+    CustomOptional<bool> F5LowKeepGameDlssg { false };
     // Keeps Streamline from picking up the driver's OTA/downloaded plugins; only files in
     // OptiScaler/streamline are used for sl.* plugins and nvngx_dlssg.dll
     CustomOptional<bool> FGStreamlineIgnoreOTA { false };

@@ -30,6 +30,7 @@
 #include <proxies/KernelBase_Proxy.h>
 #include <imgui/ImGuiNotify.hpp>
 #include <framegen/GameFsrFgRule.h>
+#include <framegen/FgWindowRule.h>
 
 #include <magic_enum.hpp>
 
@@ -120,9 +121,9 @@ static bool RefuseUnderGameFsrFg(HWND hwnd)
 {
     auto& state = State::Instance();
 
-    const auto decision = GameFsrFg::Decide(
-        state.activeFgOutput == FGOutput::XeFG, state.activeFgOutput == FGOutput::XeFG && CreatedByGameFsrFg(),
-        state.activeFgInput == FGInput::DLSSG, state.gameFsrFgSeen, state.gameFsrFgOn);
+    const auto decision =
+        GameFsrFg::Decide(UsesXeFGApi(state.activeFgOutput), UsesXeFGApi(state.activeFgOutput) && CreatedByGameFsrFg(),
+                          state.activeFgInput == FGInput::DLSSG, state.gameFsrFgSeen, state.gameFsrFgOn);
 
     state.xefgUnderGameFsrFg = decision == GameFsrFg::Swapchain::Take;
 
@@ -176,6 +177,71 @@ static bool RefuseUnderGameFsrFg(HWND hwnd)
     return true;
 }
 
+static FgWindow::Window DescribeWindow(HWND hwnd)
+{
+    FgWindow::Window window { hwnd };
+
+    if (hwnd == nullptr || !IsWindow(hwnd))
+        return window;
+
+    window.shown = IsWindowVisible(hwnd) != FALSE;
+
+    const bool minimized = IsIconic(hwnd) != FALSE;
+
+    RECT client {};
+    if (!GetClientRect(hwnd, &client))
+        client = {};
+
+    // The restored size is the window's rect (frame included), a little more than its client area: errs towards
+    // keeping frame generation where it is
+    WINDOWPLACEMENT placement { sizeof(WINDOWPLACEMENT) };
+    RECT restored {};
+    if (minimized && GetWindowPlacement(hwnd, &placement))
+        restored = placement.rcNormalPosition;
+
+    window.area = FgWindow::WindowArea(minimized, client.right - client.left, client.bottom - client.top,
+                                       restored.right - restored.left, restored.bottom - restored.top);
+
+    return window;
+}
+
+// The window frame generation's live swapchain is on: SetFGSwapchain's, or the window of the D3D11 interop's plain
+// D3D12 chain (SetDx12InteropPresentSC) when that one stands in as currentFGSwapchain. Null without one.
+static HWND LiveFgWindow(HWND fgHwnd, IDXGISwapChain* interopSC, HWND interopHwnd)
+{
+    auto* live = State::Instance().currentFGSwapchain;
+
+    if (live == nullptr)
+        return nullptr;
+
+    return interopSC != nullptr && live == interopSC ? interopHwnd : fgHwnd;
+}
+
+bool FGHooks::IsOtherWindowThanFG(HWND hwnd)
+{
+    // The Vulkan bridge's chain: its own call is not guarded, and the library's inner creates for it come through the
+    // guarded hooks inside ScopedBridgeCreate
+    if (_bridgeCreateDepth > 0)
+        return false;
+
+    const HWND fgHwnd = LiveFgWindow(_hwnd, _dx12InteropPresentSC, _dx12InteropPresentHwnd);
+
+    if (fgHwnd == nullptr || hwnd == nullptr || hwnd == fgHwnd)
+        return false;
+
+    const auto fg = DescribeWindow(fgHwnd);
+    const auto requested = DescribeWindow(hwnd);
+
+    if (!FgWindow::IsOtherWindow(true, fg, requested))
+        return false;
+
+    LOG_WARN("Frame generation's swapchain lives on window {:X} ({} px), window {:X} ({} px) gets a plain swapchain "
+             "and leaves frame generation's state alone",
+             (size_t) fgHwnd, fg.area, (size_t) hwnd, requested.area);
+
+    return true;
+}
+
 void FGHooks::NoteGameFsrFgSeen() { State::Instance().gameFsrFgSeen = true; }
 
 void FGHooks::NoteGameFsrFg(bool on)
@@ -219,7 +285,7 @@ static bool CheckForFGStatus()
             State::Instance().activeFgOutput = Config::Instance()->FGOutput.value_or_default();
         }
     }
-    else if (State::Instance().activeFgOutput == FGOutput::XeFG && !XeFGProxy::InitXeFG())
+    else if (UsesXeFGApi(State::Instance().activeFgOutput) && !XeFGProxy::InitXeFG())
     {
         ImGui::InsertNotification(
             { ImGuiToastType::Error, 20000, "Can't init XeFG\nAre you missing the required DLLs?" });
@@ -277,7 +343,7 @@ HRESULT FGHooks::CreateSwapChain(IDXGIFactory* pFactory, IUnknown* pDevice, DXGI
         {
             State::Instance().currentFG = new FSRFG_Dx12();
         }
-        else if (State::Instance().activeFgOutput == FGOutput::XeFG)
+        else if (UsesXeFGApi(State::Instance().activeFgOutput))
         {
             State::Instance().currentFG = new XeFG_Dx12();
         }
@@ -297,7 +363,7 @@ HRESULT FGHooks::CreateSwapChain(IDXGIFactory* pFactory, IUnknown* pDevice, DXGI
         if (Config::Instance()->FGDontUseSwapchainBuffers.value_or_default())
             State::Instance().skipHeapCapture = true;
 
-        if (State::Instance().activeFgOutput == FGOutput::XeFG && !pDesc->Windowed)
+        if (UsesXeFGApi(State::Instance().activeFgOutput) && !pDesc->Windowed)
             LOG_WARN("Using exclusive fullscreen with XeFG!!!");
 
         // These effects are not supported in DX12
@@ -391,7 +457,7 @@ HRESULT FGHooks::CreateSwapChainForHwnd(IDXGIFactory* pFactory, IUnknown* pDevic
         {
             State::Instance().currentFG = new FSRFG_Dx12();
         }
-        else if (State::Instance().activeFgOutput == FGOutput::XeFG)
+        else if (UsesXeFGApi(State::Instance().activeFgOutput))
         {
             State::Instance().currentFG = new XeFG_Dx12();
         }
@@ -411,8 +477,7 @@ HRESULT FGHooks::CreateSwapChainForHwnd(IDXGIFactory* pFactory, IUnknown* pDevic
         if (Config::Instance()->FGDontUseSwapchainBuffers.value_or_default())
             State::Instance().skipHeapCapture = true;
 
-        if (State::Instance().activeFgOutput == FGOutput::XeFG && pFullscreenDesc != nullptr &&
-            !pFullscreenDesc->Windowed)
+        if (UsesXeFGApi(State::Instance().activeFgOutput) && pFullscreenDesc != nullptr && !pFullscreenDesc->Windowed)
             LOG_WARN("Using exclusive fullscreen with XeFG!!!");
 
         // These effects are not supported in DX12
@@ -584,11 +649,11 @@ void FGHooks::HookFGSwapchain(IDXGISwapChain* pSwapChain)
                 DetourAttach(&(PVOID&) o_FGSCGetFullscreenDesc, hkGetFullscreenDesc);
         }
 
-        if (State::Instance().activeFgOutput == FGOutput::XeFG)
+        if (UsesXeFGApi(State::Instance().activeFgOutput))
         {
             if ((Config::Instance()->SimulateWaitableObject.value_or_default() ||
                  (State::Instance().gameEngine == GameEngineType::Unity &&
-                  State::Instance().activeFgOutput == FGOutput::XeFG)) &&
+                  UsesXeFGApi(State::Instance().activeFgOutput))) &&
                 o_FGSCGetFrameLatencyWaitableObject != nullptr)
             {
                 DetourAttach(&(PVOID&) o_FGSCGetFrameLatencyWaitableObject, hkGetFrameLatencyWaitableObject);
@@ -658,7 +723,7 @@ HRESULT FGHooks::hkSetFullscreenState(IDXGISwapChain* This, BOOL Fullscreen, IDX
 
     State::Instance().realExclusiveFullscreen = Fullscreen;
 
-    if (State::Instance().activeFgOutput == FGOutput::XeFG && Fullscreen)
+    if (UsesXeFGApi(State::Instance().activeFgOutput) && Fullscreen)
         LOG_WARN("Using exclusive fullscreen with XeFG!!!");
 
     auto result = S_OK;
@@ -883,7 +948,7 @@ LRESULT CALLBACK FGHooks::RestyleMessageHook(int code, WPARAM wParam, LPARAM lPa
 
 HANDLE FGHooks::hkGetFrameLatencyWaitableObject(IDXGISwapChain2* This)
 {
-    if (State::Instance().activeFgOutput != FGOutput::XeFG)
+    if (!UsesXeFGApi(State::Instance().activeFgOutput))
         return o_FGSCGetFrameLatencyWaitableObject(This);
 
     if (_semaphore == nullptr)
@@ -961,7 +1026,7 @@ HRESULT FGHooks::hkResizeBuffers(IDXGISwapChain* This, UINT BufferCount, UINT Wi
         LOG_DEBUG("WaitForSingleObject result: {}", waitResult);
     }
 
-    if (State::Instance().activeFgOutput == FGOutput::XeFG)
+    if (UsesXeFGApi(State::Instance().activeFgOutput))
     {
         if (BorderlessForced())
         {
@@ -972,7 +1037,7 @@ HRESULT FGHooks::hkResizeBuffers(IDXGISwapChain* This, UINT BufferCount, UINT Wi
         {
             LOG_WARN("SwapChainFlags changed from {:X} to {:X}", State::Instance().SCLastFlags, SwapChainFlags);
 
-            if (State::Instance().activeFgOutput == FGOutput::XeFG)
+            if (UsesXeFGApi(State::Instance().activeFgOutput))
             {
                 LOG_WARN("Preventing flag change for XeFG!");
                 SwapChainFlags = State::Instance().SCLastFlags;
@@ -1069,7 +1134,7 @@ HRESULT FGHooks::hkResizeBuffers(IDXGISwapChain* This, UINT BufferCount, UINT Wi
 
         // Let's try Dx11 like approach on Dx12
         std::shared_lock<std::shared_mutex> resizeLock(_resizeMutex, std::defer_lock);
-        if (State::Instance().activeFgOutput == FGOutput::XeFG &&
+        if (UsesXeFGApi(State::Instance().activeFgOutput) &&
             State::Instance().swapchainInteropApi == SwapchainInteropApi::None)
         {
             resizeLock.lock();
@@ -1232,7 +1297,7 @@ HRESULT FGHooks::hkResizeBuffers1(IDXGISwapChain3* This, UINT BufferCount, UINT 
         LOG_DEBUG("WaitForSingleObject result: {}", waitResult);
     }
 
-    if (State::Instance().activeFgOutput == FGOutput::XeFG)
+    if (UsesXeFGApi(State::Instance().activeFgOutput))
     {
         if (BorderlessForced())
         {
@@ -1243,7 +1308,7 @@ HRESULT FGHooks::hkResizeBuffers1(IDXGISwapChain3* This, UINT BufferCount, UINT 
         {
             LOG_WARN("SwapChainFlags changed from {:X} to {:X}", State::Instance().SCLastFlags, SwapChainFlags);
 
-            if (State::Instance().activeFgOutput == FGOutput::XeFG)
+            if (UsesXeFGApi(State::Instance().activeFgOutput))
             {
                 LOG_WARN("Preventing flag change for XeFG!");
                 SwapChainFlags = State::Instance().SCLastFlags;
@@ -1337,7 +1402,7 @@ HRESULT FGHooks::hkResizeBuffers1(IDXGISwapChain3* This, UINT BufferCount, UINT 
 
         // Let's try Dx11 like approach on Dx12
         std::shared_lock<std::shared_mutex> resizeLock(_resizeMutex, std::defer_lock);
-        if (State::Instance().activeFgOutput == FGOutput::XeFG &&
+        if (UsesXeFGApi(State::Instance().activeFgOutput) &&
             State::Instance().swapchainInteropApi == SwapchainInteropApi::None)
         {
             resizeLock.lock();
@@ -1506,7 +1571,7 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
     {
         // Let's try Dx11 like approach on Dx12
         std::shared_lock<std::shared_mutex> resizeLock(_resizeMutex, std::defer_lock);
-        if (State::Instance().activeFgOutput == FGOutput::XeFG &&
+        if (UsesXeFGApi(State::Instance().activeFgOutput) &&
             State::Instance().swapchainInteropApi == SwapchainInteropApi::None)
         {
             resizeLock.lock();
@@ -1547,6 +1612,28 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
         }
 
         gameQueue = fg12->GameCommandQueue();
+    }
+
+    // Which queue this is can change from frame to frame (frame generation's game queue comes and goes at a screen
+    // change): native input's work keeps its own order across a change (native::NativeProducer), and the log says when.
+    {
+        static ID3D12CommandQueue* lastGameQueue = nullptr; // compared only
+        static uint32_t changes = 0;
+
+        if (gameQueue != lastGameQueue)
+        {
+            if (lastGameQueue != nullptr && changes++ < 8)
+            {
+                auto* fg12 = dynamic_cast<IFGFeature_Dx12*>(state.currentFG);
+                LOG_INFO("FGPresent: the game's queue for work before frame generation changed {:X} -> {:X} ({})",
+                         (size_t) lastGameQueue, (size_t) gameQueue,
+                         fg12 == nullptr                       ? "no frame generation"
+                         : fg12->GameCommandQueue() == nullptr ? "frame generation has no game queue right now"
+                                                               : "frame generation's game queue");
+            }
+
+            lastGameQueue = gameQueue;
+        }
     }
 
     // Native input runs here, on the game's picture and queue, ahead of frame generation and before its lock below: when it
@@ -1702,7 +1789,7 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
                 SyncInterval = 1;
 
             // XeFG runs with XeLL, and XeLL needs sync interval 1 with VSync on (Intel's XeLL guide)
-            if (SyncInterval > 1 && state.activeFgOutput == FGOutput::XeFG)
+            if (SyncInterval > 1 && UsesXeFGApi(state.activeFgOutput))
             {
                 static bool logged = false;
 
@@ -1746,7 +1833,7 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
     void* xefgContext = nullptr;
     uint64_t xefgFrameId = 0;
 
-    if (willPresent && state.currentFG != nullptr && state.activeFgOutput == FGOutput::XeFG)
+    if (willPresent && state.currentFG != nullptr && UsesXeFGApi(state.activeFgOutput))
     {
         xefgContext = state.currentFG->SwapchainContext();
         xefgFrameId = InputCommon::xefg_marked_frame_id();
@@ -1834,7 +1921,7 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
     }
 
     if ((config->SimulateWaitableObject.value_or_default() ||
-         (state.gameEngine == GameEngineType::Unity && state.activeFgOutput == FGOutput::XeFG)) &&
+         (state.gameEngine == GameEngineType::Unity && UsesXeFGApi(state.activeFgOutput))) &&
         _semaphore != nullptr)
     {
         ReleaseSemaphore(_semaphore, 1, nullptr);

@@ -467,3 +467,6 @@ dlssg_for_sm86/
 /ROADMAP.md
 /ARCHITECTURE.md
 **/INDEX.md
+# F5Low kit folder: only its README is tracked (see external/f5low/README.md)
+/external/f5low/*
+!/external/f5low/README.md

@@ -60,4 +60,31 @@ inline void PackHalf4(const float* rgb, int size, uint8_t* dst, size_t rowPitch,
     }
 }
 
+// The lattice as RGBA32F texels (w = 1), the format the GPU pass reads since 2026-11-01: on Linear HDR its result is
+// turned back into light through Neutwo's inverse, which near display 1 magnifies half's 1/2048 steps into visible
+// bands. Same order and pitches as PackHalf4, 16 bytes a texel.
+inline size_t TightBytesFloat4(int size) { return (size_t) size * (size_t) size * (size_t) size * 4u * sizeof(float); }
+
+inline void PackFloat4(const float* rgb, int size, uint8_t* dst, size_t rowPitch, size_t slicePitch)
+{
+    const size_t sizeT = (size_t) size;
+
+    for (int z = 0; z < size; ++z)
+    {
+        uint8_t* const slice = dst + slicePitch * (size_t) z;
+        for (int y = 0; y < size; ++y)
+        {
+            float* const row = reinterpret_cast<float*>(slice + rowPitch * (size_t) y);
+            for (int x = 0; x < size; ++x)
+            {
+                const size_t i = ((size_t) z * sizeT + (size_t) y) * sizeT + (size_t) x;
+                row[x * 4 + 0] = rgb[i * 3 + 0];
+                row[x * 4 + 1] = rgb[i * 3 + 1];
+                row[x * 4 + 2] = rgb[i * 3 + 2];
+                row[x * 4 + 3] = 1.0f;
+            }
+        }
+    }
+}
+
 } // namespace DlssNrLutPack

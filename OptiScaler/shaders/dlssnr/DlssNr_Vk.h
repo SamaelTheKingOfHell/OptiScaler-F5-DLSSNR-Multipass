@@ -50,12 +50,13 @@ class DlssNr_Vk : public Shader_Vk
 
     void WriteDescriptors(VkDescriptorSet set, VkDeviceSize constantOffset, VkImageView source, VkImageView model,
                           VkImageView original, VkImageView motion, VkImageView target, VkImageView keep,
-                          VkImageLayout sourceLayout, VkImageLayout motionLayout);
+                          VkImageLayout sourceLayout, VkImageLayout motionLayout, VkImageView depth);
 
     // Takes a constant slot and its descriptor set, binds `pipeline`, dispatches and puts the barrier after it.
     bool Record(VkCommandBuffer cmdList, VkPipeline pipeline, const DlssNrConstants& constants, uint32_t groupsX,
                 uint32_t groupsY, VkImageView source, VkImageView model, VkImageView original, VkImageView motion,
-                VkImageView target, VkImageView keep, VkImageLayout sourceLayout, VkImageLayout motionLayout);
+                VkImageView target, VkImageView keep, VkImageLayout sourceLayout, VkImageLayout motionLayout,
+                VkImageView depth = VK_NULL_HANDLE);
 
     // Automatic exposure's eye adaptation (dlssnr_exposure_adapt.hlsl, SPIR-V), on this pass's pipeline layout. Built on
     // first use; not retried once it failed, and the meter then writes the exposure directly, as before.
@@ -90,7 +91,10 @@ class DlssNr_Vk : public Shader_Vk
                   uint32_t InThreadsY, VkImageView InSource, VkImageView InModel, VkImageView InOriginal,
                   VkImageView InMotion, VkImageView InTarget, VkImageView InKeep,
                   VkImageLayout InSourceLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                  VkImageLayout InMotionLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                  VkImageLayout InMotionLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  // The game's depth for the resolve's depth fade (binding 8): a depth-only view, in
+                  // SHADER_READ_ONLY_OPTIMAL. Null binds the placeholder, which is never read.
+                  VkImageView InDepth = VK_NULL_HANDLE);
 
     // Automatic exposure's eye adaptation (DlssNr_ExposureAdapt.h): one thread eases the 1x1 InEased (GENERAL) toward
     // the 1x1 InReading (SHADER_READ_ONLY_OPTIMAL). ExposureAdaptReady builds the pipeline on first use and says

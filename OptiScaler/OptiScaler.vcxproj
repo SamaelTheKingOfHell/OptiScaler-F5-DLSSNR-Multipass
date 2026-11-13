@@ -359,6 +359,9 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="plugins\PluginRegistry.h" />
     <ClInclude Include="plugins\PluginsView.h" />
     <ClInclude Include="menu\PluginsPage.h" />
+    <ClInclude Include="menu\NotificationsPage.h" />
+    <ClInclude Include="misc\NotificationHistory.h" />
+    <ClInclude Include="misc\LibraryPathCheck.h" />
     <ClInclude Include="framegen\mfgunlock\Locator.h" />
     <ClInclude Include="framegen\mfgunlock\Patch.h" />
     <ClInclude Include="framegen\mfgunlock\Provider.h" />
@@ -523,6 +526,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="dlssnr\DlssNr_ColourEncodingStatus.h" />
     <ClInclude Include="dlssnr\DlssNr_NativeMode.h" />
     <ClInclude Include="dlssnr\DlssNr_LutStatus.h" />
+    <ClInclude Include="dlssnr\DlssNr_SteadyValue.h" />
     <ClInclude Include="dlssnr\DlssNr_LutPack.h" />
     <ClInclude Include="shaders\dlssnr\DlssNr_ColourEncoding.h" />
     <ClInclude Include="shaders\dlssnr\DlssNr_ExposureState.h" />
@@ -656,6 +660,8 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="native\F5LowShaderBytecode.h" />
     <ClInclude Include="shaders\dlssnr\DlssNr_WatchedLists.h" />
     <ClInclude Include="native\VirtualUpscalerHold.h" />
+    <ClInclude Include="native\FpsLog.h" />
+    <ClInclude Include="native\GpuStageTiming.h" />
     <ClInclude Include="motion\OpticalFlow_Dx12.h" />
     <ClInclude Include="motion\SceneCut_Dx12.h" />
     <ClInclude Include="motion\TrustMask_Dx12.h" />
@@ -781,6 +787,11 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="shaders\rcas\RCAS_Common.h" />
     <ClInclude Include="shaders\rcas\RCAS_Dx11.h" />
     <ClInclude Include="shaders\rcas\RCAS_Dx12.h" />
+    <ClInclude Include="shaders\f5lut\F5Lut_Common.h" />
+    <ClInclude Include="shaders\f5lut\F5Lut_Dx11.h" />
+    <ClInclude Include="shaders\f5lut\F5Lut_Dx12.h" />
+    <ClInclude Include="shaders\f5lut\F5Lut_Vk.h" />
+    <ClInclude Include="shaders\dlssnr\precompile\dlssnr_lut_Shader_Dx11.h" />
     <ClInclude Include="State.h" />
     <ClInclude Include="upscalers\xess\XeSSFeature_Dx11on12.h" />
     <ClInclude Include="upscalers\xess\XeSSFeature_Vk.h" />
@@ -798,6 +809,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="gpu_time\GpuTime_Dx11.cpp" />
     <ClCompile Include="gpu_time\GpuTime_Dx12.cpp" />
     <ClCompile Include="framegen\mfgunlock\MfgUnlock.cpp" />
+    <ClCompile Include="framegen\f5low\F5Low.cpp" />
     <ClCompile Include="framegen\mfgunlock\hde\hde64.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <DisableSpecificWarnings>4701</DisableSpecificWarnings>
@@ -1107,6 +1119,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="hooks\Vulkan_Hooks.cpp" />
     <ClCompile Include="menu\menu_common.cpp" />
     <ClCompile Include="menu\PluginsPage.cpp" />
+    <ClCompile Include="menu\NotificationsPage.cpp" />
     <ClCompile Include="menu\menu_dx_base.cpp" />
     <ClCompile Include="menu\menu_dx11.cpp" />
     <ClCompile Include="menu\menu_dx12.cpp" />
@@ -1146,6 +1159,8 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="shaders\dlssnr\DlssNr_ExposureCalibrate.cpp" />
     <ClInclude Include="shaders\dlssnr\DlssNr_ActiveColor.h" />
     <ClInclude Include="shaders\dlssnr\DlssNr_Views.h" />
+    <ClInclude Include="shaders\dlssnr\DlssNr_Contexts.h" />
+    <ClInclude Include="shaders\dlssnr\DlssNr_Retire.h" />
     <ClCompile Include="shaders\dlssnr\DlssNr_Vk.cpp" />
     <ClCompile Include="shaders\dlssnr\DlssNr_LutVk.cpp" />
     <ClCompile Include="shaders\dlssnr\DlssNrDetailReuse_Vk.cpp" />
@@ -1186,6 +1201,10 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="shaders\sgsr1\SGSR1_Vk.cpp" />
     <ClCompile Include="shaders\rcas\RCAS_Dx11.cpp" />
     <ClCompile Include="shaders\rcas\RCAS_Dx12.cpp" />
+    <ClCompile Include="shaders\f5lut\F5Lut_Common.cpp" />
+    <ClCompile Include="shaders\f5lut\F5Lut_Dx11.cpp" />
+    <ClCompile Include="shaders\f5lut\F5Lut_Dx12.cpp" />
+    <ClCompile Include="shaders\f5lut\F5Lut_Vk.cpp" />
     <ClCompile Include="upscalers\xess\XeSSFeature_Vk.cpp" />
     <ClCompile Include="Util.cpp" />
     <ClCompile Include="version_check.cpp" />

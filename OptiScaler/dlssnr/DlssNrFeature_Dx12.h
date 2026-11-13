@@ -44,17 +44,23 @@ inline constexpr unsigned int DefaultMaxPassCount = 3;
 // game never does -- so without this the pass runs and never reports what it cost.
 // rayReconstruction identifies the feature for history reset and the SR-only deferred experiment.
 // Placement and model cost controls are shared by SR and RR+SR.
+// gameFeature is the game's DLSS feature handle, when the caller has it: a game that keeps several alive (a 3D
+// character preview next to the world) gets one NR state per feature (shaders/dlssnr/DlssNr_Contexts.h). 0 = main.
 void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
                           ID3D12CommandQueue* timingQueue = nullptr, bool rayReconstruction = false,
-                          unsigned long long submissionEpoch = 0);
+                          unsigned long long submissionEpoch = 0, uint32_t gameFeature = 0);
 
 // Runs the same pass over Color immediately before SR or RR+SR consumes it. The call is a no-op
 // unless RunBeforeSR is enabled. Color is returned in its original readable state.
 void EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
-                           ID3D12CommandQueue* timingQueue = nullptr,
-                           unsigned long long submissionEpoch = 0, bool rayReconstruction = false);
+                           ID3D12CommandQueue* timingQueue = nullptr, unsigned long long submissionEpoch = 0,
+                           bool rayReconstruction = false, uint32_t gameFeature = 0);
 
+// The game released one of its DLSS features: a model NR kept for it alone is parked.
+void ReleaseGameFeature(uint32_t gameFeature);
 
+// Of the game's DLSS features other than the main one: how many stand aside and how many have a model of their own.
+void GameFeatureStatus(unsigned& standingAside, unsigned& ownModels);
 
 // Frame generation titles tag their UI layer through Streamline; a copy of it makes the HUD mask
 // exact at the finished frame. Called at tag time.
@@ -64,6 +70,9 @@ void EvaluateBeforeUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Paramet
 
 // The settings panel, drawn inside OptiScaler's menu.
 void RenderMenu(::Config* config, float menuResScale, MenuPages::Page page);
+
+// The F5LUT page's card (the LUT stack graded after NR, or on the upscaler's output with NR off).
+void RenderF5LutCard(::Config* config, float menuResScale);
 
 // The main menu's header line for the native modes (Optical F5Low), by the rule in menu/HeaderBanner.h. True when it
 // drew the line and its button, false when the line is the menu's own (a game's feature, or no offer to make).
@@ -297,6 +306,10 @@ Spatial::Published EdgeCompressionStatus();
 // Whether the game draws several views into one colour allocation (a multi-monitor layout), the views found, and the one
 // NR works on (shaders/dlssnr/DlssNr_Views.h). Direct3D 12 only.
 Views::Snapshot MultiViewStatus();
+
+// NR stands down because the game keeps switching back and forth between what the model is built for (two formats or
+// sizes): every call would rebuild it (shaders/dlssnr/DlssNr_SurfaceFormats.h, RebuildGuard). Direct3D 12 only.
+bool StoodDownForRebuilds();
 
 // The size NR hands the model, in pixels, or 0x0 before the first frame. The network pools that 2x2 before
 // its body runs, so the body sees half of it (rounded up); the menu and log show both so tuning is not

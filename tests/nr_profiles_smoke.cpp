@@ -74,9 +74,22 @@ static void Keys()
     Check(IsKept("Passes") && IsKept("passes") && IsKept("PASSES"), "keys match case-insensitively (as the ini does)");
     Check(IsKept("Pass4Style") && IsKept("Pass30AutoMask") && IsKept("Pass17LocalTone"), "passes 4-30 kept");
     Check(!IsKept("Pass31Style") && !IsKept("Pass3x") && !IsKept("Pass4") && !IsKept("Pass04Style"), "not a pass key");
-    Check(IsKept("WhitePointSource") && IsKept("NativeMotion") && IsKept("ColourEncoding") &&
-              IsKept("FinishedPicture") && IsKept("SpatialCenterX"),
+    Check(IsKept("WhitePointSource") && IsKept("NativeDepthWidth") && IsKept("NativeMotionProfile") &&
+              IsKept("ColourEncoding") && IsKept("FinishedPicture") && IsKept("SpatialCenterX"),
           "the game's own settings kept (a profile is shared for one game)");
+    for (const char* mode :
+         { "NativeDepthFinder", "NativeMotion", "NativeInput", "NativeUpscaler", "NativeFrameGenerationOnly" })
+        Check(!IsKept(mode) && IsLeftOut(mode), std::string("Optical F5Low mode key left out: ") + mode);
+    Check(Filter({ { "NativeMotion", "false" }, { "NativeUpscaler", "false" }, { "Passes", "2" } }).size() == 1,
+          "an older profile's mode keys are not read");
+
+    const Section other { { "Passes", "3" }, { "NativeDepthWidth", "1280" }, { "NativeMotionProfile", "anime" } };
+    const Section here { { "Passes", "1" }, { "NativeDepthWidth", "auto" }, { "NativeDepthOffsetX", "4" },
+                         { "NativeMotion", "true" } };
+    const Section mixed = KeepNative(other, here);
+    Check(mixed.at("Passes") == "3" && mixed.at("NativeDepthWidth") == "auto" && mixed.at("NativeDepthOffsetX") == "4" &&
+              !mixed.count("NativeMotionProfile") && !mixed.count("NativeMotion"),
+          "another game's profile: this game's Optical F5Low tuning, the profile's look");
     Check(!IsKept("Enabled") && !IsKept("MultiViewScreens") && !IsKept("ToggleKey") && !IsKept("DisplayPaperWhiteNits") && !IsKept("HoldFrame") &&
               !IsKept("NativeDebugView") && !IsKept("Compare"),
           "the player's own and session keys left out");
@@ -84,7 +97,8 @@ static void Keys()
 
     Check(SameGame("NBA2K27.exe", "nba2k27.EXE") && SameGame("", "x.exe") && !SameGame("Cyberpunk2077.exe", "x.exe"),
           "same game by exe name, a file without one counts as this game's");
-    Check(NativeChanged({ { "NativeMotion", "true" } }, {}) && !NativeChanged({ { "NativeMotion", "auto" } }, {}) &&
+    Check(NativeChanged({ { "NativeDepthWidth", "1280" } }, {}) &&
+              !NativeChanged({ { "NativeDepthWidth", "auto" } }, {}) && !NativeChanged({ { "NativeMotion", "true" } }, {}) &&
               !NativeChanged({ { "Passes", "3" } }, { { "Passes", "2" } }),
           "only a Native key change counts as an Optical F5Low change");
 
@@ -102,6 +116,27 @@ static void Keys()
     Check(Same({ { "LutFile", "warm.cube" } }, { { "LutFile", "C:\\Games\\X\\OptiScaler\\LUTs\\warm.cube" } }) &&
               !Same({ { "LutFile", "warm.cube" } }, { { "LutFile", "C:\\LUTs\\cold.cube" } }),
           "the LUT counts by file name");
+
+    // The post-NR LUT stack (memory/plans/2026-10-31-nr-lut-chain.md): its files and strengths are kept, by file name.
+    for (int i = 1; i <= 4; ++i)
+    {
+        const std::string file = "PostLutFile" + std::to_string(i);
+        const std::string strength = "PostLutStrength" + std::to_string(i);
+        const std::string enabled = "PostLutEnabled" + std::to_string(i);
+        Check(IsLutFileKey(file) && IsLutFileKey("postlutfile" + std::to_string(i)), "post LUT file key: " + file);
+        Check(!IsLeftOut(file) && !IsLeftOut(strength) && !IsLeftOut(enabled), "post LUT keys are not left out: " + file);
+        Check(Filter({ { enabled, "false" } }).count(enabled) == 1 && !IsLutFileKey(enabled),
+              "a profile keeps " + enabled);
+        const Section kept = Filter({ { file, "a.cube" }, { strength, "0.5" }, { "Bogus", "1" } });
+        Check(kept.size() == 2 && kept.count(file) && kept.count(strength), "filter keeps " + file + " and its strength");
+    }
+    Check(!IsLeftOut("PostLutStackEnabled") && Filter({ { "PostLutStackEnabled", "false" } }).size() == 1,
+          "a profile keeps the stack's on/off");
+    Check(!IsLutFileKey("PostLutStrength1") && !IsLutFileKey("LutStrength") && !IsLutFileKey("PostLutFile5"),
+          "only file keys are LUT file keys");
+    Check(Same({ { "PostLutFile2", "warm.cube" } }, { { "PostLutFile2", "C:\\Games\\X\\OptiScaler\\LUTs\\warm.cube" } }) &&
+              !Same({ { "PostLutFile2", "warm.cube" } }, { { "PostLutFile2", "cold.cube" } }),
+          "a post LUT layer counts by file name");
 }
 
 // Every key SaveIni writes into [DlssNr] is kept or left out. The Pass{}... keys written in a loop are covered by the

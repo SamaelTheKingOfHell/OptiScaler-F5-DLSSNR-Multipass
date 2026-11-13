@@ -4,11 +4,15 @@
 
 #include <native/Dx12FrameSource.h>
 #include <native/FlowDiagnosticUi.h>
+#include <native/FpsLog.h>
 #include <native/NativeDriver.h>
 
 #include <Config.h>
 #include <dlssnr/DlssNr_StreamlinePicture.h>
 #include <dlssnr/DlssNrFeature_Dx12.h>
+#include <dlssnr/DlssNr_NativeMode.h>
+#include <framegen/FGOutput.h>
+#include <framegen/xefg/XeFG_ShownRate.h>
 
 #include <menu/menu_overlay_dx.h>
 #include <resource_tracking/GenericDepth_Dx12.h>
@@ -25,6 +29,78 @@ namespace
 
 native::NativeDriver g_driver("Native motion", "");
 native::Dx12FrameSource g_source;
+native::fpslog::Tracker g_fps; // under g_runMutex
+
+const char* ModeName(DlssNrNativeMode::Shown shown)
+{
+    switch (shown)
+    {
+    case DlssNrNativeMode::Shown::NrOnly:
+        return "NR only";
+    case DlssNrNativeMode::Shown::NrAndFrameGeneration:
+        return "NR + frame generation";
+    case DlssNrNativeMode::Shown::MotionOnly:
+        return "motion only";
+    default:
+        return "Off";
+    }
+}
+
+const char* OutputName(FGOutput output)
+{
+    switch (output)
+    {
+    case FGOutput::FSRFG:
+        return "FSR FG";
+    case FGOutput::DLSSG:
+        return "DLSS-G";
+    case FGOutput::XeFG:
+        return "XeFG";
+    case FGOutput::F5Low:
+        return "F5Low";
+    default:
+        return "none";
+    }
+}
+
+// The frame rate after each change of a setting that moves it (native/FpsLog.h), whatever the Optical F5Low mode: one
+// game present of a D3D12 game, under g_runMutex. Compared: what the player set; in the line: what runs now.
+void LogFps()
+{
+    auto* config = Config::Instance();
+    auto& state = State::Instance();
+    const bool xefgApi = UsesXeFGApi(state.activeFgOutput);
+
+    native::fpslog::Settings settings;
+    settings.nr = config->DlssNrEnabled.value_or_default();
+    settings.modelScale = config->DlssNrWorkingScale.value_or_default();
+    settings.modelAuto = config->DlssNrModelResolutionAuto.value_or_default();
+    settings.upscalerPass = config->DlssNrNativeUpscalerPass.value_or_default();
+    settings.mode = ModeName(DlssNrNativeMode::FromKeys(
+        { config->DlssNrNativeDepthFinder.value_or_default(), config->DlssNrNativeMotion.value_or_default(),
+          config->DlssNrNativeInput.value_or_default(), config->DlssNrNativeUpscaler.value_or_default() }));
+    settings.fgOutput = OutputName(state.activeFgOutput);
+    settings.fgEnabled = state.activeFgOutput != FGOutput::NoFG && config->IsFGEnabled();
+    // XeFG's API (XeFG, F5Low) takes the count asked for; FSR FG makes one frame; DLSS-G's count is its own
+    settings.fgCount = xefgApi ? (uint32_t) (std::max) (config->FGXeFGInterpolationCount.value_or_default(), 1) + 1 : 2;
+    settings.dynamicMfg = xefgApi && config->FGXeFGDynamicMFG.value_or_default();
+    settings.capFps = config->FramerateLimit.value_or_default();
+
+    // Read as the present hooks around it read it (wrapped_swapchain.cpp, FG_Hooks.cpp)
+    native::fpslog::Live live;
+    auto* fg = state.currentFG;
+    live.fgRunning = fg != nullptr && fg->IsActive() && !fg->IsPaused();
+    live.fgMultiplier = live.fgRunning ? fg->GetInterpolatedFrameCount() + 1 : 1;
+
+    if (xefgApi && fg != nullptr)
+        live.shownTotal = state.xefgShown.load(std::memory_order_relaxed) >> xefg::kShownPresentBits;
+
+    live.shownMask = xefg::kShownFrameMask;
+    live.modelPercent = settings.nr ? DlssNr::CurrentModelResolutionPercent() : 0;
+
+    if (auto line = g_fps.OnPresent(Util::MillisecondsNow(), settings, live))
+        LOG_INFO("{}", *line);
+}
 
 // Under frame generation the menu's present hook sees the real swap chain after frame generation ran, on its presenter's
 // thread and queue; FGPresent drives the step instead. The menu's hook stands aside while FGPresent ran within this many of
@@ -163,6 +239,7 @@ void OnPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, ID3D12Devic
         return;
 
     g_fgDriven = false;
+    LogFps();
     GenericDepthDx12::OnPresent(swapChain);
     RunFrame(swapChain, queue, device);
 }
@@ -173,6 +250,7 @@ void OnFGPresent(IDXGISwapChain* swapChain, ID3D12CommandQueue* queue, ID3D12Dev
     g_fgDriven = true;
 
     std::lock_guard lock(g_runMutex);
+    LogFps();
     GenericDepthDx12::OnPresent(swapChain);
     RunFrame(swapChain, queue, device);
 }

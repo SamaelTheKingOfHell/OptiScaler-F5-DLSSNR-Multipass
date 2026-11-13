@@ -89,6 +89,29 @@ int main() try
                DlssNr::PresentsSince(10, 7) == 3,
            "Presents-since arithmetic (a stamp read ahead of the present count counts as just now)");
 
+    // Picture age counts presents; frame generation adds some per game frame (window 2n - 1, 1 at x1).
+    using DlssNr::FinishedHistoryGap;
+    using DlssNr::FinishedPresentWindow;
+    using DlssNr::FinishedStale;
+    Expect(FinishedPresentWindow(0) == 1 && FinishedPresentWindow(1) == 1 && FinishedPresentWindow(2) == 3 &&
+               FinishedPresentWindow(3) == 5 && FinishedPresentWindow(6) == 11,
+           "Present window per frame generation multiplier");
+    Expect(!FinishedStale(11, 10, 1) && FinishedStale(12, 10, 1), "x1: age 1 fresh, age 2 stale");
+    Expect(!FinishedStale(13, 10, 2) && FinishedStale(14, 10, 2), "x2: age 3 fresh, age 4 stale");
+    Expect(!FinishedStale(13, 10, 3) && !FinishedStale(15, 10, 3) && FinishedStale(16, 10, 3),
+           "x3: age 3 and 5 fresh, age 6 stale");
+    Expect(!FinishedStale(16, 10, 6) && !FinishedStale(21, 10, 6) && FinishedStale(22, 10, 6),
+           "x6: age 6 and 11 fresh, age 12 stale");
+    Expect(FinishedStale(9, 10, 1) && FinishedStale(9, 10, 6), "A capture from the future is stale");
+    // History gap: a step of up to two game frames of presents keeps NR's history, a longer one drops it.
+    Expect(!FinishedHistoryGap(10, 12, 1) && FinishedHistoryGap(10, 13, 1), "x1: step 2 fine, 3 resets");
+    Expect(!FinishedHistoryGap(10, 14, 2) && FinishedHistoryGap(10, 15, 2), "x2: step 4 fine, 5 resets");
+    Expect(!FinishedHistoryGap(10, 16, 3) && FinishedHistoryGap(10, 17, 3), "x3: step 6 fine, 7 resets");
+    Expect(!FinishedHistoryGap(10, 22, 6) && FinishedHistoryGap(10, 23, 6), "x6: step 12 fine, 13 resets");
+    Expect(FinishedHistoryGap(0, 10, 3), "Nothing applied yet resets");
+    Expect(!FinishedHistoryGap(10, 10, 3), "The same epoch is no gap");
+    Expect(!FinishedHistoryGap(10, 7, 3), "An earlier epoch is no gap");
+
     // ResizeBuffers waits only for work that touched the back buffer (a compose), never for a guide copy.
     Expect(!DlssNr::TouchedBackBuffer(5, 5), "Waited for a capture-only slot");
     Expect(DlssNr::TouchedBackBuffer(5, 6), "Skipped a composed slot");

@@ -7,6 +7,8 @@
 
 #include <proxies/Ntdll_Proxy.h>
 #include <proxies/KernelBase_Proxy.h>
+#include <misc/XeModuleInfo.h>
+#include <framegen/f5low/F5Low.h>
 
 #include <xefg_swapchain.h>
 #include <xefg_swapchain_d3d12.h>
@@ -66,6 +68,9 @@ class XeFGProxy
     inline static PFN_xefgSwapChainSetLatencyReduction _xefgSwapChainSetLatencyReduction = nullptr;
     using PFN_XellCountsRenderedOnly = uint32_t (*)();
     inline static PFN_XellCountsRenderedOnly _xellCountsRenderedOnly = nullptr;
+    using PFN_DriverMultipliesReflexCap = uint32_t (*)();
+    inline static PFN_DriverMultipliesReflexCap _driverMultipliesReflexCap = nullptr;
+    using PFN_HostRoutesMarkers = void (*)();
     inline static PFN_xefgSwapChainSetSceneChangeThreshold _xefgSwapChainSetSceneChangeThreshold = nullptr;
     inline static PFN_xefgSwapChainGetPipelineBuildStatus _xefgSwapChainGetPipelineBuildStatus = nullptr;
     inline static PFN_xefgSwapChainSetNumInterpolatedFrames _xefgSwapChainSetNumInterpolatedFrames = nullptr;
@@ -136,6 +141,22 @@ class XeFGProxy
 
         auto optiPath = Config::Instance()->MainDllPath.value();
 
+        // FG Output F5Low: our f5low.dll from the plugins folder only, never Intel's library in its place
+        if (State::Instance().activeFgOutput == FGOutput::F5Low)
+        {
+            // One try per session (the output does not change without a restart); a second caller waits for it
+            static std::once_flag f5lowOnce;
+            static HMODULE f5lowModule = nullptr;
+            std::call_once(f5lowOnce, [] { f5lowModule = F5Low::LoadLibraryForOutput(); });
+
+            mainModule = f5lowModule;
+            if (mainModule == nullptr)
+                return false;
+
+            _dllPath = F5Low::LibraryPath();
+            return HookXeFG(mainModule);
+        }
+
         for (size_t i = 0; i < dllNames.size(); i++)
         {
             LOG_DEBUG("Trying to load {}", wstring_to_string(dllNames[i]));
@@ -160,9 +181,11 @@ class XeFGProxy
 
             LOG_INFO("Loaded from {}", wstring_to_string(_dllPath));
 
+            XeModuleInfo::CheckXeFGPath();
             return HookXeFG(mainModule);
         }
 
+        XeModuleInfo::CheckXeFGPath();
         return false;
     }
 
@@ -213,6 +236,20 @@ class XeFGProxy
                 if (_xellCountsRenderedOnly != nullptr)
                     LOG_INFO("XeFG library does not tell XeLL about its generated frames while it runs its own: a cap "
                              "XeLL keeps then goes per rendered frame");
+                // Not Intel's: a library that runs NVIDIA's DLSS-G behind XeFG's API (xefg_cuda Generator=dlssg)
+                _driverMultipliesReflexCap = (PFN_DriverMultipliesReflexCap) KernelBaseProxy::GetProcAddress_()(
+                    _dll, "xefgCudaDriverMultipliesReflexCap");
+                // Asked once now too: the library logs a warning when an OptiScaler never asks
+                if (_driverMultipliesReflexCap != nullptr)
+                    _driverMultipliesReflexCap();
+                // Not Intel's: tells f5low.dll once that this OptiScaler hands the library's async frame markers on as
+                // the library's own, not the game's Reflex calls (IsFgLibraryMarker), so its DriverPacing default can
+                // be automatic. Before any context is made: the contexts are created through the procs looked up below,
+                // and f5low reads the answer when it creates one.
+                if (const auto routesMarkers =
+                        (PFN_HostRoutesMarkers) KernelBaseProxy::GetProcAddress_()(_dll, "f5lowHostRoutesMarkers");
+                    routesMarkers != nullptr)
+                    routesMarkers();
                 _xefgSwapChainSetSceneChangeThreshold =
                     (PFN_xefgSwapChainSetSceneChangeThreshold) KernelBaseProxy::GetProcAddress_()(
                         _dll, "xefgSwapChainSetSceneChangeThreshold");
@@ -309,6 +346,13 @@ class XeFGProxy
     // Support"). A replacement such as xefg_cuda that does not says so (xefgCudaXellCountsRenderedOnly, while its own
     // context runs): XeLL then caps the game's own frames.
     static bool XellCountsShownFrames() { return _xellCountsRenderedOnly == nullptr || _xellCountsRenderedOnly() == 0; }
+    // A library that runs DLSS-G behind XeFG's API (xefgCudaDriverMultipliesReflexCap, while it does): the NVIDIA
+    // driver multiplies a Reflex interval by DLSS-G's multiplier itself (NBA 2K27: 33333 us at 3x read back as 99999
+    // us), so a shown-frame cap goes to real Reflex undivided, as for a game's own DLSS-G (CapForGame)
+    static bool DriverMultipliesReflexCap()
+    {
+        return _driverMultipliesReflexCap != nullptr && _driverMultipliesReflexCap() != 0;
+    }
     static PFN_xefgSwapChainSetSceneChangeThreshold SetSceneChangeThreshold()
     {
         return _xefgSwapChainSetSceneChangeThreshold;

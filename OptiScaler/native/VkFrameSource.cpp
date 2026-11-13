@@ -503,6 +503,24 @@ void VkFrameSource::OnDeviceDestroyed(VkDevice device)
     g_devices.Forget(device);
 }
 
+void VkFrameSource::Skip()
+{
+    // Bridged, as a present with no producer does (NativeMotionVk::OnPresent): the picture is copied in all the same
+    if (_bridged)
+    {
+        FrameInput unused;
+        Acquire(unused);
+        return;
+    }
+
+    // Not bridged: nothing of an earlier frame may reach this present (its waits would be an old, spent semaphore)
+    _acquired = false;
+    _tookPresentWaits = false;
+    _presentWait = VK_NULL_HANDLE;
+    _acquiredPicture = nullptr;
+    _producerDone = SyncPoint {};
+}
+
 AcquireStatus VkFrameSource::Acquire(FrameInput& input)
 {
     _acquired = false;

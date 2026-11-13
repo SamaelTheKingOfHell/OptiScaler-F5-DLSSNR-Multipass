@@ -88,7 +88,7 @@ namespace Late
 using Microsoft::WRL::ComPtr;
 struct Slot
 {
-    struct Frame { uint64_t SubmissionEpoch = 0; unsigned OutputWidth = 8, OutputHeight = 8; } frame;
+    struct Frame { uint64_t SubmissionEpoch = 0; unsigned OutputWidth = 8, OutputHeight = 8; bool Reset = false; } frame;
     bool pending = false, submitted = false, expired = false, residualOnly = false;
     uint64_t serial = 0, ready = 0;
     ID3D12CommandList* producer = nullptr;
@@ -99,6 +99,9 @@ std::array<Slot, 4> slots;
 bool reset = false;
 uint64_t resetVersion = 0;
 #include "FinishedReset.inl"
+uint32_t presentsPerGameFrame = 1; // stands in for the frame generation multiplier
+uint32_t PresentsPerGameFrame() { return presentsPerGameFrame; }
+uint64_t lastAppliedEpoch = 0;
 uint64_t successes = 0, lastApplicationSuccesses = 0;
 std::string status;
 void Say(const char* message) { status = message; }
@@ -265,6 +268,25 @@ try
     slots[0].frame.SubmissionEpoch = 98;
     Expect(select(false) == DlssNr::FinishedPick::None && !slots[0].pending,
            "Ordinary Present lost its epoch expiry");
+    // Age is counted in presents, scaled by the frames shown per game frame; a plain expiry is no reset.
+    const auto expireAt = [&](uint64_t submissionEpoch, bool gameReset)
+    {
+        slots[0].pending = true;
+        slots[0].expired = false;
+        slots[0].frame.SubmissionEpoch = submissionEpoch;
+        slots[0].frame.Reset = gameReset;
+        DlssNr::Late::reset = false;
+        select(false);
+        return slots[0].expired;
+    };
+    Expect(expireAt(98, false) && !DlssNr::Late::reset, "Plain expiry on an ordinary present reset NR history");
+    Expect(expireAt(98, true) && DlssNr::Late::reset, "Expired capture lost the game's reset flag");
+    DlssNr::Late::presentsPerGameFrame = 3;
+    Expect(!expireAt(98, false), "x3: a capture 2 presents old expired");
+    Expect(expireAt(94, false), "x3: a capture 6 presents old stayed eligible");
+    DlssNr::Late::presentsPerGameFrame = 1;
+    Expect(expireAt(98, false), "x1: a capture 2 presents old stayed eligible");
+    slots[0].frame.Reset = false;
     slots[0].pending = true;
     slots[0].expired = false;
     slots[0].frame.SubmissionEpoch = 100;

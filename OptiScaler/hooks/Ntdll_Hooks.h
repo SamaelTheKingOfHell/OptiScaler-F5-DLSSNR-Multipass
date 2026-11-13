@@ -5,6 +5,7 @@
 #include <Config.h>
 #include <DllNames.h>
 #include <framegen/mfgunlock/MfgUnlock.h>
+#include <framegen/f5low/F5Low.h>
 
 #include "LibraryLoad_Hooks.h"
 #include "Hook_Utils.h"
@@ -89,7 +90,7 @@ class NtdllHooks
             auto moduleHandle = LibraryLoadHooks::LoadLibraryCheckW(name.data(), name.data());
 
             // skip loading of dll
-            if (moduleHandle == (HMODULE) 1337)
+            if (moduleHandle == (HMODULE) 1337 || moduleHandle == F5Low::kBlockedLoad)
             {
                 return STATUS_DLL_NOT_FOUND;
             }
@@ -151,7 +152,7 @@ class NtdllHooks
             auto moduleHandle = LibraryLoadHooks::LoadLibraryCheckW(name.data(), path.data());
 
             // skip loading of dll
-            if (moduleHandle == (HMODULE) 1337)
+            if (moduleHandle == (HMODULE) 1337 || moduleHandle == F5Low::kBlockedLoad)
             {
                 return STATUS_DLL_NOT_FOUND;
             }

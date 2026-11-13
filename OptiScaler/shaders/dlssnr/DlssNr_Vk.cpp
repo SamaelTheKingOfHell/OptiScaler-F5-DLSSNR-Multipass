@@ -54,21 +54,22 @@ DlssNr_Vk::DlssNr_Vk(std::string InName, VkDevice InDevice, VkPhysicalDevice InP
     // samplers for the reads: the shader declares its sampler separately, and a combined descriptor
     // satisfies a separately declared sampled image with the sampler half simply unused.
     std::vector<VkDescriptorSetLayoutBinding> bindings = {
-        CreateBinding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER),          // Params
-        CreateBinding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),  // gSource
-        CreateBinding(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),  // gModel
-        CreateBinding(3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),  // gOriginal
-        CreateBinding(4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),  // gMotion
-        CreateBinding(5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),           // gTarget
-        CreateBinding(6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),           // gKeep
-        CreateBinding(7, VK_DESCRIPTOR_TYPE_SAMPLER),                 // gLinear
+        CreateBinding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER),         // Params
+        CreateBinding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER), // gSource
+        CreateBinding(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER), // gModel
+        CreateBinding(3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER), // gOriginal
+        CreateBinding(4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER), // gMotion
+        CreateBinding(5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),          // gTarget
+        CreateBinding(6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),          // gKeep
+        CreateBinding(7, VK_DESCRIPTOR_TYPE_SAMPLER),                // gLinear
+        CreateBinding(8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER), // gDepth (the depth fade)
     };
 
     CreateLayouts(bindings);
 
     std::vector<VkDescriptorPoolSize> poolSizes = {
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kSlots },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 * kSlots },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5 * kSlots },
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * kSlots },
         { VK_DESCRIPTOR_TYPE_SAMPLER, kSlots },
     };
@@ -193,7 +194,8 @@ bool DlssNr_Vk::CreateDummy(VkCommandBuffer cmdList)
 
 void DlssNr_Vk::WriteDescriptors(VkDescriptorSet set, VkDeviceSize constantOffset, VkImageView source,
                                  VkImageView model, VkImageView original, VkImageView motion, VkImageView target,
-                                 VkImageView keep, VkImageLayout sourceLayout, VkImageLayout motionLayout)
+                                 VkImageView keep, VkImageLayout sourceLayout, VkImageLayout motionLayout,
+                                 VkImageView depth)
 {
     VkDescriptorBufferInfo bufferInfo { _constantBuffer, constantOffset, sizeof(DlssNrConstants) };
 
@@ -218,6 +220,7 @@ void DlssNr_Vk::WriteDescriptors(VkDescriptorSet set, VkDeviceSize constantOffse
     VkDescriptorImageInfo targetInfo = writeInfo(target);
     VkDescriptorImageInfo keepInfo = writeInfo(keep);
     VkDescriptorImageInfo samplerInfo { _textureSampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
+    VkDescriptorImageInfo depthInfo = readInfo(depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
     const VkWriteDescriptorSet writes[] = {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr,
@@ -236,6 +239,8 @@ void DlssNr_Vk::WriteDescriptors(VkDescriptorSet set, VkDeviceSize constantOffse
           nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 7, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLER, &samplerInfo,
           nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 8, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+          &depthInfo, nullptr, nullptr },
     };
 
     vkUpdateDescriptorSets(_device, (uint32_t) (sizeof(writes) / sizeof(writes[0])), writes, 0, nullptr);
@@ -243,8 +248,8 @@ void DlssNr_Vk::WriteDescriptors(VkDescriptorSet set, VkDeviceSize constantOffse
 
 bool DlssNr_Vk::Dispatch(VkCommandBuffer InCmdList, const DlssNrConstants& InConstants, uint32_t InThreadsX,
                          uint32_t InThreadsY, VkImageView InSource, VkImageView InModel, VkImageView InOriginal,
-                         VkImageView InMotion, VkImageView InTarget, VkImageView InKeep,
-                         VkImageLayout InSourceLayout, VkImageLayout InMotionLayout)
+                         VkImageView InMotion, VkImageView InTarget, VkImageView InKeep, VkImageLayout InSourceLayout,
+                         VkImageLayout InMotionLayout, VkImageView InDepth)
 {
     // The shader's thread group is 8x8, the same as the D3D12 path. Automatic exposure's meter is the
     // one exception: its shader spends a whole group on each 64x64 tile, so it dispatches one per tile.
@@ -254,7 +259,7 @@ bool DlssNr_Vk::Dispatch(VkCommandBuffer InCmdList, const DlssNrConstants& InCon
     const uint32_t groupsY = parallelExposureMeter ? InConstants.Height : (InThreadsY + 7) / 8;
 
     return Record(InCmdList, _pipeline, InConstants, groupsX, groupsY, InSource, InModel, InOriginal, InMotion,
-                  InTarget, InKeep, InSourceLayout, InMotionLayout);
+                  InTarget, InKeep, InSourceLayout, InMotionLayout, InDepth);
 }
 
 bool DlssNr_Vk::EnsurePipeline(VkPipeline& pipeline, bool& failed, const unsigned char* code, size_t size,
@@ -327,7 +332,7 @@ bool DlssNr_Vk::DispatchStatsCopy(VkCommandBuffer InCmdList, const DlssNrConstan
 bool DlssNr_Vk::Record(VkCommandBuffer InCmdList, VkPipeline pipeline, const DlssNrConstants& InConstants,
                        uint32_t groupsX, uint32_t groupsY, VkImageView InSource, VkImageView InModel,
                        VkImageView InOriginal, VkImageView InMotion, VkImageView InTarget, VkImageView InKeep,
-                       VkImageLayout InSourceLayout, VkImageLayout InMotionLayout)
+                       VkImageLayout InSourceLayout, VkImageLayout InMotionLayout, VkImageView InDepth)
 {
     if (!CanRender() || InCmdList == VK_NULL_HANDLE)
         return false;
@@ -348,7 +353,7 @@ bool DlssNr_Vk::Record(VkCommandBuffer InCmdList, VkPipeline pipeline, const Dls
     std::memcpy((char*) _mappedConstantBuffer + offset, &InConstants, sizeof(DlssNrConstants));
 
     WriteDescriptors(_descriptorSets[slot], offset, InSource, InModel, InOriginal, InMotion, InTarget, InKeep,
-                     InSourceLayout, InMotionLayout);
+                     InSourceLayout, InMotionLayout, InDepth);
 
     vkCmdBindPipeline(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(InCmdList, VK_PIPELINE_BIND_POINT_COMPUTE, _pipelineLayout, 0, 1, &_descriptorSets[slot], 0,

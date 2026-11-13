@@ -23,6 +23,7 @@ bool IFeature_Vk::Init(VkInstance InInstance, VkPhysicalDevice InPD, VkDevice In
         OutputScaler = std::make_unique<OS_Vk>("Output Scaling", InDevice, InPD, (TargetWidth() < DisplayWidth()));
         RCAS = std::make_unique<RCAS_Vk>("RCAS", InDevice, InPD);
         Magnifier = std::make_unique<Magnifier_Vk>("Magnifier", InDevice, InPD);
+        F5Lut = std::make_unique<F5Lut_Vk>("F5LUT", InDevice, InPD);
 
         // UpscalerTime = std::make_unique<GpuTime_Vk>(InDevice);
     }
@@ -220,6 +221,35 @@ bool IFeature_Vk::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InP
                   }
                   return true;
               } });
+    }
+
+    // F5LUT: the LUT stack on the upscaler's output, after sharpening, while NR is not grading it (F5Lut_Common.h)
+    if (F5Lut != nullptr && F5Lut->ShouldRun(IsHdr()))
+    {
+        pipeline.push_back({ // Setup
+                             [&](const VkImageInfo& nextOutput) -> VkImageInfo
+                             { return F5Lut->Setup(InCmdBuffer, nextOutput, intermediateUsage); },
+
+                             // Dispatch
+                             [&](const VkImageInfo& input, const VkImageInfo& output) -> bool
+                             {
+                                 // The game's exposure sets the white point of a linear HDR frame (none with auto
+                                 // exposure)
+                                 VkImageView exposure = VK_NULL_HANDLE;
+                                 float preExposure = 1.0f;
+                                 NVSDK_NGX_Resource_VK* paramExposure = nullptr;
+                                 if (IsHdr() && !AutoExposure() &&
+                                     InParameters->Get(NVSDK_NGX_Parameter_ExposureTexture, (void**) &paramExposure) ==
+                                         NVSDK_NGX_Result_Success &&
+                                     paramExposure != nullptr &&
+                                     paramExposure->Type == NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW)
+                                 {
+                                     exposure = paramExposure->Resource.ImageViewInfo.ImageView;
+                                     InParameters->Get(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, &preExposure);
+                                 }
+
+                                 return F5Lut->Dispatch(InCmdBuffer, input, output, IsHdr(), exposure, preExposure);
+                             } });
     }
 
     if (Magnifier->ShouldRun())

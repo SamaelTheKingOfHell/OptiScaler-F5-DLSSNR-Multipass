@@ -5,6 +5,8 @@
 
 #include <imgui/imgui.h>
 
+class IFGFeature;
+
 class ScopedIndent
 {
   public:
@@ -218,6 +220,23 @@ class MenuCommon
 
     struct RenderMenuContext;
 
+    // What keeps XeFG / F5Low from running, worked out from the current state without drawing: the XeFG card acts on
+    // it (turns frame generation off, greys controls) and the page's status line names it.
+    struct XeFGRunChecks
+    {
+        bool ignoreChecks = false;
+        bool correctMVs = true;
+        bool restartNeeded = false;
+        bool exclusiveFullscreen = false; // turns frame generation off even with the checks ignored
+        bool borderlessMissing = false;
+        bool hdrUnsupported = false;
+
+        bool CantActivate() const { return borderlessMissing || hdrUnsupported; }
+        // Why frame generation cannot run now, for the status line; null when it can
+        const char* BlockedReason() const;
+    };
+    static XeFGRunChecks CheckXeFGRun(RenderMenuContext& ctx, IFGFeature* fg);
+
     // RenderMenu orchestration helpers. These keep the public RenderMenu() flow short
     // while preserving the original ImGui layout and draw order.
     static void UpdateRenderTiming(RenderMenuContext& ctx);
@@ -242,6 +261,8 @@ class MenuCommon
     static void RenderActiveUpscalerSettings(RenderMenuContext& ctx);
     static void RenderFrameGenerationSelection(RenderMenuContext& ctx);
     static void RenderFrameGenerationRuntimeSettings(RenderMenuContext& ctx);
+    static void RenderFrameGenerationFooter(RenderMenuContext& ctx);
+    static void RenderFgStatusLine(RenderMenuContext& ctx);
     static void RenderXeFGDynamicMFG(RenderMenuContext& ctx, int maxInterpolationCount, bool followsGame);
     static void RenderFGFollowGame();
     static void RenderFsrCommonSettings(RenderMenuContext& ctx);
@@ -249,6 +270,7 @@ class MenuCommon
     static void RenderFramerateSettings(RenderMenuContext& ctx);
     static void RenderFakenvapiSettings(RenderMenuContext& ctx);
     static void RenderActiveImageSettings(RenderMenuContext& ctx);
+    static void RenderF5LutSettings(RenderMenuContext& ctx);
     static void RenderHdrOutputSettings(RenderMenuContext& ctx);
     static void RenderMagnifierSettings(RenderMenuContext& ctx);
     static void RenderQuirksSettings(RenderMenuContext& ctx);

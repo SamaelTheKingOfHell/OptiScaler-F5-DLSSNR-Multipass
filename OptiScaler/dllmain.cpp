@@ -1589,7 +1589,7 @@ static void CheckQuirks(bool isNvidia)
         quirks.reset(GameQuirk::UseFsr2VulkanInputs);
 
     if (quirks & GameQuirk::ForceBorderlessWhenUsingXeFG && !Config::Instance()->FGXeFGForceBorderless.has_value() &&
-        State::Instance().activeFgOutput == FGOutput::XeFG && State::Instance().activeFgInput != FGInput::NoFG &&
+        UsesXeFGApi(State::Instance().activeFgOutput) && State::Instance().activeFgInput != FGInput::NoFG &&
         State::Instance().activeFgInput != FGInput::NvngxFG)
     {
         Config::Instance()->FGXeFGForceBorderless.set_volatile_value(true);
@@ -1598,7 +1598,7 @@ static void CheckQuirks(bool isNvidia)
         quirks.reset(GameQuirk::ForceBorderlessWhenUsingXeFG);
 
     if (quirks & GameQuirk::OverrideVsyncWhenUsingXeFG && !Config::Instance()->OverrideVsync.has_value() &&
-        State::Instance().activeFgOutput == FGOutput::XeFG && State::Instance().activeFgInput != FGInput::NoFG &&
+        UsesXeFGApi(State::Instance().activeFgOutput) && State::Instance().activeFgInput != FGInput::NoFG &&
         State::Instance().activeFgInput != FGInput::NvngxFG)
     {
         Config::Instance()->OverrideVsync.set_volatile_value(true);
@@ -2031,6 +2031,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
         State::Instance().activeFgInput = Config::Instance()->FGInput.value_or_default();
         State::Instance().activeFgOutput = Config::Instance()->FGOutput.value_or_default();
+        F5Low::LatchSettings();
         State::Instance().activeFgNvngx = Config::Instance()->FGNvngxReplacement.value_or_default();
 
         // Ensure valid FG configuration
@@ -2126,6 +2127,27 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         };
 
         bool possibleNvidia = isNvidiaViaNvapi();
+        F5Low::SetStartupNvidia(possibleNvidia);
+
+        // F5Low that cannot run here is None from the start: the quirks below and the swap chain would otherwise
+        // treat the session as XeFG while no frame generation runs
+        if (State::Instance().activeFgOutput == FGOutput::F5Low)
+        {
+            if (const auto availability = F5Low::Available(); !availability.available)
+            {
+                spdlog::warn("F5Low: {}; FG Output set to None for this session", availability.reason);
+                Config::Instance()->FGOutput.set_volatile_value(FGOutput::NoFG);
+                State::Instance().activeFgOutput = FGOutput::NoFG;
+
+                if (State::Instance().activeFgInput != FGInput::NvngxFG &&
+                    State::Instance().activeFgInput != FGInput::ForceXeLL)
+                    State::Instance().activeFgInput = FGInput::NoFG;
+
+                ImGuiToast notification({ ImGuiToastType::Warning, 20000, availability.reason });
+                notification.setTitle("F5Low frame generation is off");
+                ImGui::InsertNotification(notification);
+            }
+        }
 
         spdlog::info("");
         spdlog::info("Check for DLSS files");

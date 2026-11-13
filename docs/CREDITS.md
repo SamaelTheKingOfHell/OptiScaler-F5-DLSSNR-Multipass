@@ -46,6 +46,15 @@ The fix keeping the game's own Streamline plugins (Common, Reflex, PCL) separate
 private DLSS Frame Generation runtime when NVIDIA's override selection would otherwise point both
 at the same already-loaded module is adapted from [wilsjo2's fork](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass), commit [`ae9a50fa`](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/commit/ae9a50fa12b1e81600d0394108d523dad8b7fd23) ("Isolate game Streamline plugins from active DLSSG output").
 
+## Upstream nightly fixes (late October 2026)
+
+Four fixes are ported from [upstream OptiScaler](https://github.com/optiscaler/OptiScaler) (GPL-3.0) and adapted to this fork:
+the FSR 4 INT8 list for RDNA1 (FakeMichau, `ab379b25`); accepting DXGI success statuses such as
+`DXGI_STATUS_OCCLUDED` when swapchains are created (felipegakkeku, `6a7b0336`); offering the driver's FSR 4 frame
+generation on Vulkan only with real FP8 (FakeMichau, the Vulkan half of `65ee5d64` and `b19cfd29`); and keeping a
+swapchain on another window out of frame generation (cdozdil, release/0.9 `192a59bb` and `0fc1ef63`, the other-window
+part only). The rules behind them, the per-chain wrapper handling and the host tests are this fork's own.
+
 ## Inter font
 
 The menu's Modern style uses [Inter](https://github.com/rsms/inter) by Rasmus Andersson and the Inter Project

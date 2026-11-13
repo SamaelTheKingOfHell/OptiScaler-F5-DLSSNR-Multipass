@@ -18,9 +18,29 @@ on:
         required: false
         default: false
         type: boolean
+      f5low_kit_url:
+        description: 'f5low kit zip (https URL: the f5low-kit-*.zip release asset of f5low-fg). Required unless no_f5low is ticked'
+        required: false
+        default: ''
+        type: string
+      f5low_kit_sha256:
+        description: 'SHA-256 of that zip (required with the URL)'
+        required: false
+        default: ''
+        type: string
+      no_f5low:
+        description: 'Package without F5Low (no f5low.dll, libxess_fg stays 1.3.1.78)'
+        required: false
+        default: false
+        type: boolean
+      attach_to_draft:
+        description: 'Finish the zip for players (F5Low defaults, short name) and attach it to this draft release (its tag). Empty: artifact only'
+        required: false
+        default: ''
+        type: string
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   package:
@@ -36,6 +56,35 @@ jobs:
     - name: Setup MSBuild
       uses: microsoft/setup-msbuild@v2
 
+    # A release must not silently lack F5Low: refuse before anything is built
+    - name: Check inputs
+      shell: powershell
+      env:
+        KIT_URL: ${{ inputs.f5low_kit_url }}
+        KIT_SHA256: ${{ inputs.f5low_kit_sha256 }}
+        NO_F5LOW: ${{ inputs.no_f5low }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        if ($env:NO_F5LOW -ne 'true') {
+            if (-not $env:KIT_URL) { throw 'Give f5low_kit_url and f5low_kit_sha256, or tick no_f5low to package without F5Low' }
+            if ($env:KIT_URL -notmatch '^https://') { throw 'f5low_kit_url must be an https URL' }
+            if ($env:KIT_SHA256 -notmatch '^[0-9A-Fa-f]{64}$') { throw 'f5low_kit_sha256 must be a 64-digit SHA-256' }
+        }
+
+    # The kit comes from the f5low-fg repo as a zip, pinned by its hash; package_release.ps1 checks it again and
+    # everything inside it. Inputs reach the script through env only, never pasted into it.
+    - name: Fetch f5low kit
+      if: ${{ inputs.no_f5low != true }}
+      shell: powershell
+      env:
+        KIT_URL: ${{ inputs.f5low_kit_url }}
+        KIT_SHA256: ${{ inputs.f5low_kit_sha256 }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $zip = Join-Path $env:RUNNER_TEMP 'f5low_kit.zip'
+        Invoke-WebRequest -Uri $env:KIT_URL -OutFile $zip -UseBasicParsing
+        "F5LOW_KIT_ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
     - name: Run package_release.ps1
       shell: powershell
       env:
@@ -43,6 +92,13 @@ jobs:
       run: |
         $params = @{
             Version = $env:PACKAGE_VERSION
+        }
+        if ("${{ inputs.no_f5low }}" -eq "true") {
+            $params["NoF5Low"] = $true
+        }
+        elseif ($env:F5LOW_KIT_ZIP) {
+            $params["F5LowKit"] = $env:F5LOW_KIT_ZIP
+            $params["F5LowKitSha256"] = "${{ inputs.f5low_kit_sha256 }}"
         }
         if ("${{ inputs.include_dlss_fg }}" -eq "true") {
             $params["IncludeDlssFrameGeneration"] = $true
@@ -58,6 +114,30 @@ jobs:
         if ($LASTEXITCODE -ne 0 -and $null -ne $LASTEXITCODE) {
             exit $LASTEXITCODE
         }
+
+    # Sets the F5Low defaults package_release.ps1 refuses to ship, and the short name. Only ever attaches to a draft:
+    # a published release's files stay as they are.
+    - name: Finish the zip and attach it to the draft
+      if: ${{ inputs.attach_to_draft != '' }}
+      shell: powershell
+      env:
+        GH_TOKEN: ${{ github.token }}
+        DRAFT_TAG: ${{ inputs.attach_to_draft }}
+        PACKAGE_VERSION: ${{ inputs.version }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        if ("${{ inputs.no_f5low }}" -eq "true") { throw 'attach_to_draft needs F5Low in the zip' }
+        $isDraft = gh release view $env:DRAFT_TAG --json isDraft --jq .isDraft
+        if ($LASTEXITCODE -ne 0 -or $isDraft -ne 'true') { throw "REFUSING: $env:DRAFT_TAG is not a draft release" }
+        $package = @(Get-ChildItem release\*.zip)
+        if ($package.Count -ne 1) { throw "expected one package zip, found $($package.Count)" }
+        $finished = "release\$env:PACKAGE_VERSION-Optiscaler-F5.zip"
+        python tools\finish_release_zip.py $package[0].FullName $finished
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        Remove-Item $package[0].FullName
+        gh release upload $env:DRAFT_TAG $finished --clobber
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        Get-FileHash $finished -Algorithm SHA256 | Format-List Hash, Path
 
     - name: Upload Release Archive
       uses: actions/upload-artifact@v4

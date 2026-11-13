@@ -34,6 +34,23 @@ class FGHooks
     static void NoteGameFsrFg(bool on);
     static bool IsDx12InteropPresentSC(IUnknown* pSwapChain);
 
+    // A swapchain of another window while the frame generation swapchain lives (framegen/FgWindowRule.h): it gets no
+    // frame generation and must not replace the State pointers frame generation reads. The game's own DXGI calls only,
+    // the Vulkan bridge manages its windows itself.
+    static bool IsOtherWindowThanFG(HWND hwnd);
+
+    // While the Vulkan bridge makes its chain (DxgiFactoryHooks::CreateDx12BridgeSwapChain), the frame generation
+    // library's inner creates on this thread are never another window's: the bridge manages its windows itself (RDR2
+    // moves to a new one after start)
+    class ScopedBridgeCreate
+    {
+      public:
+        ScopedBridgeCreate() { _bridgeCreateDepth++; }
+        ~ScopedBridgeCreate() { _bridgeCreateDepth--; }
+        ScopedBridgeCreate(const ScopedBridgeCreate&) = delete;
+        ScopedBridgeCreate& operator=(const ScopedBridgeCreate&) = delete;
+    };
+
   private:
     using PFN_Present = rewrite_signature<decltype(&IDXGISwapChain::Present)>::type;
     using PFN_Present1 = rewrite_signature<decltype(&IDXGISwapChain1::Present1)>::type;
@@ -58,6 +75,7 @@ class FGHooks
     inline static PFN_Release o_FGRelease = nullptr;
     inline static PFN_GetFrameLatencyWaitableObject o_FGSCGetFrameLatencyWaitableObject = nullptr;
     inline static HWND _hwnd = nullptr;
+    inline static thread_local int _bridgeCreateDepth = 0;
     inline static IDXGISwapChain* _dx12InteropPresentSC = nullptr;
     inline static HWND _dx12InteropPresentHwnd = nullptr;
     inline static bool _skipResize = false;

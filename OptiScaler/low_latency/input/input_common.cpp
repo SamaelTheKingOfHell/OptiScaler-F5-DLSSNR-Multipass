@@ -291,7 +291,7 @@ lloutput::OutputPlan InputCommon::plan_output(API api, IUnknown* pDevice)
     lloutput::OutputInputs in;
     in.realNvapi = nvidiaGpu && (!fakenvapi::isUsingAsMainNvapi() || lowLatency2);
     in.vulkan = api == API::Vulkan;
-    in.xefgOutput = state.activeFgOutput == FGOutput::XeFG;
+    in.xefgOutput = UsesXeFGApi(state.activeFgOutput);
     in.side = native::lowlatency::XefgSide();
     in.forceLatencyFlex = Config::Instance()->FN_ForceLatencyFlex.value_or_default();
     in.frameCapOnly = Config::Instance()->FramerateFrameCapOnly.value_or_default();
@@ -459,7 +459,7 @@ std::optional<LowLatencyMode> InputCommon::forced_output()
 bool InputCommon::xefg_paced()
 {
     // OptiScaler's XeFG needs XeLL in low latency mode and knows its generated frames
-    return activeOutput == LowLatencyMode::XeLL && State::Instance().activeFgOutput == FGOutput::XeFG;
+    return activeOutput == LowLatencyMode::XeLL && UsesXeFGApi(State::Instance().activeFgOutput);
 }
 
 LowLatencyInput InputCommon::default_input()
@@ -1406,7 +1406,7 @@ SleepMode InputCommon::shaped_sleep_mode(lloutput::Role role)
     const auto copy = get_sleep_copy(input);
 
     lloutput::ShapeInputs in;
-    in.xefgOutput = State::Instance().activeFgOutput == FGOutput::XeFG;
+    in.xefgOutput = UsesXeFGApi(State::Instance().activeFgOutput);
     in.side = native::lowlatency::XefgSide();
     // OptiScaler's own calls carry their cap (native::lowlatency PlanCap); the UE mod's goes only to Frame cap only
     // (update), else it stays with the limiter
@@ -1526,7 +1526,7 @@ void InputCommon::update()
         const bool multiFrame = state.dlssgLastSetMode == sl::DLSSGMode::eDynamic || frames > 1;
         const bool playerForcedOn =
             config->FN_ForceReflex.value_for_config().value_or(ForceReflex::InGame) == ForceReflex::ForceEnable;
-        const bool wanted = multiFrame && fakenvapi::isUsingAsMainNvapi() && state.activeFgOutput != FGOutput::XeFG &&
+        const bool wanted = multiFrame && fakenvapi::isUsingAsMainNvapi() && !UsesXeFGApi(state.activeFgOutput) &&
                             activeOutput != LowLatencyMode::FpsLimiter && !playerForcedOn;
 
         if (wanted && !toldForceDisable)
@@ -1567,7 +1567,7 @@ void InputCommon::update()
         const auto game =
             gameInput ? ReflexHooks::gameSleepMode() : (streamlineSource ? streamline : ReflexHooks::GameSleepMode {});
         const auto side = native::lowlatency::XefgSide();
-        const bool xefgOutput = state.activeFgOutput == FGOutput::XeFG;
+        const bool xefgOutput = UsesXeFGApi(state.activeFgOutput);
         const bool blocked = native::lowlatency::GameLowLatencyBlocked();
         const bool forceDisabled = config->FN_ForceReflex.value_or_default() == ForceReflex::ForceDisable;
         static const bool intelGpu = IdentifyGpu::getPrimaryGpu().vendorId == VendorId::Intel;
@@ -1592,6 +1592,7 @@ void InputCommon::update()
         in.blocked = blocked;
         in.xefgShownPerRendered = native::lowlatency::XefgShownPerRendered();
         in.xellCountsShown = native::lowlatency::XellCountsShown();
+        in.driverMultipliesCap = native::lowlatency::DriverMultipliesReflexCap();
         in.dlssgFramesToGenerate = ReflexHooks::dlssgFrameCountToGenerate();
         in.outputIsXell = activeOutput == LowLatencyMode::XeLL;
         in.outputIsFrameCap = frameCapOutput;
@@ -1609,7 +1610,7 @@ void InputCommon::update()
     // the new output (XeLL counts shown frames, the others rendered ones) and goes in when it starts (init_tech,
     // use_output)
     const bool outputPending = lloutput::OutputSwitchPending(
-        state.activeFgOutput == FGOutput::XeFG, current_tech != nullptr, native::lowlatency::XefgSide(),
+        UsesXeFGApi(state.activeFgOutput), current_tech != nullptr, native::lowlatency::XefgSide(),
         activeOutput == LowLatencyMode::XeLL, incompatibility(input, LowLatencyMode::XeLL) == nullptr);
 
     // The game's (or the UE mod's to Frame cap only): in its sleep mode through the output (and XeFG's XeLL)

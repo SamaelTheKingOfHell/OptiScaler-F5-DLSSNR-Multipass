@@ -3,6 +3,8 @@
 #include "input_reflex.h"
 #include <hooks/Reflex_Hooks.h>
 #include <hooks/Vulkan_Hooks.h>
+#include <proxies/XeFG_Proxy.h>
+#include "OutputRule.h"
 #include <low_latency/low_latency_tech/ll_reflex_vk.h>
 #include <low_latency/low_latency_tech/ll_reflex_nvapi_vk.h>
 
@@ -216,6 +218,10 @@ NvAPI_Status InputReflex::D3D12_SetAsyncFrameMarker(ID3D12CommandQueue* pCommand
 {
     if (pSetAsyncFrameMarkerParams == nullptr)
         return NVAPI_INVALID_ARGUMENT;
+
+    // The frame generation library's own presents: not the game's Reflex
+    if (lloutput::IsFgLibraryMarker(Util::GetCallerModule(_ReturnAddress()), XeFGProxy::Module()))
+        return ReflexHooks::deliverLibraryAsyncMarker(pCommandQueue, pSetAsyncFrameMarkerParams);
 
     if (!ReflexHooks::isGameCall(_ReturnAddress()))
         return ReflexHooks::routeSetAsyncFrameMarker(pCommandQueue, pSetAsyncFrameMarkerParams, false);

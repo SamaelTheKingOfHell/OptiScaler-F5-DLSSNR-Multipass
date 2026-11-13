@@ -9,6 +9,7 @@
 #include <shaders/rcas/RCAS_Dx12.h>
 #include <shaders/bias/Bias_Dx12.h>
 #include <shaders/magnifier/Magnifier_Dx12.h>
+#include <shaders/f5lut/F5Lut_Dx12.h>
 #include <gpu_time/GpuTime_Dx12.h>
 
 class IFeature_Dx12 : public virtual IFeature
@@ -53,6 +54,7 @@ class IFeature_Dx12 : public virtual IFeature
     std::unique_ptr<RCAS_Dx12> RCAS = nullptr;
     std::unique_ptr<Bias_Dx12> Bias = nullptr;
     std::unique_ptr<Magnifier_Dx12> Magnifier = nullptr;
+    std::unique_ptr<F5Lut_Dx12> F5Lut = nullptr;
 
     std::unique_ptr<GpuTime_Dx12> UpscalerTime = nullptr;
 

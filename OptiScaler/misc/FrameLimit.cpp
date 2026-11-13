@@ -78,7 +78,7 @@ float FrameLimit::CapFps()
     // back to the FPS limit and again would resend every sleep mode twice a pause. Not when XeFG passes frames through
     // (real exclusive full screen) or generates none (1X, which the cap never picks): it would cap the game's own
     // frames.
-    if (dynamic <= 0.0f || state.activeFgOutput != FGOutput::XeFG || fg == nullptr || !fg->IsActive() ||
+    if (dynamic <= 0.0f || !UsesXeFGApi(state.activeFgOutput) || fg == nullptr || !fg->IsActive() ||
         fg->GenerationOff() || state.realExclusiveFullscreen)
     {
         return limit;

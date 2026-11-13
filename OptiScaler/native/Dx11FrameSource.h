@@ -27,6 +27,7 @@ class Dx11FrameSource : public IFrameSource
     AcquireStatus Acquire(FrameInput& input) override;
     void Return(const FrameInput& input, const FrameOutput& output) override;
     void OnResize() override;
+    void Skip() override { _backBuffer.Reset(); }
 
     ID3D12Device* Device() const override { return _device12; }
     ID3D12CommandQueue* Queue() const override { return _queue12; }

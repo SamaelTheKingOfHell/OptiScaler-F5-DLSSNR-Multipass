@@ -327,9 +327,25 @@ void Before(ID3D12GraphicsCommandList* cmd, NVSDK_NGX_Parameter* source,
     const auto active = PreSrColorExtent(inDesc,
         UInt(source, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width),
         UInt(source, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height));
-    if (!active || !PreSrColorExtent(outDesc, 0, 0) || inDesc.MipLevels != 1 || outDesc.MipLevels != 1 ||
+    // Output mips are fine with Finished Picture: that path reads only the output's size and identity (After hands the
+    // changes to Late::CaptureResidual). Composition copies the whole output, which needs a single level. Resonance: A
+    // Plague Tale Legacy keeps a 12-level mip chain on its upscaled picture.
+    const bool outputMipsOk = outDesc.MipLevels == 1 || cfg.DlssNrFinishedPicture.value_or_default();
+    if (!active || !PreSrColorExtent(outDesc, 0, 0) || inDesc.MipLevels != 1 || !outputMipsOk ||
         active->width > outDesc.Width || active->height > outDesc.Height)
     {
+        // Which buffer, once per shape: a refusal here is otherwise only this one status line.
+        static std::set<std::tuple<UINT64, UINT, UINT16, UINT16, UINT64, UINT, UINT16, UINT16, unsigned, unsigned>> logged;
+        const unsigned rw = UInt(source, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width);
+        const unsigned rh = UInt(source, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height);
+        if (logged.emplace(inDesc.Width, inDesc.Height, inDesc.DepthOrArraySize, inDesc.MipLevels, outDesc.Width,
+                           outDesc.Height, outDesc.DepthOrArraySize, outDesc.MipLevels, rw, rh).second)
+            LOG_WARN("DLSS-NR deferred: refused colour (dimension {}, {}x{}, array {}, mips {}, samples {}, format {}) "
+                     "output (dimension {}, {}x{}, array {}, mips {}, samples {}, format {}) render subrect {}x{}",
+                     (int) inDesc.Dimension, inDesc.Width, inDesc.Height, inDesc.DepthOrArraySize, inDesc.MipLevels,
+                     inDesc.SampleDesc.Count, (int) inDesc.Format, (int) outDesc.Dimension, outDesc.Width,
+                     outDesc.Height, outDesc.DepthOrArraySize, outDesc.MipLevels, outDesc.SampleDesc.Count,
+                     (int) outDesc.Format, rw, rh);
         Say("inactive: unsupported active input/output dimensions");
         return;
     }
@@ -608,6 +624,10 @@ void After(ID3D12GraphicsCommandList* cmd, NVSDK_NGX_Parameter* source, unsigned
         else { g.reset = true; Say("waiting to save the upscaled changes for the finished picture"); }
         return; // Keep the game's SR output clean: no early composition and no second NR evaluation.
     }
+    // Before let an output with mips in only for Finished Picture; if that was switched off since, composition's
+    // whole-resource copies below would not match it.
+    if (pair.output->GetDesc().MipLevels != 1)
+    { g.reset = true; Say("inactive: unsupported active input/output dimensions"); return; }
 
     Barrier(cmd, g.residualOutput, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     bool half = pair.half && g.half && !g.half->failed;

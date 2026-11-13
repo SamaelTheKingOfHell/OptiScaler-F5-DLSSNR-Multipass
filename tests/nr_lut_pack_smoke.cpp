@@ -81,6 +81,29 @@ int main()
             }
     }
 
+    // Float texels (what every backend uploads since 2026-11-01), padded as D3D12 pads them.
+    {
+        CHECK(TightBytesFloat4(size) == 2 * 2 * 2 * 16);
+        constexpr size_t rowPitch = 256;
+        constexpr size_t slicePitch = rowPitch * size;
+        std::vector<uint8_t> out(slicePitch * size, 0xCD);
+        PackFloat4(rgb.data(), size, out.data(), rowPitch, slicePitch);
+
+        for (int z = 0; z < size; ++z)
+            for (int y = 0; y < size; ++y)
+            {
+                const float* row = reinterpret_cast<const float*>(out.data() + z * slicePitch + y * rowPitch);
+                for (int x = 0; x < size; ++x)
+                {
+                    const int i = (z * size + y) * size + x;
+                    CHECK(row[x * 4 + 0] == rgb[i * 3 + 0] && row[x * 4 + 1] == rgb[i * 3 + 1] &&
+                          row[x * 4 + 2] == rgb[i * 3 + 2] && row[x * 4 + 3] == 1.0f);
+                }
+
+                CHECK(out[z * slicePitch + y * rowPitch + size * 16] == 0xCD);
+            }
+    }
+
     if (fails == 0)
         printf("nr_lut_pack_smoke: ok\n");
 

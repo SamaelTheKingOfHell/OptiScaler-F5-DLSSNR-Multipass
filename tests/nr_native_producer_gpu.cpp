@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <string>
 #include <vector>
 
 #include "../OptiScaler/native/NativeProducer.h"
@@ -441,6 +442,9 @@ int main()
     native::NativeProducer::Options extra; // the debug view and the depth alignment, for the frames below
     std::vector<float> guideDepth;          // the consumer's depth guide of the last frame, when asked for
     bool readGuideDepth = false;
+    ID3D12CommandQueue* runQueue = nullptr; // the queue a frame runs on (null: gpu.queue)
+    bool waitDone = true;                   // wait for the frame's work before returning
+    std::vector<ComPtr<ID3D12Resource>> keep; // a frame's textures, alive while its work may still run
 
     auto frame = [&](const Scene& s, D3D12_RESOURCE_STATES state, bool withDepth, bool applyOn, bool cutHint,
                      native::FrameOutput& output, std::vector<uint8_t>* before, std::vector<uint8_t>* after)
@@ -482,7 +486,15 @@ int main()
         native::NativeProducer::Options options = extra;
         options.apply = applyOn;
 
-        const auto result = producer.Run(gpu.queue.Get(), input, options, applyNr, output);
+        const auto result =
+            producer.Run(runQueue != nullptr ? runQueue : gpu.queue.Get(), input, options, applyNr, output);
+
+        if (!waitDone)
+        {
+            keep.push_back(picture);
+            keep.push_back(depth);
+            return result;
+        }
 
         // Wait for the producer's work the way an adapter would before presenting.
         if (output.done.fence != nullptr)
@@ -550,6 +562,17 @@ int main()
         r = frame(Scene { 7, 584, 20.0f, 5.0f }, kRead, true, false, false, output, nullptr, nullptr);
         ok &= Check("NR off: mask runs, NR not called",
                     r.flowValid && r.trustRan && !r.nativeRan && nr.count == calls + 1);
+    }
+
+    printf("GPU timing\n");
+    {
+        // The frames above have finished (each later frame waited for its slot): their stages are timed
+        const uint32_t timed = producer.GpuStats().Frames();
+        const std::string report = producer.GpuStats().Report();
+        printf("    %s\n", report.c_str());
+        ok &= Check("finished frames are timed, by stage", timed > 0 && report.find("motion") != std::string::npos &&
+                                                               report.find("consumer") != std::string::npos);
+        ok &= Check("the report starts a new window", producer.GpuStats().Frames() == 0);
     }
 
     printf("depth for the flow\n");
@@ -778,6 +801,56 @@ int main()
         frame(shifted, kRead, true, true, false, output, nullptr, nullptr);
         ok &= Check("back to no alignment: the depth as the game gave it", guideDepth == plain);
         readGuideDepth = false;
+    }
+
+    // The caller's queue changes between frames (NBA 2K27: frame generation's game queue comes and goes at a screen
+    // change). Every list uses the same textures, so a list on another queue must not run while the last one still
+    // does: the frame is skipped (a CPU check, no GPU wait across queues) until it has finished.
+    printf("the caller's queue changes between frames\n");
+    {
+        ComPtr<ID3D12CommandQueue> second;
+        ComPtr<ID3D12Fence> gate;
+        D3D12_COMMAND_QUEUE_DESC qd {};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        const bool made = SUCCEEDED(gpu.device->CreateCommandQueue(&qd, IID_PPV_ARGS(&second))) &&
+                          SUCCEEDED(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)));
+        ok &= Check("a second direct queue", made);
+        const Scene a { 7, 300, 20.0f, 5.0f }, b { 7, 300, 24.0f, 5.0f };
+
+        if (made)
+        {
+            auto r = frame(a, kRead, true, true, false, output, nullptr, nullptr);
+            ok &= Check("a frame on the first queue runs", r.submitted && !r.queueChanged);
+
+            // The last list done: a frame on the second queue runs, and says the queue changed.
+            runQueue = second.Get();
+            r = frame(b, kRead, true, true, false, output, nullptr, nullptr);
+            ok &= Check("the last list done: a frame on another queue runs", r.submitted && r.queueChanged);
+
+            // The second queue held back by a gate, so its list stays unfinished; then a frame on the first queue.
+            second->Wait(gate.Get(), 1);
+            waitDone = false;
+            r = frame(a, kRead, true, true, false, output, nullptr, nullptr);
+            ok &= Check("a frame behind the gate is submitted on its queue", r.submitted && !r.queueChanged);
+            const native::SyncPoint held = output.done;
+
+            runQueue = nullptr;
+            r = frame(b, kRead, true, true, false, output, nullptr, nullptr);
+            ok &= Check("the last list unfinished: a frame on another queue is skipped, nothing submitted",
+                        !r.submitted && r.queueChanged && r.stoppedAt != nullptr &&
+                            std::string(r.stoppedAt).find("another queue") != std::string::npos);
+
+            // The gate opens: the held list finishes, and the next frame on the first queue runs with a reset of NR.
+            gate->Signal(1);
+            held.fence->SetEventOnCompletion(held.value, gpu.event);
+            ok &= Check("the held list finishes once the gate opens", WaitForSingleObject(gpu.event, 5000) == WAIT_OBJECT_0);
+            waitDone = true;
+            const auto resetsBefore = nr.count;
+            r = frame(a, kRead, true, true, false, output, nullptr, nullptr);
+            ok &= Check("then a frame on the first queue runs", r.submitted && r.queueChanged);
+            ok &= Check("... and NR's history restarts after the skipped frame", nr.count != resetsBefore && nr.reset);
+            keep.clear();
+        }
     }
 
     printf(ok ? "all passed\n" : "FAILED\n");

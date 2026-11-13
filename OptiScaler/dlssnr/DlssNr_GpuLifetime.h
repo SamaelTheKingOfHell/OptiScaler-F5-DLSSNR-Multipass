@@ -39,6 +39,9 @@ class GpuLifetime
     // Queued only; runs from a later Collect() once every recording of the current generation has completed.
     // Unresolved callbacks, including their captured ownership, are retained at destruction.
     void Retire(std::function<void()> destroy);
+    // The same, for a callback that only reports to `owner`: once `owner` has expired, Collect() drops it without
+    // running it, so a recording that never completes does not keep it (and the recordings it waits on) for good.
+    void Retire(std::function<void()> destroy, std::weak_ptr<const void> owner);
     // Runs the destruction callbacks whose GPU work has completed. A removed device counts as completed.
     void Collect();
 };

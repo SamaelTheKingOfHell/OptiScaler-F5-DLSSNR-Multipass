@@ -145,6 +145,8 @@ OutputInputs CurrentOutputInputs();
 uint32_t XefgShownPerRendered();
 // XeFG's XeLL counts shown frames (false with a library behind XeFG's API that does not tell XeLL about its frames)
 bool XellCountsShown();
+// XeFG frames from DLSS-G (xefg_cuda Generator=dlssg): the driver multiplies a Reflex interval itself
+bool DriverMultipliesReflexCap();
 
 // The menu's line. Cheap; GetLatency is asked at most twice a second.
 Status GetStatus();

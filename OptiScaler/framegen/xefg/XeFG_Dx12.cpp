@@ -11,6 +11,7 @@
 #include <low_latency/input/input_common.h>
 #include <misc/FrameLimit.h>
 #include <framegen/mfgunlock/MfgUnlock.h>
+#include <framegen/f5low/F5Low.h>
 #include <imgui/ImGuiNotify.hpp>
 #include <framegen/GameFsrFgRule.h>
 
@@ -78,11 +79,18 @@ bool XeFG_Dx12::CreateSwapchainContext(ID3D12Device* device)
 {
     if (XeFGProxy::Module() == nullptr && !XeFGProxy::InitXeFG())
     {
-        LOG_ERROR("XeFG proxy can't find libxess_fg.dll!");
+        if (State::Instance().activeFgOutput == FGOutput::F5Low)
+            F5Low::ReportFailure("OptiScaler\\plugins\\f5low.dll could not be loaded");
+        else
+            LOG_ERROR("XeFG proxy can't find libxess_fg.dll!");
         return false;
     }
 
-    if (!MfgUnlock::PrepareXeFG())
+    // F5Low runs our f5low.dll: the XeFG unlock patches Intel's library only
+    const bool f5low = State::Instance().activeFgOutput == FGOutput::F5Low;
+    if (f5low)
+        F5Low::ApplyGenerator();
+    else if (!MfgUnlock::PrepareXeFG())
     {
         LOG_ERROR("XeFG MFG unlock recovery failed; refusing to create a context with partially patched code");
         return false;
@@ -102,10 +110,15 @@ bool XeFG_Dx12::CreateSwapchainContext(ID3D12Device* device)
         if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS)
         {
             LOG_ERROR("D3D12CreateContext error: {} ({})", magic_enum::enum_name(result), (UINT) result);
+
+            if (f5low)
+                F5Low::ReportFailure("f5low.dll could not create its frame generation context");
             return false;
         }
 
         LOG_INFO("XeFG context created");
+        if (f5low)
+            F5Low::LogStatus();
         result = XeFGProxy::SetLoggingCallback()(_swapChainContext, XEFG_SWAPCHAIN_LOGGING_LEVEL_DEBUG, xefgLogCallback,
                                                  nullptr);
 
@@ -145,6 +158,18 @@ bool XeFG_Dx12::CreateSwapchainContext(ID3D12Device* device)
 
 void XeFG_Dx12::ApplyMaxInterpolations(uint32_t reported)
 {
+    // F5Low: what f5low.dll reports (up to 6x), capped by [XeFG] MaxInterpolations
+    if (State::Instance().activeFgOutput == FGOutput::F5Low)
+    {
+        _nativeMaxInterpolations = reported < 1 ? 1 : static_cast<int>(reported);
+        const int configured = Config::Instance()->FGXeFGMaxInterpolations.value_or_default();
+        _maxInterpolationCount = F5Low::MaxInterpolations(reported, configured);
+        LOG_INFO("Max supported interpolations: {} (F5Low library reports {}, MaxInterpolations {})",
+                 _maxInterpolationCount, reported, configured);
+        F5Low::LogStatus();
+        return;
+    }
+
     // Without the unlock the reported value is used as is, as before the unlock existed.
     if (!MfgUnlock::IsXeFGActive())
     {
@@ -180,15 +205,16 @@ void XeFG_Dx12::LogAcceptedInterpolations()
 const char* XeFG_Dx12::Name()
 {
     static std::string nameBuffer;
+    const char* base = State::Instance().activeFgOutput == FGOutput::F5Low ? "F5Low" : "XeFG";
 
     if (_maxInterpolationCount == 1 || _framesToInterpolate < 0)
     {
-        nameBuffer = "XeFG";
+        nameBuffer = base;
     }
     else
     {
         auto count = _framesToInterpolate + 1;
-        nameBuffer = "XeFG " + std::to_string(count) + "x";
+        nameBuffer = std::string(base) + " " + std::to_string(count) + "x";
     }
 
     return nameBuffer.c_str();

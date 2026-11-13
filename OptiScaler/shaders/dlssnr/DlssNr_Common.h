@@ -12,6 +12,8 @@
 
 #include <cstdint>
 
+#include "DlssNr_DepthFade.h"
+
 // Which of the passes a dispatch is. One shader, because they read and write the same set of
 // resources and differ only in what they compute.
 enum DlssNrMode : uint32_t
@@ -354,8 +356,12 @@ struct alignas(256) DlssNrConstants
     // Resolve only: 1 when gOriginal is the game's own texture rather than the encode's kept copy (the colour cannot
     // take a UAV, so the resolve writes into the copy instead), and so still carries InputEncoding's encoding.
     uint32_t OriginalIsGameColour;
+
+    // Resolve only: the depth fade (DlssNr_DepthFade.h), twelve scalars mirrored in the shader as gDepthFade*. All
+    // zero -- what a zero-initialised struct holds -- is off. This is why the struct is two slots wide.
+    DlssNrDepthFade::Block DepthFade;
 };
-static_assert(sizeof(DlssNrConstants) == 256);
+static_assert(sizeof(DlssNrConstants) == 512);
 
 // The reduce dispatch (DlssNrMode_AutoExposure) has no use for the Trim fields, so the meter's choice rides in them: the
 // percentile meter is ExposureTrimAnchorCount == 1, ExposureTrimAnchorExposure0 its low percent and

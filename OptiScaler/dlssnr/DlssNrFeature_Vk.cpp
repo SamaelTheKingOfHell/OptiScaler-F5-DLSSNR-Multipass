@@ -13,6 +13,7 @@
 #include <shaders/dlssnr/DlssNr_Vk.h>
 #include <shaders/dlssnr/DlssNr_LutVk.h>
 #include <dlssnr/DlssNr_Lut.h>
+#include <dlssnr/DlssNr_LutChain.h>
 #include <dlssnr/DlssNr_LutStatus.h>
 #include <shaders/dlssnr/DlssNr_Guides.h>
 #include <shaders/dlssnr/DlssNr_GameScale.h>
@@ -164,6 +165,12 @@ struct VkState
     std::unique_ptr<DlssNr_LutVk> lutPass;
     OwnedImage lutScratch;
     bool lutScratchFailed = false;
+
+    // The post-NR LUT stack (memory/plans/2026-10-31-nr-lut-chain.md): its layers baked into one lattice, and a pass of
+    // its own (its own 3D image) so the Inputs LUT's and this one's lattices never replace each other. Graded in place
+    // on the picture NR just wrote. Nothing exists until the stack holds a file.
+    DlssNr_LutChainState postLut;
+    std::unique_ptr<DlssNr_LutVk> postLutPass;
 
     // Experimental input styles (DlssNr_InputStyles.h): the model's picture restyled, standing in for the model input and
     // the resolve's proxy; styledB is the second image they alternate with when more than one is on. Made on first use at
@@ -688,6 +695,69 @@ std::optional<std::filesystem::path> FindSnippet()
 #include "DlssNr_DetailReuse_Vk.inl"
 #include "DlssNr_Spatial_Vk.inl"
 
+// The game's depth for the resolve's depth fade (shaders/dlssnr/DlssNr_DepthFade.h). Read as a sampled image in
+// SHADER_READ_ONLY_OPTIMAL and never moved, as the detail reuse and Compress screen edges read it, through a depth-only
+// view when the game's own view covers stencil too (a view with both aspects cannot be sampled). That view is made for
+// the frame and retired like theirs.
+namespace DepthFadeVk
+{
+OwnedImage depthOnly;
+bool warned = false;
+
+// The depth image view to bind, or null (no depth, or one that cannot be read: the fade then does nothing).
+VkImageView View(VkDevice device, const NVSDK_NGX_Resource_VK* res)
+{
+    DetailReuseVk::Retire(depthOnly);
+
+    if (res == nullptr || res->Type != NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW)
+        return VK_NULL_HANDLE;
+
+    const auto& info = res->Resource.ImageViewInfo;
+    if (info.ImageView == VK_NULL_HANDLE)
+        return VK_NULL_HANDLE;
+
+    if (info.SubresourceRange.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT ||
+        info.SubresourceRange.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT)
+        return info.ImageView;
+
+    if (info.Image == VK_NULL_HANDLE || (info.SubresourceRange.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) == 0)
+        return VK_NULL_HANDLE;
+
+    VkImageViewCreateInfo view {};
+    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view.image = info.Image;
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = info.Format;
+    view.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, info.SubresourceRange.baseMipLevel, 1,
+                              info.SubresourceRange.baseArrayLayer, 1 };
+
+    if (vkCreateImageView(device, &view, nullptr, &depthOnly.view) != VK_SUCCESS)
+    {
+        depthOnly.view = VK_NULL_HANDLE;
+        if (!warned)
+        {
+            warned = true;
+            LOG_WARN("DLSS-NR Vulkan depth fade: could not make a depth-only view of the game's depth");
+        }
+        return VK_NULL_HANDLE;
+    }
+
+    return depthOnly.view;
+}
+
+// The fade is off: let go of last frame's view.
+void Idle() { DetailReuseVk::Retire(depthOnly); }
+
+// Shutdown. deviceAlive: the device is idle and the view is destroyed; otherwise it went with the device.
+void Release(bool deviceAlive)
+{
+    if (deviceAlive)
+        DestroyImage(depthOnly);
+    else
+        depthOnly = OwnedImage {};
+}
+} // namespace DepthFadeVk
+
 } // namespace
 
 // ---------------------------------------------------------------------------------------------
@@ -757,6 +827,103 @@ unsigned long long VkFrameClock()
     return presents != 0 ? presents : g_vk.frames;
 }
 
+// The post-NR LUT stack on `view`, the picture NR just wrote (the game's image after SR, our own pre-SR image before
+// it). In place: the pass reads and writes one pixel per thread and nothing around it, and the image is already in
+// GENERAL for the resolve that wrote it. Only called after a resolve that ran, so a failed evaluation leaves the game's
+// image alone.
+static void ApplyPostLutVk(VkCommandBuffer cmdBuffer, VkDevice device, VkPhysicalDevice physicalDevice,
+                           const Config& cfg, VkImageView view, bool ownTarget, uint32_t width, uint32_t height,
+                           uint32_t shaderConversion, bool linearHdr, const DlssNrConstants& encode,
+                           VkImageView liveExposureView)
+{
+    const auto entries = DlssNr::PostLutEntries(cfg);
+    const bool wanted =
+        std::any_of(entries.begin(), entries.end(), [](const DlssNr::ChainEntry& e) { return !e.path.empty(); });
+    DlssNr::PostLutStatus status;
+    status.wanted = wanted;
+
+    if (!wanted)
+    {
+        if (g_vk.postLutPass && g_vk.postLutPass->HoldsImage())
+        {
+            // Earlier frames may still read the image; one drain, then every frame without a stack costs nothing.
+            vkDeviceWaitIdle(device);
+            g_vk.postLutPass->ReleaseLutImage();
+        }
+
+        DlssNr_LutChainEnsure(&g_vk.postLut, {});
+        DlssNr::ReportPostLutStatus(status);
+        return;
+    }
+
+    bool graded = false;
+    const bool usable =
+        DlssNr_LutChainEnsure(&g_vk.postLut, entries, DlssNr::FrameDecodeFor(shaderConversion, linearHdr));
+
+    // The game's image after SR can be any format, so the pass writes it through a storage image declared without one,
+    // which the device must allow (the resolve that just wrote it needs the same). Our own pre-SR image is RGBA16F.
+    const bool anyFormat = VkExt::WritesWithoutFormat(device);
+    if (usable && !ownTarget && !anyFormat)
+        status.note = "Not applied after Super Resolution: the game's Vulkan device was created without a feature it "
+                      "needs (restart the game with NR on).";
+    else if (usable)
+    {
+        if (!g_vk.postLutPass)
+            g_vk.postLutPass = std::make_unique<DlssNr_LutVk>(device, physicalDevice, anyFormat);
+
+        const DlssNr::Lut3D& lut = g_vk.postLut.baked;
+
+        if (g_vk.postLutPass->Ready() && g_vk.postLutPass->NeedsDrainFor(lut.size, g_vk.postLut.key))
+            vkDeviceWaitIdle(device);
+
+        if (g_vk.postLutPass->Ready() &&
+            g_vk.postLutPass->EnsureLutImage(cmdBuffer, lut.rgb.data(), lut.size, g_vk.postLut.key))
+        {
+            DlssNrLutConstants constants {};
+            constants.Width = width;
+            constants.Height = height;
+            constants.Strength = g_vk.postLut.strength; // a single layer's own; a baked stack holds its strengths
+            constants.DomainMinR = lut.domainMin[0];
+            constants.DomainMinG = lut.domainMin[1];
+            constants.DomainMinB = lut.domainMin[2];
+            constants.DomainMaxR = lut.domainMax[0];
+            constants.DomainMaxG = lut.domainMax[1];
+            constants.DomainMaxB = lut.domainMax[2];
+            constants.LutSize = (uint32_t) lut.size;
+            constants.LatticeCoord = (uint32_t) lut.latticeCoord;
+            constants.InputEncoding = shaderConversion;
+            constants.ColourIsLinearHdr = linearHdr ? 1u : 0u;
+            CopyLiveWhitePoint(constants, encode);
+            if (liveExposureView == VK_NULL_HANDLE)
+                constants.UseGameExposure = constants.UseExposureWhitePoint = 0u;
+
+            // The resolve's writes must be visible to this pass's reads.
+            VkMemoryBarrier barrier {};
+            barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmdBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+            graded = g_vk.postLutPass->Dispatch(cmdBuffer, view, VK_IMAGE_LAYOUT_GENERAL, view, constants,
+                                                liveExposureView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
+    }
+
+    const DlssNr_LutChainState& chain = g_vk.postLut;
+    status.loaded = graded && chain.Loaded();
+    status.chain = chain.description;
+    static_assert(std::size(decltype(status.inputs) {}) == DlssNr::kMaxLutChainLayers);
+    std::copy(std::begin(chain.inputs), std::end(chain.inputs), status.inputs);
+    status.endsIn = chain.endsIn;
+    if (!chain.error.empty())
+    {
+        status.failedPath = chain.failedLayer >= 0 ? chain.failedPath : std::string();
+        status.error = chain.error;
+    }
+    DlssNr::ReportPostLutStatus(status);
+}
+
 static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* params, VkInstance instance,
                              VkPhysicalDevice physicalDevice, VkDevice device, bool beforeSr, bool rayReconstruction,
                              bool& applied, bool* handled = nullptr)
@@ -776,11 +943,20 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
         return;
     }
 
-    if (cfg.DlssNrFinishedPicture.value_or_default())
-        return; // finished-picture composition requires a native D3D12 swapchain
-
     if (!cfg.DlssNrEnabled.value_or_default())
         return;
+
+    if (cfg.DlssNrFinishedPicture.value_or_default())
+    {
+        // Finished-picture composition requires a native D3D12 swapchain; say so where the post-NR stack is shown.
+        DlssNr::PostLutStatus status;
+        status.wanted = std::any_of(cfg.DlssNrPostLutFile, cfg.DlssNrPostLutFile + Config::kPostLutLayers,
+                                    [](const auto& file) { return !file.value_or_default().empty(); });
+        if (status.wanted)
+            status.note = "Not applied: Finished Picture mode does not run NR on Vulkan.";
+        DlssNr::ReportPostLutStatus(status);
+        return;
+    }
 
     if (cmdBuffer == VK_NULL_HANDLE || params == nullptr || device == VK_NULL_HANDLE ||
         physicalDevice == VK_NULL_HANDLE)
@@ -1972,6 +2148,7 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
                         lutConstants.DomainMaxG = g_vk.lut.lut.domainMax[1];
                         lutConstants.DomainMaxB = g_vk.lut.lut.domainMax[2];
                         lutConstants.LutSize = (uint32_t) g_vk.lut.lut.size;
+                        lutConstants.LatticeCoord = (uint32_t) g_vk.lut.lut.latticeCoord;
                         lutConstants.InputEncoding = shaderConversion;
                         lutConstants.ColourIsLinearHdr = linearHdr ? 1u : 0u;
                         // The white point the encode below uses (Tune's pinned value included), so linear HDR lands
@@ -2550,6 +2727,19 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
 
     DlssNrConstants resolve = encode;
     resolve.Mode = DlssNrMode_Resolve;
+
+    // The depth fade. Off, or a depth that cannot be read, leaves the block zero and the resolve as it was.
+    const DlssNrDepthFade::Settings depthFade = DlssNrDepthFade::SettingsFrom(cfg);
+    VkImageView fadeDepth = VK_NULL_HANDLE;
+    if (depthFade.enabled)
+        fadeDepth = DepthFadeVk::View(device, depth);
+    else
+        DepthFadeVk::Idle();
+    resolve.DepthFade = DlssNrDepthFade::MakeBlock(depthFade, fadeDepth != VK_NULL_HANDLE, depthInverted,
+                                                   { guideWidth, guideHeight, guides.depth.x, guides.depth.y });
+    DlssNrDepthFade::Report(depthFade, fadeDepth != VK_NULL_HANDLE);
+    if ((resolve.DepthFade.Flags & DlssNrDepthFade::kActive) == 0)
+        fadeDepth = VK_NULL_HANDLE;
     // Replace's detail injection puts back the game frame's own fine texture, which is what a style removed: off while
     // the picture was restyled, so Replace shows the model's painting of the restyled picture.
     if (inputRestyled)
@@ -2708,15 +2898,18 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
 
     if (beforeSr)
         Transition(cmdBuffer, g_vk.preColor, VK_IMAGE_LAYOUT_GENERAL);
-    if (!g_vk.pass->Dispatch(cmdBuffer, resolve, width, height, resolveProxy->view, resolveAnswer->view,
-                             g_vk.keep.view,
-                             liveExposureView,
-                             beforeSr ? g_vk.preColor.view : colour->Resource.ImageViewInfo.ImageView,
-                             VK_NULL_HANDLE, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL))
+    if (!g_vk.pass->Dispatch(cmdBuffer, resolve, width, height, resolveProxy->view, resolveAnswer->view, g_vk.keep.view,
+                             liveExposureView, beforeSr ? g_vk.preColor.view : colour->Resource.ImageViewInfo.ImageView,
+                             VK_NULL_HANDLE, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, fadeDepth))
     {
         Fail("the resolve dispatch failed");
         return;
     }
+
+    ApplyPostLutVk(cmdBuffer, device, physicalDevice, cfg,
+                   beforeSr ? g_vk.preColor.view : colour->Resource.ImageViewInfo.ImageView, beforeSr, width, height,
+                   shaderConversion, linearHdr, encode, liveExposureView);
 
     if (beforeSr)
         Transition(cmdBuffer, g_vk.preColor, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -2802,6 +2995,7 @@ void ReleaseNrObjects()
     CalibrationVkShutdown(true);
     DetailReuseVk::Release(true);
     EdgeCompressionVk::Release(true);
+    DepthFadeVk::Release(true);
 
     if (g_vk.feature != nullptr && g_vk.release != nullptr)
         g_vk.release(g_vk.feature);
@@ -2839,6 +3033,7 @@ void ReleaseNrObjects()
 
     g_vk.pass.reset();
     g_vk.lutPass.reset(); // frees the 3D image, its staging buffer and the pass's own rings
+    g_vk.postLutPass.reset();
     g_vk.superUp.reset();
     g_vk.superDown.reset();
     g_vk.sgsr1UpAnswer.reset();
@@ -2864,6 +3059,7 @@ void ShutdownVk(bool deviceAlive)
         // handle from the dead device would be reused on the NEW device and crash.
         g_vk.pass.release();
         g_vk.lutPass.release(); // same reason: its destructor would vkDestroy on the dead device
+        g_vk.postLutPass.release();
         g_vk.superUp.release();
         g_vk.superDown.release();
         g_vk.sgsr1UpAnswer.release();
@@ -2894,6 +3090,7 @@ void ShutdownVk(bool deviceAlive)
         CalibrationVkShutdown(false);
         DetailReuseVk::Release(false);
         EdgeCompressionVk::Release(false);
+        DepthFadeVk::Release(false);
         // The model's kernels went with the device without their destroy calls.
         DlssNrNative::VkDeviceLost();
 

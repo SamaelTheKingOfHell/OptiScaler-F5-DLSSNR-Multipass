@@ -51,7 +51,7 @@ static void NoteRtssMarker(uint64_t frameId)
     if ((frameId >> 32) == 0)
         return;
 
-    if (!State::Instance().rtssReflexInjection && State::Instance().activeFgOutput == FGOutput::XeFG)
+    if (!State::Instance().rtssReflexInjection && UsesXeFGApi(State::Instance().activeFgOutput))
     {
         ImGuiToast notification { ImGuiToastType::Warning, 10000 };
         notification.setTitle("RTSS + XeFG detected");
@@ -65,7 +65,7 @@ static void NoteRtssMarker(uint64_t frameId)
 
 ID3D12Device* ReflexHooks::bridgedXellDevice()
 {
-    const bool xefgOutput = State::Instance().activeFgOutput == FGOutput::XeFG;
+    const bool xefgOutput = UsesXeFGApi(State::Instance().activeFgOutput);
 
     // Lock-free (XeFG's present thread asks while the bridge's teardown holds its lock and waits for that thread)
     ID3D12Device* device = xefgOutput ? VkPresentBridge::Device() : nullptr;
@@ -79,7 +79,7 @@ ID3D12Device* ReflexHooks::bridgedXellDevice()
 bool ReflexHooks::gameReflexFeedsXell()
 {
     // XeFG is a Vulkan game's output only on the bridge, where the game's calls are InputCommon's too
-    return State::Instance().activeFgOutput == FGOutput::XeFG && gameCalledReflex();
+    return UsesXeFGApi(State::Instance().activeFgOutput) && gameCalledReflex();
 }
 
 namespace
@@ -107,7 +107,7 @@ NV_SET_SLEEP_MODE_PARAMS WithMode(const NV_SET_SLEEP_MODE_PARAMS& params, const 
 
 bool ForceDisabled() { return Config::Instance()->FN_ForceReflex.value_or_default() == ForceReflex::ForceDisable; }
 
-bool XefgOutput() { return State::Instance().activeFgOutput == FGOutput::XeFG; }
+bool XefgOutput() { return UsesXeFGApi(State::Instance().activeFgOutput); }
 
 // The Framerate page's Input is Off: the sleep mode goes out with low latency off (XefgReflexRule.h)
 bool Blocked() { return native::lowlatency::GameLowLatencyBlocked(); }
@@ -511,6 +511,8 @@ void* ReflexHooks::getHookedReflex(unsigned int InterfaceId)
         timingData[TimingType::type].reset();                                                                          \
     }
 
+void ReflexHooks::resetInputLatency() { _inputLatencyValid.store(false, std::memory_order_relaxed); }
+
 bool ReflexHooks::updateTimingData()
 {
     // Why the Reflex timings are empty, once per reason (the menu's timing graph and the FPS overlay's Reflex timings)
@@ -523,6 +525,7 @@ bool ReflexHooks::updateTimingData()
             LOG_INFO("Reflex timings: no data, {}", why);
         }
 
+        resetInputLatency();
         return false;
     };
 
@@ -553,6 +556,44 @@ bool ReflexHooks::updateTimingData()
             return noData("the driver's frame report is empty (no markers reached it on this device)");
 
         double rangeNs = static_cast<double>(end - start);
+
+        // Input latency: the report's own unit is microseconds. An estimated report (fakenvapi) has made-up GPU marks:
+        // it reaches no further than Present.
+        {
+            const auto latency = lloutput::InputLatencyFromReport(
+                frameReport.simStartTime, frameReport.presentEndTime,
+                _timingEstimated.load(std::memory_order_relaxed) ? 0 : frameReport.gpuRenderEndTime);
+
+            // Only a new frame of sane length counts; a stalled report (loading screen) starts the average over
+            const bool counts =
+                latency.valid && lloutput::InputLatencySampleCounts(_haveLatencyFrameId, _lastLatencyFrameId,
+                                                                    frameReport.frameID, latency.ms);
+            _lastLatencyFrameId = frameReport.frameID;
+            _haveLatencyFrameId = true;
+
+            if (!counts)
+            {
+                resetInputLatency();
+            }
+            else
+            {
+                // An average of about the last 8 reads, about 4 s at the overlay's 500 ms poll (an exponential one);
+                // starts again when the data was empty or changes from reaching the GPU to not (or back)
+                constexpr double alpha = 2.0 / (8.0 + 1.0);
+                double value = latency.ms;
+
+                if (_inputLatencyValid.load(std::memory_order_relaxed) &&
+                    _inputLatencyReachesGpu.load(std::memory_order_relaxed) == latency.reachesGpu)
+                {
+                    const double previous = _inputLatencyMs.load(std::memory_order_relaxed);
+                    value = previous + alpha * (latency.ms - previous);
+                }
+
+                _inputLatencyMs.store(value, std::memory_order_relaxed);
+                _inputLatencyReachesGpu.store(latency.reachesGpu, std::memory_order_relaxed);
+                _inputLatencyValid.store(true, std::memory_order_relaxed);
+            }
+        }
 
         timingData[TimingType::TimeRange] = TimingEntry { .position = 0, .length = rangeNs };
         UPDATE_TIMING_ENTRY(sim, Simulation)
@@ -606,6 +647,7 @@ bool ReflexHooks::updateTimingData()
         if (auto result = o_NvAPI_D3D_GetLatency(_lastSleepDev, results); result != NVAPI_OK)
         {
             LOG_WARN("NvAPI_D3D_GetLatency failed: {}", magic_enum::enum_name(result));
+            resetInputLatency();
             return false;
         }
 
@@ -993,6 +1035,14 @@ NvAPI_Status ReflexHooks::routeGetLatency(IUnknown* pDev, NV_LATENCY_RESULT_PARA
 NvAPI_Status ReflexHooks::routeSetLatencyMarker(IUnknown* pDev, NV_LATENCY_MARKER_PARAMS* pParams, bool)
 {
     return hkNvAPI_D3D_SetLatencyMarker(pDev, pParams);
+}
+
+NvAPI_Status ReflexHooks::deliverLibraryAsyncMarker(ID3D12CommandQueue* pQueue, NV_ASYNC_FRAME_MARKER_PARAMS* pParams)
+{
+    if (o_NvAPI_D3D12_SetAsyncFrameMarker == nullptr)
+        return NVAPI_NO_IMPLEMENTATION;
+
+    return o_NvAPI_D3D12_SetAsyncFrameMarker(pQueue, pParams);
 }
 
 NvAPI_Status ReflexHooks::routeSetAsyncFrameMarker(ID3D12CommandQueue* pQueue, NV_ASYNC_FRAME_MARKER_PARAMS* pParams,

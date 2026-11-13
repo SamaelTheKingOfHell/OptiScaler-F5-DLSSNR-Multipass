@@ -27,6 +27,7 @@
 #include <d3d12.h>
 #include <d3dx/d3dx12.h>
 #include <dlssnr/DlssNr_Lut.h>
+#include <dlssnr/DlssNr_LutChain.h>
 #include <shaders/Shader_Dx12.h>
 #include <shaders/Shader_Dx12Utils.h>
 
@@ -58,9 +59,9 @@ class FinishedPqRaster;
 }
 
 // Goes through the same constant-buffer ring as DlssNrConstants.
-static_assert(sizeof(DlssNrDetailReuseConstants) == sizeof(DlssNrConstants));
-static_assert(sizeof(DlssNrEditCacheConstants) == sizeof(DlssNrConstants));
-static_assert(sizeof(DlssNr::Spatial::Constants) == sizeof(DlssNrConstants));
+static_assert(sizeof(DlssNrDetailReuseConstants) <= sizeof(DlssNrConstants));
+static_assert(sizeof(DlssNrEditCacheConstants) <= sizeof(DlssNrConstants));
+static_assert(sizeof(DlssNr::Spatial::Constants) <= sizeof(DlssNrConstants));
 
 namespace DlssNr::Worker { struct DispatchContext; class DispatchTask; }
 
@@ -157,9 +158,9 @@ class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
     // Its own root signature, PSO and small descriptor-heap ring -- not the shared table above -- because it
     // is the first pass here to sample a 3D texture, and keeping it separate means DispatchPass/
     // DispatchDetailReuse/DispatchExposureAdapt/DispatchResidualPass and their compiled bytecode need no
-    // changes at all. Eight heap/constant-buffer slots: this dispatches at most once a frame, unlike the 64
-    // the shared ring budgets for several passes deep in flight.
-    static constexpr uint32_t kLutHeapCount = 8;
+    // changes at all. 32 heap/constant-buffer slots: the Input LUT and the post-NR stack each dispatch once per view
+    // per frame (two a frame, six on three screens), and a slot must outlive the frames in flight that read it.
+    static constexpr uint32_t kLutHeapCount = 32;
     ID3D12RootSignature* _lutRootSignature = nullptr;
     ID3D12PipelineState* _lutPipelineState = nullptr;
     bool _lutPipelineFailed = false;
@@ -187,6 +188,19 @@ class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
     // recording the upload on InCmdList. False if there is nothing loaded or the texture could not be
     // (re)built.
     bool EnsureLutTexture(ID3D12GraphicsCommandList* InCmdList);
+
+    // The same upload for any lattice into any texture slot: `key` says what the slot's content was made from (a
+    // path, or a stack's baked key), so a different source of the same size is re-uploaded. EnsureLutTexture above is
+    // this for the Inputs LUT.
+    bool EnsureLutTextureFrom(ID3D12GraphicsCommandList* InCmdList, const DlssNr::Lut3D& Lut, const std::string& Key,
+                              ID3D12Resource*& Texture, int& TextureSize, std::string& TextureKey);
+
+    // The post-NR LUT stack (memory/plans/2026-10-31-nr-lut-chain.md): its layers baked into one lattice and the GPU
+    // texture of that lattice. Held only while the stack is non-empty.
+    DlssNr_LutChainState _postLut;
+    ID3D12Resource* _postLutTexture = nullptr;
+    std::string _postLutTextureKey;
+    int _postLutTextureSize = 0;
 
     // Releases _lutTexture and forgets its source path, so the next EnsureLutTexture call re-uploads from
     // scratch rather than reading _lutTextureSourcePath against a texture that no longer exists.
@@ -310,5 +324,20 @@ class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
                      unsigned int Width, unsigned int Height, float Strength, uint32_t InputEncoding,
                      bool ColourIsLinearHdr, const DlssNrConstants& White, ID3D12Resource* ExposureTex,
                      const std::string& LutPath);
+    // One dispatch of the lut pass with a lattice and texture the caller already has ready (DispatchLut's tail).
+    bool DispatchLutWith(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InSource, ID3D12Resource* OutTarget,
+                         unsigned int Width, unsigned int Height, float Strength, uint32_t InputEncoding,
+                         bool ColourIsLinearHdr, const DlssNrConstants& White, ID3D12Resource* ExposureTex,
+                         const DlssNr::Lut3D& Lut, ID3D12Resource* Texture);
+    // The post-NR stack on NR's returned picture: parses and bakes `Entries` (re-baking only on a change), uploads the
+    // baked lattice and dispatches it with the chain's strength (a single layer's own; a stack's strengths are in the
+    // bake). False when no chain is usable (see PostLut()).
+    bool DispatchPostLut(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InSource, ID3D12Resource* OutTarget,
+                         unsigned int Width, unsigned int Height, uint32_t InputEncoding, bool ColourIsLinearHdr,
+                         const DlssNrConstants& White, ID3D12Resource* ExposureTex,
+                         const std::vector<DlssNr::ChainEntry>& Entries);
+    // Frees the stack's parsed layers and texture (an emptied stack holds nothing).
+    void ReleasePostLut();
+    const DlssNr_LutChainState& PostLut() const { return _postLut; }
     const std::string& LutError() const { return _lutState.error; }
 };

@@ -50,6 +50,7 @@ ColourEncodingStatus ReadColourEncodingStatus()
         status.line = DlssNrColourEncoding::Describe(g_choice, g_format);
         status.warning = DlssNrColourEncoding::MismatchWarning(g_choice);
         status.exposureState = DlssNrExposureState::For(g_choice, g_finishedPicture);
+        status.gammaConverted = g_choice.encoding == DlssNrColourEncoding::Encoding::Gamma22;
     }
     else
         status.line = "Waiting for a frame.";

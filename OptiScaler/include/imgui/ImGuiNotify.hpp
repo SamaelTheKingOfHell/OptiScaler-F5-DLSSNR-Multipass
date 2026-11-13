@@ -22,6 +22,8 @@
 #include "imgui.h"
 #include "imgui_internal.h"
 
+#include "../../misc/NotificationHistory.h" // every toast is also kept for the menu's Notifications page
+
 
 
 
@@ -484,6 +486,13 @@ namespace ImGui
      */
     inline void InsertNotification(const ImGuiToast& toast)
     {
+        {
+            ImGuiToast copy = toast; // the getters are not const
+            const char* title = copy.getDefaultTitle();
+            NotificationHistory::Add(static_cast<uint8_t>(copy.getType()), title != nullptr ? title : "",
+                                     copy.getContent());
+        }
+
         notifications.push_back(toast);
     }
 

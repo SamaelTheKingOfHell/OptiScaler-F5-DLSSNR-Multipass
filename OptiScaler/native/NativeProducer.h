@@ -11,6 +11,7 @@
 
 #include "DepthAlign_Dx12.h"
 #include "FrameContract.h"
+#include "GpuStageTiming.h"
 
 #include "../motion/OpticalFlow_Dx12.h"
 #include "../motion/TrustMask_Dx12.h"
@@ -92,6 +93,7 @@ class NativeProducer
         float distrustedShare = 0.0f;
         bool nativeRan = false;  // the consumer ran on the picture
         bool previewDrawn = false;       // the debug view was drawn this frame (Options::flowPreview)
+        bool queueChanged = false;       // the caller's queue is not the last list's (for the log)
         const char* stoppedAt = nullptr; // when nothing was submitted: the step that gave up (for the log)
         long stoppedHr = 0;              // and the HRESULT it got, when it had one
         long deviceRemoved = 0;          // the device's removed reason at that moment (0: not removed)
@@ -122,6 +124,10 @@ class NativeProducer
     TrustMaskDx12* Trust() { return _trust.get(); }
     bool PreviewReady() const { return _previewReady; }
 
+    // The frame step's GPU time by stage (native/GpuStageTiming.h), of the frames the GPU has finished. The owner logs
+    // its Report() now and then, which also starts a new window.
+    gputiming::Stats& GpuStats() { return _gpuStats; }
+
   private:
     static constexpr uint32_t kRing = 3;
     static_assert(DepthAlignDx12::kSlots >= kRing, "a depth alignment descriptor pair per ring slot");
@@ -139,6 +145,10 @@ class NativeProducer
     HANDLE _event = nullptr;
     UINT64 _values[kRing] = {};
     UINT64 _signalled = 0;
+    // The queue the last list went to, held so its address can't be reused by a new queue. The caller's queue can
+    // change between frames (frame generation's game queue comes and goes) and every list uses the same textures: on
+    // another queue, Run skips the frame until the last list has finished (a CPU check, no GPU wait across queues).
+    ID3D12CommandQueue* _lastQueue = nullptr;
     uint64_t _frame = 0;
     uint64_t _cutQuietUntil = 0; // a cut's consumer reset was asked for: the late count of the same cut is not another
 
@@ -146,6 +156,16 @@ class NativeProducer
     ID3D12Resource* _cutReadback[kRing] = {};
     bool _cutPending[kRing] = {};
     bool _consumerResetPending = false; // a cut was found and the consumer has not run since
+
+    // Timestamps of each ring slot's list (gputiming::kStamps a slot), resolved to a readback read once the GPU has
+    // finished that slot. Optional: without a query heap (or a queue tick rate) nothing is timed.
+    ID3D12QueryHeap* _timeHeap = nullptr;
+    ID3D12Resource* _timeReadback[kRing] = {};
+    bool _timePending[kRing] = {};
+    bool _timeConsumerRan[kRing] = {}; // the slot's frame ran the consumer (NR or the virtual upscaler)
+    UINT64 _timeFrequency = 0;
+    ID3D12CommandQueue* _timeQueue = nullptr; // the queue _timeFrequency was read from (compared only, not held)
+    gputiming::Stats _gpuStats;
     uint32_t _width = 0;
     uint32_t _height = 0;
     bool _previewReady = false;

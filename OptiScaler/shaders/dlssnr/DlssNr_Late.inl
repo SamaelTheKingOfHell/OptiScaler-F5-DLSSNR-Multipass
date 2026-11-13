@@ -28,6 +28,7 @@ struct Slot
 std::array<Slot, 4> slots;
 ComPtr<ID3D12Device> device;
 uint64_t serial = 0, successes = 0, stillRendering = 0, lastApplicationSuccesses = 0;
+uint64_t lastAppliedEpoch = 0; // capture epoch of the last picture NR ran on; 0: none yet (FinishedHistoryGap)
 bool loggedCrossQueue = false;
 std::string status = "Waiting for a finished picture.";
 bool reset = true;
@@ -133,12 +134,21 @@ void Cancel()
             slot.pending = false;
     }
     RequestReset();
+    lastAppliedEpoch = 0;
+}
+
+// Presents OptiScaler's own frame generation shows per game frame: 1 + the generated ones while it generates.
+uint32_t PresentsPerGameFrame()
+{
+    const auto fg = State::Instance().currentFG;
+    return native::lowlatency::ShownPerRendered(fg != nullptr && fg->IsGenerating(),
+                                                fg != nullptr ? fg->GetInterpolatedFrameCount() : 0);
 }
 
 bool Clone(ComPtr<ID3D12Resource>& copy, ID3D12Resource* source, const D3D12_RESOURCE_DESC& want)
 {
-    if (want.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || want.SampleDesc.Count != 1 ||
-        want.DepthOrArraySize != 1 || want.MipLevels != 1)
+    // Mips and array slices are fine: the copy keeps only the top level (CopyFinishedGuide).
+    if (want.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || want.SampleDesc.Count != 1)
         return false;
     if (copy)
     {
@@ -148,7 +158,7 @@ bool Clone(ComPtr<ID3D12Resource>& copy, ID3D12Resource* source, const D3D12_RES
             copy.Reset(); // caller checked the previous GPU fence
     }
     if (!copy)
-        copy.Attach(CreateGuideClone(device.Get(), source));
+        copy.Attach(CreateGuideClone(device.Get(), source, true));
     return copy != nullptr;
 }
 
@@ -183,7 +193,13 @@ Slot* Acquire(ID3D12GraphicsCommandList* cmd)
         // Captures of this frame (a game may evaluate more than once) stay.
         const auto now = State::Instance().frameCount;
         for (auto& slot : slots)
-            if (slot.submitted && slot.pending && slot.frame.SubmissionEpoch < now) { slot.pending = false; reset = true; }
+        {
+            if (slot.submitted && slot.pending && slot.frame.SubmissionEpoch < now)
+            {
+                reset |= slot.frame.Reset; // dropped unapplied: keep the game's reset flag
+                slot.pending = false;
+            }
+        }
         Say("Waiting for the previous picture to finish.");
         return nullptr;
     }
@@ -239,9 +255,30 @@ void Capture(ID3D12GraphicsCommandList* cmd, NVSDK_NGX_Parameter* params, bool r
     auto& slot = *next;
     const auto depthDesc = depth ? depth->GetDesc() : D3D12_RESOURCE_DESC {};
     const auto motionDesc = motion->GetDesc();
+    // Logs a guide the copy could not take, once per shape, so the next unsupported case names itself.
+    const auto refuse = [](const char* name, const D3D12_RESOURCE_DESC& d)
+    {
+        static std::set<std::tuple<std::string, UINT64, UINT, UINT16, UINT16, UINT, int, unsigned>> logged;
+        if (!logged.emplace(name, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.SampleDesc.Count,
+                            (int) d.Format, (unsigned) d.Flags).second)
+            return;
+        LOG_WARN("DLSS-NR finished picture: cannot copy the game's {} (dimension {}, {}x{}, array {}, mips {}, samples {}, "
+                 "format {}, flags 0x{:X})",
+                 name, (int) d.Dimension, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.SampleDesc.Count,
+                 (int) d.Format, (unsigned) d.Flags);
+    };
+    if (depth && !Clone(slot.depth, depth, depthDesc))
+    {
+        refuse("depth", depthDesc);
+        depth = nullptr; // NR runs without depth rather than skipping the frame
+    }
     if (!depth) slot.depth.Reset(); // no stale depth from an earlier frame
-    if ((depth && !Clone(slot.depth, depth, depthDesc)) || !Clone(slot.motion, motion, motionDesc))
-    { Say("The game's depth or movement data is not supported."); return; }
+    if (!Clone(slot.motion, motion, motionDesc))
+    {
+        refuse("motion vectors", motionDesc);
+        Say("The game's movement data is not supported.");
+        return;
+    }
     slot.residualOnly = false;
     slot.frame = {};
     auto& frame = slot.frame;
@@ -279,9 +316,23 @@ void Capture(ID3D12GraphicsCommandList* cmd, NVSDK_NGX_Parameter* params, bool r
                           const D3D12_RESOURCE_DESC& desc, GuideRegion region)
     {
         if (!source) return;
-        Barrier(cmd, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        // Only the top level is read. With more subresources, only that one is moved: the game's lower mips (a depth
+        // pyramid) may rest in another state, which a whole-resource barrier would get wrong.
+        const bool whole = desc.MipLevels == 1 && desc.DepthOrArraySize == 1;
+        const auto move = [&](D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
+        {
+            if (whole) { Barrier(cmd, source, from, to); return; }
+            D3D12_RESOURCE_BARRIER b {};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = source;
+            b.Transition.Subresource = 0;
+            b.Transition.StateBefore = from;
+            b.Transition.StateAfter = to;
+            cmd->ResourceBarrier(1, &b);
+        };
+        move(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
         CopyFinishedGuide(cmd, destination, source, desc, region);
-        Barrier(cmd, source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        move(D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         // The copy returns to COPY_DEST after the late dispatch.
     };
     copy(depth, slot.depth.Get(), depthDesc, regions.depth);
@@ -345,6 +396,7 @@ void FinishedPictureResetCommandList(ID3D12CommandList* cmd)
 
     std::lock_guard<std::recursive_mutex> lock(g_nrMutex);
     DlssNrWatchedLists::Remove(1, &list);
+    NrLifetime().ResetRecording(cmd);
     SuperiorRun::ResetRecording(cmd);
     if (g_gpuTime) g_gpuTime->ResetRecording(cmd);
     if (g_ngxTime) g_ngxTime->ResetRecording(cmd);
@@ -398,6 +450,11 @@ void FinishedPictureSubmitted(ID3D12CommandQueue* queue, UINT count, ID3D12Comma
 
     std::lock_guard<std::recursive_mutex> lock(g_nrMutex);
     DlssNrWatchedLists::Remove(count, watched);
+    NrLifetime().Submitted(queue, count, lists);
+    // A list stays open until it is reset (or replayed): its reset must still reach NrLifetime.
+    for (UINT i = 0; i < count; ++i)
+        if (NrLifetime().Open(lists[i]))
+            DlssNrWatchedLists::Add(lists[i]);
     SuperiorRun::Submitted(queue, count, lists);
     if (g_gpuTime) g_gpuTime->Submitted(queue, count, lists);
     if (g_ngxTime) g_ngxTime->Submitted(queue, count, lists);
@@ -492,11 +549,12 @@ static FinishedPick SelectFinishedInput(ID3D12CommandQueue* queue, const D3D12_R
         auto& slot = Late::slots[i];
         if (!slot.pending || slot.expired || !slot.submitted || (gameFrameHandoff && slot.serial > snapshot))
             continue;
-        if (!gameFrameHandoff && (epoch < slot.frame.SubmissionEpoch || epoch - slot.frame.SubmissionEpoch > 1))
+        // Counted in presents, and frame generation adds some per game frame; a missed game frame is FinishedHistoryGap's job
+        if (!gameFrameHandoff && FinishedStale(epoch, slot.frame.SubmissionEpoch, Late::PresentsPerGameFrame()))
         {
+            Late::reset |= slot.frame.Reset; // dropped unapplied: keep the game's reset flag
             slot.expired = true;
             if (slot.submitted) slot.pending = false;
-            Late::RequestReset();
             continue;
         }
         inputs[i] = { slot.residualOnly == residualOnly && slot.frame.OutputWidth == desc.Width &&
@@ -584,8 +642,10 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
     if (pick == FinishedPick::NotReady)
     {
         // Ordinary presents may retry within their epoch window. App handoffs expire at EndStreamlinePicture.
-        Late::RequestReset();
+        // Sustained skips are the history gap rule's; a removed device resets as before
         const auto& input = inputs[index];
+        if (gameFrameHandoff || input.completed == UINT64_MAX)
+            Late::reset = true;
         if (!input.sameQueue && input.completed != UINT64_MAX && !Late::loggedCrossQueue)
         {
             Late::loggedCrossQueue = true;
@@ -603,7 +663,11 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
     // Drop other submitted evaluates from this picture, not their in-flight resources.
     for (auto& other : Late::slots)
         if (other.submitted && other.serial <= slot.serial)
+        {
+            if (&other != &slot && other.pending)
+                Late::reset |= other.frame.Reset; // the game's reset flag outlives the capture it came with
             other.pending = false;
+        }
     // Same queue: orders after the producer's signal. Another queue: already complete, so this never blocks.
     if (FAILED(slot.allocator->Reset()) ||
         FAILED(slot.commands->Reset(slot.allocator.Get(), nullptr)))
@@ -719,7 +783,10 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
                                 Config::Instance()->DlssNrDisplayPaperWhiteNits.value_or_default(),
                                 DlssNrExposureState::kNitsPerScrgbUnit)
                           : 0.0f;
-        frame.Reset |= Late::reset;
+        // slot.frame.SubmissionEpoch is still the capture's; frame's is overwritten with this present's just below
+        frame.Reset |= Late::reset || (!gameFrameHandoff && FinishedHistoryGap(Late::lastAppliedEpoch,
+                                                                              slot.frame.SubmissionEpoch,
+                                                                              Late::PresentsPerGameFrame()));
         frame.SubmissionEpoch = epoch;
         if (slot.depth) Barrier(cmd, slot.depth.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         Barrier(cmd, slot.motion.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -833,6 +900,8 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
         }
         const bool ran = slot.residualOnly ? appliedResidual : g_nr.successfulDispatches > before;
         Late::FinishReset(ran, resetAtStart);
+        if (ran)
+            Late::lastAppliedEpoch = slot.frame.SubmissionEpoch;
         Late::Automatic::Completed(balanceContext, balanceRevision, slot.serial, balancePrimary, ran, workerContext);
         Late::Say(!apply ? "NR changes are hidden."
                   : ran && workerContext.deferredTask ? "Pipelined NR: rendering ahead while the second GPU processes the previous picture."
@@ -940,6 +1009,8 @@ void EndStreamlinePicture(uint64_t snapshot, const char* unavailable)
     for (auto& slot : Late::slots)
         if (slot.serial <= snapshot && &slot != Late::pendingPipeline) // the pipelined picture completes next frame
         {
+            if (slot.pending && !slot.expired)
+                Late::reset |= slot.frame.Reset; // dropped unapplied: keep the game's reset flag
             slot.expired = true;
             if (slot.submitted) slot.pending = false;
         }

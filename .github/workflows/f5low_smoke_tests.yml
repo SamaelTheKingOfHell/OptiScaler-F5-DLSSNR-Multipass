@@ -1,0 +1,54 @@
+name: F5Low and low latency rule smoke tests
+
+on:
+  push:
+    paths:
+      - 'OptiScaler/framegen/f5low/**'
+      - 'OptiScaler/framegen/FGOutput.h'
+      - 'OptiScaler/framegen/xefg/XeFGFrameId.h'
+      - 'OptiScaler/low_latency/**'
+      - 'OptiScaler/native/**'
+      - 'tests/**'
+      - '.github/workflows/f5low_smoke_tests.yml'
+  pull_request:
+    paths:
+      - 'OptiScaler/framegen/f5low/**'
+      - 'OptiScaler/framegen/FGOutput.h'
+      - 'OptiScaler/framegen/xefg/XeFGFrameId.h'
+      - 'OptiScaler/low_latency/**'
+      - 'OptiScaler/native/**'
+      - 'tests/**'
+      - '.github/workflows/f5low_smoke_tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host-smoke:
+    name: F5Low and frame cap rules (host, no GPU)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: false
+      # nr_native_low_latency_smoke includes the Vulkan headers, a submodule
+      - name: Fetch the Vulkan headers
+        shell: pwsh
+        run: git submodule update --init external/vulkan
+      - name: Build and run the smoke tests
+        shell: pwsh
+        run: |
+          $vcvars = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $out = Join-Path $env:RUNNER_TEMP 'smoke'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $tests = @(Get-ChildItem tests -Filter 'f5low_*_smoke.cpp' | ForEach-Object { $_.BaseName }) +
+                   @('ll_output_rule_smoke', 'nr_native_low_latency_smoke', 'nr_status_steady_value_smoke')
+          $failed = @()
+          foreach ($name in $tests) {
+            cmd /c "call `"$vcvars\VC\Auxiliary\Build\vcvars64.bat`" >nul && cl /nologo /std:c++20 /EHsc /W4 /Iexternal\vulkan\include tests\$name.cpp /Fe:$out\$name.exe /Fo:$out\"
+            if ($LASTEXITCODE -ne 0) { $failed += "$name (build)"; continue }
+            & "$out\$name.exe"
+            if ($LASTEXITCODE -ne 0) { $failed += "$name (run)" }
+          }
+          if ($failed.Count -gt 0) { throw "Failed: $($failed -join ', ')" }

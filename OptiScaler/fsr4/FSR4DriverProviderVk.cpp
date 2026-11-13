@@ -1,6 +1,10 @@
 #include "pch.h"
 #include "FSR4DriverProviderVk.h"
 
+#include <misc/Fsr4AsicRule.h>
+#include <misc/IdentifyGpu.h>
+#include <proxies/D3D12_Proxy.h>
+
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -375,6 +379,22 @@ bool FSR4DriverProviderVk::InitFg()
         return IsFgAvailable();
 
     initTried = true;
+
+    // Real FP8 support comes from the D3D12 checks. The game's Vulkan device can be made before anything ran them, or
+    // before d3d12.dll is loaded at all, which the checks need. AMD only: the driver provider is AMD's. This runs
+    // inside the game's vkCreateDevice (Vulkan_Hooks CreateFGFeature, driver-init gate held): the checks' own D3D12
+    // device and vkd3d's Vulkan calls skip our Vulkan hooks (ScopedSkipVulkanHooks in IdentifyGpu)
+    if (IdentifyGpu::getPrimaryGpu().vendorId == VendorId::AMD)
+    {
+        D3d12Proxy::Init();
+        IdentifyGpu::updateD3d12Capabilities();
+    }
+
+    if (!Fsr4Asic::DriverFgAllowed(IdentifyGpu::getPrimaryGpu().realFsr4Support))
+    {
+        LOG_INFO("GPU has no FP8 FSR 4 support, not offering the driver's frame generation");
+        return false;
+    }
 
     auto fg = GetProvider(FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION);
     if (!fg.has_value())
