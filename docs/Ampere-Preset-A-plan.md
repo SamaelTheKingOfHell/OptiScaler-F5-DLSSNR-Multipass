@@ -1,6 +1,6 @@
 # Plan: a Preset A runtime tuned for RTX 30 (Ampere, `sm_86`)
 
-Status: **plan only**. No tuned Preset A runtime was found (searched 2026-11-13).
+Status: **found by measurement (2026-11-14)**. The published Ampere v0.4.0 runtime, documented for Preset B only, also runs Preset A about twice as fast as the compatibility runtime. Its Preset A picture is not validated.
 
 ## What exists today
 
@@ -25,20 +25,42 @@ all 15 kernel containers of the original 310.9.16.0 DLL, so the main model's ker
   multiply. That is the best use of Ampere's tensor cores that keeps the model's numbers; an INT8 path would change
   the picture and is out of scope.
 
-## Measured 2026-11-13 (step 1 done)
+## Measured 2026-11-13 and 2026-11-14 (steps 1 and 2 done)
 
-`tests/run_nr_cross_process_neural.ps1`, 1280x720, one pass on the RTX 3060, 30 frames, RTX 5070 Ti as game GPU,
-median GPU time of the neural pass:
+RTX 3060, model input 1280x720, one pass. "Trace" is `tests/nr_gpu/nr_cuda_trace.cpp` (8 evaluates, the last one
+timed, the 3060 alone). "Handoff" is `tests/run_nr_cross_process_neural.ps1` (30 frames, RTX 5070 Ti as game GPU,
+median GPU time of the neural pass, two runs each).
 
-| Runtime on the 3060 | Preset A | Preset B |
-|---|---|---|
-| NVIDIA 310.8 (`e16bcf15…`) | model creation fails | not applicable |
-| Compatibility 310.9 (`cdfa6c1e…`) | 33.2 ms (handoff median 42.0 ms) | not run |
-| Ampere v0.4.0 (`749daadb…`) | 46.6 ms | 7.6 ms |
+| Runtime on the 3060 | Preset A, trace | Preset A, handoff | Preset B, trace |
+|---|---|---|---|
+| NVIDIA 310.8 (`e16bcf15…`) | model creation fails | model creation fails | not applicable |
+| Compatibility 310.9 (`cdfa6c1e…`) | 27.7 ms | 31.2 and 43.5 ms | 16.0 ms |
+| Ampere v0.4.0 (`749daadb…`) | **13.7 ms** | 13.6 and 28.0 ms | 8.2 ms |
 
-The Ampere v0.4.0 runtime does run Preset A, but slower than the compatibility runtime: its tuning does not reach the
-main model's kernels. The Preset A run had little free memory (8.3 GiB commit) and its copy times doubled, so treat
-46.6 ms as "not faster", not as an exact figure. Steps 2 to 5 are still needed.
+**The Ampere v0.4.0 runtime is already about twice as fast at Preset A.** Both runtimes launch the same 156 kernels
+(43 distinct) for Preset A, and all but two small copy kernels are the FP8 kernels the Ampere project rewrote, so
+its tuning reaches the main model too. By kernel family, Preset A, trace:
+
+| Family | Ampere v0.4.0 | Compatibility | Faster by |
+|---|---|---|---|
+| `cc_tinlayout_*` (windowed layers) | 8.87 ms | 18.90 ms | 2.1x |
+| `cc_split_swin_*` | 2.33 ms | 5.75 ms | 2.5x |
+| `cc_vit_*` | 2.38 ms | 3.00 ms | 1.3x |
+
+What this does not establish:
+
+- **Picture quality at Preset A.** The Ampere project validated Preset B only, and its output is not bit-identical
+  to the compatibility runtime (each runtime's checksums repeat exactly between runs, and differ between runtimes).
+  Compare the two runtimes in the game before trusting it.
+- **Steady timing.** The handoff runs vary by a factor of two between identical runs. The 3060 sat idle at 210 MHz
+  and 14 W between runs and nothing else was using it, so the slow runs are probably the card not leaving its idle
+  clocks during a short test; a game keeps it loaded. Not verified.
+- An earlier handoff run measured 46.6 ms for this runtime at Preset A with only 8.3 GiB of free memory; that
+  figure was wrong for normal conditions.
+
+The remaining headroom is in the `cc_vit_*` kernels (1.3x so far) and the eight-head windowed layer
+(`cc_tinlayout_fused_swin_8h_256_8_chained_fp8`, 1.7 ms, the largest single item). Steps 3 and 4 below now apply
+only to squeezing those, and step 5 is already possible with the v0.4.0 runtime.
 
 ## Steps
 
