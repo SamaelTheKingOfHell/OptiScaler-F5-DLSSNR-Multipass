@@ -6018,9 +6018,13 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                                          DlssNr::MaxPassCount);
     const bool fgActive = State::Instance().currentFG && State::Instance().currentFG->IsActive() &&
                           !State::Instance().currentFG->IsPaused();
+    // OptiScaler's frame generation and detail reuse may use the helper too: the frame waits for its passes on the
+    // game GPU's queue, so frame generation still receives this frame's finished picture. The overlap mode, the
+    // automatic balance (Late::Automatic::ConfiguredRoute) and the network split stay off with them.
     const bool multiEligible = workerContext && workerContext->chain && workerContext->queue &&
         cfg.DlssNrMultiGpu.value_or_default() && placement && placement->HasSecondary() &&
-        !g_multiRun && !superior && !spatial && !reusePlan.active && !cachePlan.runs && !fgActive &&
+        !g_multiRun && !superior && !spatial && !cachePlan.runs &&
+        !(workerContext->pipelineRequested && (fgActive || reusePlan.active)) &&
         !cfg.DlssNrNetworkSplit.value_or_default();
     // Network split (DlssNr_NetworkSplitRun.inl): one pass's network is shared with the helper GPU. It takes the place
     // of the pass handoff above, under the same conditions.
@@ -6040,7 +6044,14 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
     {
         workerContext->balanceEligible = !g_multiRun && !superior && !spatial && !reusePlan.active &&
             !cachePlan.runs && !fgActive && !reused && !cached;
+        if (cfg.DlssNrMultiGpu.value_or_default())
+            ++MultiGpuRun::framesSinceSend;
         if (!cfg.DlssNrMultiGpu.value_or_default()) MultiGpuRun::Disabled();
+        else if (multiEligible && reused)
+        {
+            // Detail reuse skipped the model on both GPUs alike: the helper's history goes on with the composed
+            // vectors of the next full frame, as the game GPU's does (a reset arrives through g_nr.reset).
+        }
         else if (!multiEligible || reused || cached)
         {
             MultiGpuRun::Skipped();
@@ -6645,7 +6656,9 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
     if (g_ngxTime != nullptr)
         g_ngxTime->End(cmdList);
 
-    // Steady a full frame's answer and save this frame's history (DlssNr_DetailReuse.inl).
+    // Steady a full frame's answer and save this frame's history (DlssNr_DetailReuse.inl). A helper handoff continued
+    // the recording on another list: the list reuse was given before the passes is already submitted.
+    reuseFrame.cmdList = cmdList;
     DetailReuse::AfterModel(reuseFrame, reusePlan, result == NVSDK_NGX_Result_Success, finalAnswer);
     if (cachePlan.runs)
         EditCache::AfterModel(cacheFrame);

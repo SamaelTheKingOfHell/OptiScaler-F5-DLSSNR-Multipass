@@ -9,6 +9,15 @@ using Microsoft::WRL::ComPtr;
 std::shared_ptr<WorkerGeneration> current;
 std::weak_ptr<WorkerGeneration> retired;
 std::wstring currentKey, failedKey;
+// Detail reuse hands the model two kinds of motion: its own composed vectors on a full frame after reused ones, the
+// game's otherwise. Each needs its own transfer, so a second generation is kept running beside the current one (same
+// settings, other motion) instead of restarting a worker at every switch. A parked generation missed frames: its
+// history restarts when it is used again.
+std::shared_ptr<WorkerGeneration> standby;
+std::wstring currentBase, standbyKey, standbyBase;
+// NR frames since the last frame that went to the helper. Detail reuse runs the model every other frame, so the time
+// between handoffs is two frames; the helper's share is judged against one frame.
+unsigned framesSinceSend = 0;
 bool primaryFeatureSkipped = false;
 // Helper share of its passes' rows (DlssNr_HelperShare.h); sentRevision tracks the share last sent to the worker.
 DlssNr::MultiGpu::HelperShare share;
@@ -30,8 +39,10 @@ HRESULT AwaitReturn(WorkerGeneration& generation, ID3D12CommandQueue* queue, boo
 void ObserveTiming(WorkerGeneration& generation)
 {
     DlssNr::Worker::WorkerWatch::Sample sample;
+    const unsigned frames = std::clamp(framesSinceSend, 1u, 8u);
+    framesSinceSend = 0;
     if (generation.TakeTiming(sample))
-        share.Observe(sample.latencyMs, sample.periodMs,
+        share.Observe(sample.latencyMs, sample.periodMs / frames,
                       std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
     using namespace DlssNr::Worker::HelperShareStatus;
     rows.store(share.Rows(), std::memory_order_relaxed);
@@ -52,6 +63,7 @@ void RetireCurrent()
     retired = current;
     current.reset();
     currentKey.clear();
+    currentBase.clear();
 }
 void FailCurrent()
 {
@@ -67,6 +79,13 @@ void Skipped()
 void Disabled()
 {
     DlssNr::Worker::currentStatus.store(DlssNr::Worker::Status::Disabled, std::memory_order_relaxed);
+    if (standby)
+    {
+        standby->MarkSkipped();
+        standby.reset(); // its own slots keep it alive until their fences retire
+        standbyKey.clear();
+        standbyBase.clear();
+    }
     RetireCurrent();
     failedKey.clear();
     DlssNr::Worker::handoffMilliseconds.store(0.0f, std::memory_order_relaxed);
@@ -110,6 +129,7 @@ std::shared_ptr<WorkerGeneration> Prepare(ID3D12Device* primary, ID3D12Resource*
     if (!primary || !color || !motion || first >= total || total > DlssNr::MaxPassCount || g_nr.isPort)
         return nullptr;
     const auto key = Key(primary, color, depth, motion, cfg, first, total);
+    const auto base = Key(primary, color, depth, nullptr, cfg, first, total); // everything but the motion
     if (current && key != currentKey)
     {
         const HRESULT status = current->Poll();
@@ -118,7 +138,41 @@ std::shared_ptr<WorkerGeneration> Prepare(ID3D12Device* primary, ID3D12Resource*
             current->MarkSkipped();
             return nullptr;
         }
-        RetireCurrent();
+        if (status == S_OK && base == currentBase)
+        {
+            // Only the motion changed: park this generation and use (or start) the one for the other motion.
+            current->MarkSkipped();
+            auto parked = std::move(current);
+            auto parkedKey = std::move(currentKey), parkedBase = std::move(currentBase);
+            current.reset();
+            currentKey.clear();
+            currentBase.clear();
+            if (standby && standbyKey == key)
+            {
+                current = std::move(standby);
+                currentKey = std::move(standbyKey);
+                currentBase = std::move(standbyBase);
+            }
+            else if (standby)
+            {
+                standby->MarkSkipped();
+                retired = standby;
+            }
+            standby = std::move(parked);
+            standbyKey = std::move(parkedKey);
+            standbyBase = std::move(parkedBase);
+        }
+        else
+        {
+            if (standby && standbyBase != base)
+            {
+                standby->MarkSkipped();
+                standby.reset();
+                standbyKey.clear();
+                standbyBase.clear();
+            }
+            RetireCurrent();
+        }
     }
     if (current)
     {
@@ -238,6 +292,7 @@ std::shared_ptr<WorkerGeneration> Prepare(ID3D12Device* primary, ID3D12Resource*
         return fail("the isolated worker could not be started", DlssNr::Worker::UnavailableReason::Startup);
     current = std::move(next);
     currentKey = key;
+    currentBase = base;
     successfulFrames = 0;
     handoffSum = handoffMax = 0.0;
     handoffSamples = 0;

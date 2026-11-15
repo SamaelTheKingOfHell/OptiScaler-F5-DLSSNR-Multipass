@@ -4835,7 +4835,8 @@ static void RenderPassesPage(Config* config, float menuResScale)
                    "evaluates its start and end. Any number of passes can be split; each one starts its own helper "
                    "on the second GPU, calibrates once (a few seconds) and keeps only a share that returns in time.\n"
                    "A split pass and a whole pass on the second GPU cannot be combined yet: choosing one clears the "
-                   "other. The second GPU needs DirectX 12 Finished Picture.");
+                   "other. The second GPU needs DirectX 12 Finished Picture. Second GPU works with frame generation "
+                   "and detail reuse; the split does not yet.");
         if (automaticOn)
         {
             const auto phase = DlssNr::Worker::AdaptiveStatus::phase.load(std::memory_order_relaxed);
@@ -4969,7 +4970,8 @@ static void RenderPassesPage(Config* config, float menuResScale)
                 config->DlssNrMultiGpuPipelined = pipelined;
             HelpMarker("Experimental: buffers one complete picture so the game can render while the second GPU "
                        "finishes the previous picture. Adds approximately one frame of presentation latency. "
-                       "Requires native DirectX 12 Finished Picture, up to three passes, and frame generation off.");
+                       "Requires native DirectX 12 Finished Picture, up to three passes, and frame generation and "
+                       "detail reuse off; while either is on, the second GPU's passes finish inside the frame instead.");
         }
         if (anySecond || automatic)
         {
@@ -4996,10 +4998,16 @@ static void RenderPassesPage(Config* config, float menuResScale)
             HelpMarker("The game GPU waits for the second GPU's result in its own queue, so the CPU keeps preparing "
                        "frames. A watchdog releases the wait if the second GPU's worker stops.");
         }
-        if ((anySecond || anySplit || automatic) &&
-            (config->DlssNrDetailReuse.value_or_default() || config->DlssNrEditCache.value_or_default()))
-            ImGui::TextWrapped("Detail reuse or edit cache keeps passes on the game GPU; turn them off to use the "
-                               "second GPU.");
+        if ((anySecond || anySplit || automatic) && config->DlssNrEditCache.value_or_default())
+            ImGui::TextWrapped("The edit cache keeps passes on the game GPU; turn it off to use the second GPU.");
+        const bool fgOn = State::Instance().currentFG && State::Instance().currentFG->IsActive() &&
+                          !State::Instance().currentFG->IsPaused();
+        if ((anySecond || anySplit || automatic) && (fgOn || config->DlssNrDetailReuse.value_or_default()))
+            ImGui::TextWrapped("With %s on, passes on the second GPU finish inside each frame: overlap, automatic "
+                               "balance and the split stay off.",
+                               fgOn && config->DlssNrDetailReuse.value_or_default() ? "frame generation and detail reuse"
+                               : fgOn                                                ? "frame generation"
+                                                                                     : "detail reuse");
         (void) anyGame;
     }
     static const char* styles[] = { "Standard", "Natural", "Cinematic" };
