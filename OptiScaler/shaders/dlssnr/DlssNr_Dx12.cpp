@@ -6021,9 +6021,12 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
     // OptiScaler's frame generation and detail reuse may use the helper too: the frame waits for its passes on the
     // game GPU's queue, so frame generation still receives this frame's finished picture. The overlap mode, the
     // automatic balance (Late::Automatic::ConfiguredRoute) and the network split stay off with them.
+    // Superior Scaling refines the picture between passes on the game GPU, so with it the helper takes only the last
+    // pass: no boundary follows it. Its matched guides (R32 depth, R32G32 motion) travel like the game's.
     const bool multiEligible = workerContext && workerContext->chain && workerContext->queue &&
         cfg.DlssNrMultiGpu.value_or_default() && placement && placement->HasSecondary() &&
-        !g_multiRun && !superior && !spatial && !cachePlan.runs &&
+        !g_multiRun && (!superior || (!superiorPacked && placement->primaryPasses + 1u >= effectivePasses)) &&
+        !spatial && !cachePlan.runs &&
         !(workerContext->pipelineRequested && (fgActive || reusePlan.active)) &&
         !cfg.DlssNrNetworkSplit.value_or_default();
     // Network split (DlssNr_NetworkSplitRun.inl): one pass's network is shared with the helper GPU. It takes the place
@@ -6054,6 +6057,24 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
         }
         else if (!multiEligible || reused || cached)
         {
+            // Say once, per cause, why the helper is not used: otherwise a blocked configuration is silent.
+            static std::string toldWhy;
+            const char* why = reused || cached ? nullptr
+                : !workerContext->chain || !workerContext->queue ? "this picture route has no command chain"
+                : !placement || !placement->HasSecondary() ? "no pass is set to the second GPU"
+                : g_multiRun ? "several views are being processed"
+                : superior && superiorPacked ? "Superior Scaling packs the picture (spatial compression)"
+                : superior ? "Superior Scaling is on: only the last pass can run on the second GPU"
+                : spatial ? "spatial compression is on"
+                : cachePlan.runs ? "the edit cache is on"
+                : workerContext->pipelineRequested ? "overlap is on with frame generation or detail reuse"
+                : cfg.DlssNrNetworkSplit.value_or_default() ? "the network split is on"
+                : "unknown";
+            if (why && toldWhy != why)
+            {
+                toldWhy = why;
+                LOG_INFO("DLSS-NR multi-GPU: passes stay on the game GPU: {}", why);
+            }
             MultiGpuRun::Skipped();
             DlssNr::Worker::currentStatus.store(placement && !placement->HasSecondary()
                                                    ? DlssNr::Worker::Status::PrimaryOnly

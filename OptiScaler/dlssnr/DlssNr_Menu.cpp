@@ -4998,6 +4998,14 @@ static void RenderPassesPage(Config* config, float menuResScale)
             HelpMarker("The game GPU waits for the second GPU's result in its own queue, so the CPU keeps preparing "
                        "frames. A watchdog releases the wait if the second GPU's worker stops.");
         }
+        if (anySecond && DlssNr::SuperiorScaling::Enabled(*config) &&
+            DlssNr::MultiGpu::DeviceOf(deviceMasks, visiblePasses >= 2 ? visiblePasses - 2 : 0, MaxPassCount) ==
+                PassDevice::Second &&
+            visiblePasses >= 2)
+            ImGui::TextWrapped("Superior Scaling refines the picture between passes on the game GPU: only the last "
+                               "pass can run on the second GPU. Set the earlier passes to Game GPU.");
+        if ((anySplit || automatic) && DlssNr::SuperiorScaling::Enabled(*config))
+            ImGui::TextWrapped("The split and automatic balance stay off while Superior Scaling is on.");
         if ((anySecond || anySplit || automatic) && config->DlssNrEditCache.value_or_default())
             ImGui::TextWrapped("The edit cache keeps passes on the game GPU; turn it off to use the second GPU.");
         const bool fgOn = State::Instance().currentFG && State::Instance().currentFG->IsActive() &&

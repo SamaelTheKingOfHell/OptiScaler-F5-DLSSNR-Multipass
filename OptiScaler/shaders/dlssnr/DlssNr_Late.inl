@@ -716,7 +716,9 @@ static void ApplyFinishedColor(ID3D12Resource* picture, ID3D12CommandQueue* queu
     // when no OptiScaler FG feature is active; keep that path single-GPU too.
     // The Streamline handoff route stays single-GPU, except for the network split: native frame generation is then
     // delayed to match its pipelined picture (inputs/FG/Streamline_Delay.h).
-    if (!slot.residualOnly && (!gameFrameHandoff || Config::Instance()->DlssNrNetworkSplit.value_or_default()) &&
+    // Whole passes on the helper (MultiGpu) also take the Streamline handoff: without the overlap mode (which this route
+    // never uses, ConfiguredRoute) the picture is complete on the game queue before Streamline presents or interpolates.
+    if (!slot.residualOnly &&
         (Config::Instance()->DlssNrMultiGpu.value_or_default() || Config::Instance()->DlssNrNetworkSplit.value_or_default()))
     {
         slot.ownedChain = std::make_unique<MultiGpu::OwnedCommandChain>();
