@@ -141,3 +141,20 @@ Why: the overlap gives the helper only the game GPU's render of the next frame (
 2.7 ms of its 8.3 ms pass, needs about 22 ms of 3060 kernels plus the transfers, and does not fit 14 ms.
 Also, the 310.9 runtime lowered NR from about 26 to 22 ms per frame without changing the frame rate (27 fps), so in
 that scene the frame rate was not set by NR on the 5070 Ti.
+
+## Measured search for the split share (2026-11-20)
+
+The split now picks its share by trying it: shares whose estimate fits about 1.4 times the helper's measured window are
+tried for about 150 judged frames each, best estimated helper work first, and judged on the game GPU's timestamps as
+saved time minus the time the game GPU waited. The best share with a net gain of at least 0.05 ms is kept, re-checked
+every 900 frames and remembered for the next start (`<plan>.pass<N>.best` beside the cached plan); with none, the pass
+stays whole and the search repeats after 90 s.
+
+Mortal Shell 2, pass 1, 8 shares, two searches: every share made the game GPU wait about 3 ms (net -2.3 to -4.1 ms), and
+the best saving was share (56, 98) at 0.62 to 0.80 ms. The helper's window measured 11.2 to 12.0 ms.
+
+The 3060's worker timing shows why: its kernel time roughly doubles within each trial (share (23, 57): 4.7, 8.2,
+9.8 ms per 60 frames), and its clocks, sampled every 0.5 s, fall from 1852 to 1920 MHz at the start of a trial to 400 to
+1200 MHz (P3 and P5) within 3 to 5 s. At about 10 ms of work per 37 ms frame the driver treats the 3060 as lightly
+loaded. Copies (0.4 to 3 ms each way) and the handoffs between the processes (about 1.5 ms) are small by comparison.
+At boost clocks share (56, 98) would take about 10.1 ms on the 3060, close to the window.

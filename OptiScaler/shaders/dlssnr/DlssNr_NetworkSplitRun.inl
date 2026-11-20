@@ -50,6 +50,22 @@ double gainSum = 0.0;
 unsigned gainCount = 0;
 // After giving up, the split tries again later: the frame rate changes with the scene.
 std::chrono::steady_clock::time_point retryAt {};
+// The measured search (Prepare). The estimate below only shortlists shares: the helper's real turnaround depends on the
+// PCIe link, both copy queues and the helper's clocks, and in a game it came back about 1.5 times slower than estimated.
+// So each shortlisted share is tried for a few seconds and judged on what the game GPU actually gained: the split
+// pass's time whole minus its two halves, minus the time the game GPU waited for the helper. The best share with a net
+// gain is kept (and remembered for the next start); without one, the pass stays whole and the search repeats later.
+std::map<std::pair<int, int>, double> tried; // share -> net game-GPU milliseconds per frame
+std::pair<int, int> best { 0, 0 };
+double bestNet = 0.0;
+bool settled = false;   // running the best share after the search
+double windowMs = 0.0;  // game-GPU time from the end of the head to the wait for the helper, measured
+constexpr double MinNet = 0.05; // ms per frame a share must gain to be kept
+std::wstring searchKey; // the configuration the search results belong to
+// A retired share's helper may still have its last picture in flight; the next helper starts once it is gone, so two
+// helpers never share the GPU, the worker files or the transfer at once.
+std::weak_ptr<DlssNr::Worker::SplitGeneration> retiredGeneration;
+unsigned failedTrials = 0; // consecutive trials whose helper failed; three end the search for this configuration
 constexpr unsigned WarmUpFrames = 90; // the helper's first frames after it starts are not judged
 
 // Measurements of the split pass, logged every few seconds: its game-GPU time whole and, when split, its two halves,
@@ -106,6 +122,9 @@ void Collect(unsigned pass, double periodMs, const DlssNr::NetworkSplit::Plan* p
                 gainSum += wholeSum / wholeCount - a - b;
                 ++gainCount;
             }
+            double window = 0;
+            if (use.stamped && timer.Elapsed(use.slot, 1, 4, window))
+                windowMs = windowMs > 0 ? windowMs * 0.9 + window * 0.1 : window;
             if (use.stamped && timer.Elapsed(use.slot, 4, 2, w))
             {
                 waitSum += w;
@@ -343,6 +362,7 @@ void Retire()
 {
     if (current)
         current->Stop(0);
+    retiredGeneration = current;
     current.reset();
     currentKey.clear();
 }
@@ -476,39 +496,59 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
             }
             if (currentPlan.helperMicros)
             {
-                // The game GPU waited for the helper on more than one frame in five, or 1 ms on average.
-                if (lateChecks >= 60 && (lateMisses * 5 > lateChecks || lateWaitSum / lateChecks > 1.0))
+                // Judged on the game GPU's own timestamps: what the pass saved, minus what the game GPU waited. A
+                // trial is short; the kept share is re-judged over longer windows, as scenes change. A share that
+                // clearly holds the game GPU is cut short.
+                const unsigned judge = settled ? 900u : 150u;
+                const bool hurting = lateChecks >= 30 && lateWaitSum / lateChecks > 3.0;
+                if (hurting || (gainCount >= judge && (lateChecks >= judge / 2 || !Stats::timer.Ready())))
                 {
-                    char why[128];
-                    std::snprintf(why, sizeof why, "held the game GPU %.2f ms on average (over 0.5 ms on %u of %u frames)",
-                                  lateWaitSum / lateChecks, lateMisses, lateChecks);
-                    StepDown(why);
-                    return nullptr;
-                }
-                // The game-GPU time it saves, measured on the pass itself (the frame period moves with the scene, so
-                // comparing it with the period before the split blamed the split for the scene).
-                if (gainCount >= 120 && gainSum / gainCount < 0.15)
-                {
-                    char why[96];
-                    std::snprintf(why, sizeof why, "saved only %.2f ms of game-GPU time per frame",
-                                  gainSum / gainCount);
-                    StepDown(why);
-                    return nullptr;
-                }
-                if (lateChecks >= 600) // a rolling window
-                {
+                    const double gain = gainCount ? gainSum / gainCount : -1.0;
+                    const double wait = lateChecks ? lateWaitSum / lateChecks : 0.0;
+                    const double net = gain - wait;
+                    const std::pair<int, int> share { currentPlan.cut, currentPlan.resume };
+                    tried[share] = net;
+                    failedTrials = 0;
+                    LOG_INFO("DLSS-NR network split: pass {} share ({}, {}): saved {:.2f} ms, waited {:.2f} ms, net {:+.2f} ms "
+                             "per frame (window for the helper {:.1f} ms){}",
+                             pass + 1, share.first, share.second, gain, wait, net, windowMs,
+                             settled ? " (kept share, re-checked)" : "");
+                    if (net >= MinNet && (net > bestNet || share == best))
+                    {
+                        best = share;
+                        bestNet = net;
+                    }
+                    else if (share == best)
+                    {
+                        best = { 0, 0 };
+                        bestNet = 0.0;
+                    }
                     lateChecks = lateMisses = 0;
                     lateWaitSum = 0.0;
                     gainSum = 0.0;
                     gainCount = 0;
+                    if (settled && share == best)
+                        return current; // still the best: keep it
+                    // Next trial, or the best share, chosen below on the next frame.
+                    settled = false;
+                    Retire();
+                    return nullptr;
                 }
             }
             return current;
         }
         if (status == E_PENDING)
             return nullptr;
-        failedKey = key;
         Retire();
+        if (!settled && currentPlan.helperMicros && ++failedTrials < 3)
+        {
+            // One failed trial ends that share, not the search.
+            tried[{ currentPlan.cut, currentPlan.resume }] = -1000.0;
+            LOG_WARN("DLSS-NR network split: the helper for share ({}, {}) failed or stopped; trying another",
+                     currentPlan.cut, currentPlan.resume);
+            return nullptr;
+        }
+        failedKey = key;
         LOG_WARN("DLSS-NR network split: the helper failed or stopped; using the game GPU.");
         return nullptr;
     }
@@ -651,28 +691,79 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
         const double period = StablePeriodMs();
         if (period <= 0.0 || period > 66.0)
             return nullptr; // still measuring the game's own steady pace
+        if (!retiredGeneration.expired())
+            return nullptr; // the previous share's helper is still finishing its last picture
         periodBefore = period;
-        for (const auto& p : plans)
-            if (p.helperMicros < helperCap && Estimate(p) <= FitMargin * period && Score(p) > 0.0 &&
-                (!chosen || Score(p) > Score(*chosen)))
-                chosen = &p;
+        if (searchKey != key)
+        {
+            // Another model, size, preset or runtime: start the search over, from the share remembered for it.
+            searchKey = key;
+            tried.clear();
+            best = { 0, 0 };
+            bestNet = 0.0;
+            settled = false;
+            windowMs = 0.0;
+        }
+        const auto memory = std::filesystem::path(planPath).replace_extension(L".pass" + std::to_wstring(pass + 1) +
+                                                                              L".best");
+        const auto find = [&](std::pair<int, int> share) -> const DlssNr::NetworkSplit::Plan*
+        {
+            for (const auto& p : plans)
+                if (p.cut == share.first && p.resume == share.second)
+                    return &p;
+            return nullptr;
+        };
+        // The helper's time: measured while a share ran, else the frame minus NR's own GPU time this frame.
+        const double budget = windowMs > 0.0 ? windowMs
+                              : g_lastGpuTime && *g_lastGpuTime < period ? period - *g_lastGpuTime
+                                                                         : FitMargin * period;
+        if (tried.empty())
+        {
+            // The share that won last time is tried first.
+            int c = 0, r = 0;
+            if (std::ifstream in(memory); in >> c >> r)
+                chosen = find({ c, r });
+        }
         if (!chosen)
-            retryAt = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+            for (const auto& p : plans) // the shortlist: generous, since the trial decides
+                if (!tried.count({ p.cut, p.resume }) && Estimate(p) <= 1.4 * budget && Score(p) > 0.0 &&
+                    (!chosen || Score(p) > Score(*chosen)))
+                    chosen = &p;
+        if (!chosen && best.first)
+        {
+            chosen = find(best);
+            settled = chosen != nullptr;
+            if (settled)
+            {
+                LOG_INFO("DLSS-NR network split: pass {} keeps share ({}, {}), net {:+.2f} ms per frame, after trying "
+                         "{} shares", pass + 1, best.first, best.second, bestNet, tried.size());
+                std::error_code error;
+                std::filesystem::create_directories(memory.parent_path(), error);
+                std::ofstream(memory, std::ios::trunc) << best.first << ' ' << best.second << '\n';
+            }
+        }
         if (!chosen)
-            return fail(helperCap != ~0ull
-                            ? "no smaller share helps at this frame rate; the pass stays on the game GPU for a minute"
-                            : "no share of the network returns from the helper within the frame (" +
-                                  std::to_string(period).substr(0, 4) + " ms); it stays on the game GPU");
-        LOG_INFO("DLSS-NR network split: frame {:.1f} ms; helper share ({}, {}) estimated {:.1f} ms ({:.1f} ms of "
-                 "kernels, {} KiB out, {} KiB back)",
-                 period, chosen->cut, chosen->resume, Estimate(*chosen), chosen->helperMicros / 1000.0,
-                 chosen->forwardBytes / 1024, chosen->backwardBytes / 1024);
+        {
+            retryAt = std::chrono::steady_clock::now() + std::chrono::seconds(90);
+            const auto count = tried.size();
+            tried.clear(); // search again later: the scene and the frame rate change
+            windowMs = 0.0;
+            return fail(count ? "none of the " + std::to_string(count) +
+                                    " shares tried gained game-GPU time; the pass stays whole and the search repeats "
+                                    "in 90 s"
+                              : "no share returns within the helper's window (" + std::to_string(budget).substr(0, 4) +
+                                    " ms); the pass stays whole");
+        }
+        LOG_INFO("DLSS-NR network split: pass {} {} share ({}, {}): window {:.1f} ms, estimated {:.1f} ms ({:.1f} ms "
+                 "of kernels, {} KiB out, {} KiB back)",
+                 pass + 1, settled ? "keeping" : "trying", chosen->cut, chosen->resume, budget, Estimate(*chosen),
+                 chosen->helperMicros / 1000.0, chosen->forwardBytes / 1024, chosen->backwardBytes / 1024);
     }
     const auto plan = *chosen;
     auto next = std::make_shared<SplitGeneration>();
     if (FAILED(next->Create(primary, helper->adapter.device.Get(), plan)))
         return fail("the shared buffer, copy queue or staging could not be created");
-    const auto log = helper->data / L"worker.log";
+    const auto log = helper->data / (L"worker-" + std::to_wstring(plan.cut) + L"-" + std::to_wstring(plan.resume) + L".log");
     if (FAILED(next->Start(helper->worker.c_str(), helper->core.c_str(), helper->forwarder.c_str(),
                            helper->model.c_str(), helper->data.c_str(), log.c_str(), Wire(cfg, pass, width, height))))
         return fail("the helper could not be started");
@@ -701,6 +792,13 @@ struct PassState
     unsigned framesRunning = 0, lateChecks = 0, lateMisses = 0, gainCount = 0;
     double periodBefore = 0.0, lateWaitSum = 0.0, gainSum = 0.0;
     std::unique_ptr<Calibration> calibration;
+    std::map<std::pair<int, int>, double> tried;
+    std::pair<int, int> best { 0, 0 };
+    double bestNet = 0.0, windowMs = 0.0;
+    bool settled = false;
+    std::wstring searchKey;
+    std::weak_ptr<SplitGeneration> retiredGeneration;
+    unsigned failedTrials = 0;
     DlssNr::PassTimer timer;
     unsigned nextSlot = 0;
     std::vector<Stats::Use> pending;
@@ -731,6 +829,14 @@ void Exchange(PassState& s)
     swap(s.lateWaitSum, lateWaitSum);
     swap(s.gainSum, gainSum);
     swap(s.calibration, calibration);
+    swap(s.tried, tried);
+    swap(s.best, best);
+    swap(s.bestNet, bestNet);
+    swap(s.windowMs, windowMs);
+    swap(s.settled, settled);
+    swap(s.searchKey, searchKey);
+    swap(s.retiredGeneration, retiredGeneration);
+    swap(s.failedTrials, failedTrials);
     swap(s.timer, Stats::timer);
     swap(s.nextSlot, Stats::nextSlot);
     swap(s.pending, Stats::pending);
@@ -765,5 +871,7 @@ void Release(unsigned pass)
     Retire();
     failedKey.clear();
     helperCap = ~0ull;
+    searchKey.clear();
+    settled = false;
 }
 } // namespace NetworkSplitRun

@@ -186,7 +186,19 @@ Slot* Acquire(ID3D12GraphicsCommandList* cmd)
     ResTrack_Dx12::HookLateNrQueue(device.Get());
     Slot* next = nullptr;
     for (auto& slot : slots)
-        if (!slot.pending && Finished(slot)) { next = &slot; break; }
+        if (!slot.pending && Finished(slot))
+        {
+            if (!next) next = &slot;
+            // A finished slot no longer needs its helper. The picker reuses the first free slot, so a slot used once
+            // could otherwise keep a retired helper (and its GPU memory and process) alive for good, and the next
+            // helper waits for that one to be gone.
+            else if (&slot != pendingPipeline && !slot.quarantined &&
+                     !(slot.workerContext.deferredTask && slot.workerContext.deferredTask->Pending()))
+            {
+                slot.workerKeepAlive.reset();
+                slot.workerGeneration.reset();
+            }
+        }
     if (!next)
     {
         // This frame gets no capture: an older frame's pending one must not be composed onto its picture.

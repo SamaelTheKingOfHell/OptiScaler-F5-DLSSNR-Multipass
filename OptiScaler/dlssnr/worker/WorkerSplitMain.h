@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // Worker network-split mode (protocol 9, InitialFrameWire::split.cut > 0): this process evaluates the helper's segment
 // of every picture on its own model instance (DlssNr_NetworkSplit.h, docs/NR-network-trace.md).
 //
@@ -758,7 +758,7 @@ inline int Run(ID3D12Device* device, DlssNr::MultiGpu::CrossAdapterPeer& peer, c
             copyOutSum += out;
             turnaroundSum +=
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readyAt).count();
-            if (++samples == 300)
+            if (++samples == 60)
             {
                 std::cerr << "Split worker: copy in " << copyInSum / samples << " ms, segment " << segmentSum / samples
                           << " ms, copy out " << copyOutSum / samples << " ms, ready to done "
