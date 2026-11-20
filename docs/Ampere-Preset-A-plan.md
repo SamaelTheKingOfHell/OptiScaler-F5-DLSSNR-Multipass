@@ -124,3 +124,20 @@ first 30 s, then 16.5, 16.4 and 15.3 fps, against 27.0 to 27.1 fps for the 5070 
 timeout in about two minutes. A quarter of one pass on the 3060 still costs the frame far more than it saves: the game
 GPU copies the picture and both guides at full size across PCIe and then waits for the strip. At these settings the
 second GPU lowers the frame rate at every share tried (whole pass and 24%).
+
+## Network split in Mortal Shell 2 (2026-11-20)
+
+The game's NVIDIA 310.8 model and the Ampere v0.4.0 runtime launch the same 156 kernels, but pass different tensor
+pointers, so their split layout fingerprints differ (51731450db78f7f5 against 81395abfed46800b, decoded from
+`nr_cuda_trace` with the split's own decoder). The compatibility 310.9 runtime on the RTX 5070 Ti has the Ampere
+runtime's fingerprint, and is faster there at 2803x1577 Preset A: 8.29 ms per pass against 9.94 ms for 310.8.
+
+With the compatibility runtime as the game's model, the Ampere runtime on the 3060 and Superior Scaling on, the split
+calibrated (55 shares) and ran on pass 1. Each share it chose came back late (the game GPU waited 1 to 6 ms) and saved
+at most 0.08 ms, so it stepped down to no share and kept the pass whole. FPS stayed at 26.3 to 27.1.
+
+Why: the overlap gives the helper only the game GPU's render of the next frame (about 14 ms at 36.9 ms frames with
+22 ms of NR) before the end of the split pass is due. The best share on paper, (56, 140), would save the 5070 Ti about
+2.7 ms of its 8.3 ms pass, needs about 22 ms of 3060 kernels plus the transfers, and does not fit 14 ms.
+Also, the 310.9 runtime lowered NR from about 26 to 22 ms per frame without changing the frame rate (27 fps), so in
+that scene the frame rate was not set by NR on the 5070 Ti.

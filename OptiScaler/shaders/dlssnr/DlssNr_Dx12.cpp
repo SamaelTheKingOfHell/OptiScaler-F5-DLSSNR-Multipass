@@ -6040,8 +6040,9 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
                                         cfg.DlssNrNetworkSplitPass.value_or_default()) &
         DlssNr::MultiGpu::PassBits(effectivePasses);
     bool splitSuspended = false; // a pipelined frame is continued once: only its first split pass suspends
+    // Superior Scaling may run with the split: every pass, and the refinement between passes, stays on the game GPU.
     const bool splitEligible = workerContext && workerContext->chain && workerContext->queue &&
-        splitMask != 0 && !g_multiRun && !superior &&
+        splitMask != 0 && !g_multiRun && !(superior && superiorPacked) &&
         !spatial && !reusePlan.active && !cachePlan.runs && !fgActive && !reused && !cached;
     if (workerContext)
     {
@@ -6313,7 +6314,12 @@ DlssNr::Worker::DispatchTask DlssNr_Dx12::DispatchResumable(
         // Network split of this pass: Head here, the middle on the helper, End here once its tensors are back.
         // Reset pictures (scene cuts) stay whole: a reset evaluate is not the chain the plan was calibrated on.
         const bool splitChosen = pass < 32 && (splitMask & (uint32_t { 1 } << pass)) != 0;
-        const bool splitThisPass = splitEligible && splitChosen && !passReset;
+        // A frame overlaps the helper once (the first split pass suspends; its end is recorded next frame). A later
+        // split pass in the same frame would make the game GPU wait for the helper's middle with nothing to do, which
+        // only costs time, so it runs whole; its helper stays ready for frames where it comes first.
+        const bool splitOverlapUsed = splitSuspended || (splitChosen && workerContext && workerContext->pipelineRequested &&
+                                                         pass > 0 && (splitMask & DlssNr::MultiGpu::PassBits(pass)) != 0);
+        const bool splitThisPass = splitEligible && splitChosen && !passReset && !splitOverlapUsed;
         if (splitThisPass)
             NetworkSplitRun::Select(pass);
         else if (!splitChosen && workerContext && !g_multiRun)

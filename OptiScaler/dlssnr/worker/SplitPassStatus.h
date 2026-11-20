@@ -33,8 +33,8 @@ inline const char* Text(unsigned pass)
     case Preparing:
         return "whole on the game GPU for now (calibrating, starting the second GPU, or no share fits the frame)";
     case Unavailable:
-        return "not available right now (needs DirectX 12 Finished Picture; detail reuse, edit cache, Superior "
-               "Scaling and OptiScaler frame generation off; Second GPU works with them)";
+        return "not available right now (needs DirectX 12 Finished Picture; detail reuse, edit cache, spatial "
+               "compression and OptiScaler frame generation off)";
     default:
         return "waiting for a picture with NR";
     }

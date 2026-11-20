@@ -4836,7 +4836,7 @@ static void RenderPassesPage(Config* config, float menuResScale)
                    "on the second GPU, calibrates once (a few seconds) and keeps only a share that returns in time.\n"
                    "A split pass and a whole pass on the second GPU cannot be combined yet: choosing one clears the "
                    "other. The second GPU needs DirectX 12 Finished Picture. Second GPU works with frame generation "
-                   "and detail reuse; the split does not yet.");
+                   "and detail reuse; the split does not yet. The split works with Superior Scaling.");
         if (automaticOn)
         {
             const auto phase = DlssNr::Worker::AdaptiveStatus::phase.load(std::memory_order_relaxed);
@@ -5004,8 +5004,14 @@ static void RenderPassesPage(Config* config, float menuResScale)
             visiblePasses >= 2)
             ImGui::TextWrapped("Superior Scaling refines the picture between passes on the game GPU: only the last "
                                "pass can run on the second GPU. Set the earlier passes to Game GPU.");
-        if ((anySplit || automatic) && DlssNr::SuperiorScaling::Enabled(*config))
-            ImGui::TextWrapped("The split and automatic balance stay off while Superior Scaling is on.");
+        if (automatic && DlssNr::SuperiorScaling::Enabled(*config))
+            ImGui::TextWrapped("Automatic balance stays off while Superior Scaling is on.");
+        if (anySplit)
+            ImGui::TextWrapped("Each frame overlaps one split pass with the second GPU: the first split pass. Later "
+                               "split passes in the same frame run whole on the game GPU, because waiting for the "
+                               "second GPU there would only cost time. Both GPUs need runtimes with the same layout "
+                               "(for example the compatibility 310.9 runtime as the game's model and the Ampere "
+                               "runtime on an RTX 30).");
         if ((anySecond || anySplit || automatic) && config->DlssNrEditCache.value_or_default())
             ImGui::TextWrapped("The edit cache keeps passes on the game GPU; turn it off to use the second GPU.");
         const bool fgOn = State::Instance().currentFG && State::Instance().currentFG->IsActive() &&

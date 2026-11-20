@@ -25,7 +25,9 @@ bool ConfiguredRoute(const Config& cfg, bool gameFrameHandoff)
         State::Instance().swapchainInteropApi == SwapchainInteropApi::None && !g_multiRun && !g_nr.isPort &&
         !cfg.DlssNrRunBeforeSr.value_or_default() && !cfg.DlssNrDeferredDlss.value_or_default() &&
         !cfg.DlssNrDetailReuse.value_or_default() && !cfg.DlssNrEditCache.value_or_default() &&
-        !cfg.DlssNrSpatialCompression.value_or_default() && !DlssNr::SuperiorScaling::Enabled(cfg) &&
+        !cfg.DlssNrSpatialCompression.value_or_default() &&
+        // The split keeps every pass on the game GPU, so Superior Scaling's refinement between passes stays as it is.
+        (!DlssNr::SuperiorScaling::Enabled(cfg) || cfg.DlssNrNetworkSplit.value_or_default()) &&
         !(State::Instance().currentFG && State::Instance().currentFG->IsActive() &&
           !State::Instance().currentFG->IsPaused());
 }
