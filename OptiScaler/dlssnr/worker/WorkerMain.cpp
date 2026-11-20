@@ -433,10 +433,14 @@ static int Worker(HANDLE pipe, const wchar_t* core, const wchar_t* forwarder, co
     return 0;
 }
 
+#include "WorkerClockProfile.h"
+
 int wmain(int argc, wchar_t** argv)
 {
     try
     {
+        if (argc == 3 && std::wcscmp(argv[1], L"--clock-profile") == 0)
+            return DlssNr::Worker::ClockProfile::Apply(std::wcscmp(argv[2], L"on") == 0);
         if (argc != 8 || std::wcscmp(argv[1], L"--worker") != 0)
             return 2;
         return Worker(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(_wcstoui64(argv[2], nullptr, 10))), argv[3],

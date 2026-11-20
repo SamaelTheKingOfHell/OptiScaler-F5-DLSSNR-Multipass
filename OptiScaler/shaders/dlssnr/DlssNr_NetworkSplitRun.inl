@@ -500,7 +500,8 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
                 // trial is short; the kept share is re-judged over longer windows, as scenes change. A share that
                 // clearly holds the game GPU is cut short.
                 const unsigned judge = settled ? 900u : 150u;
-                const bool hurting = lateChecks >= 30 && lateWaitSum / lateChecks > 3.0;
+                // A kept share is not dropped on a short bad stretch (a scene change, a menu): it is judged over more frames.
+                const bool hurting = lateChecks >= (settled ? 300u : 30u) && lateWaitSum / lateChecks > 3.0;
                 if (hurting || (gainCount >= judge && (lateChecks >= judge / 2 || !Stats::timer.Ready())))
                 {
                     const double gain = gainCount ? gainSum / gainCount : -1.0;
@@ -631,6 +632,8 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
         }
     }
     auto& helper = found;
+    // Before a helper starts: the driver reads its power setting when the helper creates its device.
+    DlssNr::HelperClocks::Ensure(helper->worker, cfg.DlssNrHelperFullClocks.value_or_default());
     std::error_code sizeError;
     const auto modelBytes = std::filesystem::file_size(helper->model, sizeError);
     wchar_t name[64];

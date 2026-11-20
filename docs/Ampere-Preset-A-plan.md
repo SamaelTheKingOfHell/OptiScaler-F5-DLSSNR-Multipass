@@ -158,3 +158,17 @@ The 3060's worker timing shows why: its kernel time roughly doubles within each 
 1200 MHz (P3 and P5) within 3 to 5 s. At about 10 ms of work per 37 ms frame the driver treats the 3060 as lightly
 loaded. Copies (0.4 to 3 ms each way) and the handoffs between the processes (about 1.5 ms) are small by comparison.
 At boost clocks share (56, 98) would take about 10.1 ms on the 3060, close to the window.
+
+## Full clocks and a GPU-side wait (2026-11-20)
+
+`HelperFullClocks` writes "Power management mode: Prefer maximum performance" for `dlssnr_worker.exe` in a driver
+profile of its own, from the worker's `--clock-profile on|off` mode, before a helper starts. With it the 3060 held 1717
+to 1875 MHz (P0) through the search instead of falling to 400 to 1200 MHz, and the game GPU's waits fell from about 3 ms
+to 0.01 to 1.3 ms for most shares. Small shares still save nothing: splitting a pass costs the game GPU fixed work in
+the second half that cancels a small middle. Share (56, 98) saved 0.57 ms but came back 1.3 ms late (net -0.73 ms).
+
+The split worker then queued its wait for the owner's data on the 3060's queue instead of waking its CPU thread first.
+Share (56, 98): saved 0.61 ms, waited 0.02 ms, net +0.59 ms per frame, and the search kept it (3060 ready to done
+10.9 ms against an 11.5 ms window). Its re-check 14 s later found 3.0 ms of waiting and dropped it, while the scene
+and settings were changing; a kept share is now judged over at least 300 frames before it can be dropped early. The
+margin is about 0.5 ms, so the gain is about 2 percent at best and depends on the scene.

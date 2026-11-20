@@ -286,6 +286,7 @@ std::shared_ptr<WorkerGeneration> Prepare(ID3D12Device* primary, ID3D12Resource*
         p.skin = t.skin;
         p.autoMask = t.autoMask ? 1 : 0;
     }
+    DlssNr::HelperClocks::Ensure(*worker, cfg.DlssNrHelperFullClocks.value_or_default());
     auto next = std::make_shared<WorkerGeneration>(std::move(transfer));
     if (FAILED(next->Start(primary, worker->c_str(), core.c_str(), forwarderPath, model->c_str(), data.c_str(),
                            log.c_str(), wire)))

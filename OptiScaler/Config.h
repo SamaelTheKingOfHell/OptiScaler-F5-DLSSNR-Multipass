@@ -923,6 +923,8 @@ class Config
     CustomOptional<uint32_t> DlssNrNetworkSplitPass { 1 };
     // Bit i splits pass i + 1 (each split pass has its own helper). Unset keeps NetworkSplitPass.
     CustomOptional<uint32_t, NoDefault> DlssNrNetworkSplitPassMask;
+    // Keep the second GPU at full clocks while it helps (a driver profile for dlssnr_worker.exe; DlssNr_HelperClocks.h).
+    CustomOptional<bool> DlssNrHelperFullClocks { false };
     // Calibrated plan file; relative paths are under OptiScaler/NR-Split/. Empty picks <width>x<height>-<preset>.txt.
     CustomOptional<std::string> DlssNrNetworkSplitPlan { std::string() };
     CustomOptional<uint32_t> DlssNrPrimaryPasses { 1 };

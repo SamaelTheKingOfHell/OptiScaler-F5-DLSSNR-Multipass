@@ -742,13 +742,17 @@ inline int Run(ID3D12Device* device, DlssNr::MultiGpu::CrossAdapterPeer& peer, c
         timer.Mark(list.Get(), timerSlot, 3);
         timer.Resolve(list.Get(), timerSlot);
         Check(list->Close(), "Close split list");
+        // The queue waits for the owner's data itself, so the segment starts the moment it lands instead of after
+        // this thread wakes up and submits. The CPU still watches for the owner exiting.
+        if (FAILED(queue->Wait(peer.Ready(), frame)))
+            throw std::runtime_error("Split worker could not queue its wait for the owner");
+        queue->ExecuteCommandLists(1, lists);
+        if (FAILED(queue->Signal(peer.Done(), frame)))
+            throw std::runtime_error("Split worker could not signal done");
         if (DlssNr::MultiGpu::WaitForFenceOrPeer(peer.Ready(), frame, parent, 30000) !=
             DlssNr::MultiGpu::WorkerFenceWaitResult::Ready)
             throw std::runtime_error("Owner exited or failed before sending the split frame");
         const auto readyAt = std::chrono::steady_clock::now();
-        queue->ExecuteCommandLists(1, lists);
-        if (FAILED(queue->Signal(peer.Done(), frame)))
-            throw std::runtime_error("Split worker could not signal done");
         retire();
         double in = 0, segment = 0, out = 0;
         if (timer.Elapsed(timerSlot, 0, 1, in) && timer.Elapsed(timerSlot, 1, 2, segment) && timer.Elapsed(timerSlot, 2, 3, out))

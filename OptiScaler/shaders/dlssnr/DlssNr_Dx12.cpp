@@ -58,6 +58,7 @@
 #include <dlssnr/DlssNr_HelperShare.h>
 #include <dlssnr/worker/HelperShareStatus.h>
 #include <dlssnr/worker/SplitPassStatus.h>
+#include <dlssnr/DlssNr_HelperClocks.h>
 #include <dlssnr/DlssNr_AdaptiveBalance.h>
 #include <dlssnr/worker/AdaptiveBalanceStatus.h>
 #include <dlssnr/worker/WorkerModelCatalog.h>

@@ -2,6 +2,8 @@
 #include <dlssnr/worker/WorkerStatus.h>
 #include <dlssnr/worker/HelperShareStatus.h>
 #include <dlssnr/worker/SplitPassStatus.h>
+#include <dlssnr/DlssNr_HelperClocks.h>
+#include <thread>
 #include <dlssnr/worker/AdaptiveBalanceStatus.h>
 #include <dlssnr/worker/WorkerGpuTelemetry.h>
 #include <dlssnr/DlssNr_MultiGpuPlan.h>
@@ -4960,6 +4962,26 @@ static void RenderPassesPage(Config* config, float menuResScale)
         if (anySecond || anySplit || automatic)
         {
             ImGui::Separator();
+            bool fullClocks = config->DlssNrHelperFullClocks.value_or_default();
+            if (ImGui::Checkbox("Keep the second GPU at full clocks", &fullClocks))
+            {
+                config->DlssNrHelperFullClocks = fullClocks;
+                // Off removes the driver profile now; on is written before the next helper starts.
+                if (!fullClocks)
+                    if (const auto worker = DlssNr::HelperClocks::FindWorker(
+                            { Util::DllPath().remove_filename(), Util::ExePath().remove_filename() }))
+                        std::thread([path = *worker] { DlssNr::HelperClocks::Ensure(path, false); }).detach();
+            }
+            HelpMarker("The second GPU works a few milliseconds per frame, which NVIDIA's driver reads as a light load: "
+                       "it lowers its clocks within seconds and its part comes back late. On sets \"Power management "
+                       "mode: Prefer maximum performance\" for dlssnr_worker.exe only (a driver profile named "
+                       "\"OptiScaler NR helper\"); off removes it. Takes effect for helpers started afterwards. The "
+                       "second GPU uses more power while the game runs.");
+            {
+                std::lock_guard<std::mutex> guard(DlssNr::HelperClocks::lock);
+                if (fullClocks || DlssNr::HelperClocks::applied)
+                    ImGui::TextDisabled("%s", DlssNr::HelperClocks::status.c_str());
+            }
             DlssNr::Worker::SecondaryModelMenu::Render(
                 *config, { Util::DllPath().remove_filename(), Util::ExePath().remove_filename() });
             if (anySplit)
