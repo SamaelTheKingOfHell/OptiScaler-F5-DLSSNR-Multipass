@@ -465,6 +465,20 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
     const auto info = features.find(feature);
     if (!primary || g_nr.isPort || info == features.end() || !info->second.fingerprint)
         return nullptr;
+    // A model larger than the helper GPU has run safely stays whole on the game GPU (HelperMaxPixels).
+    const uint64_t maxPixels = cfg.DlssNrHelperMaxPixels.value_or_default();
+    if (maxPixels && uint64_t(width) * height > maxPixels)
+    {
+        static uint64_t told = 0;
+        if (told != uint64_t(width) * height)
+            LOG_WARN("DLSS-NR network split: the {}x{} model is above HelperMaxPixels ({}); the pass stays on the "
+                     "game GPU", width, height, maxPixels);
+        told = uint64_t(width) * height;
+        Select(pass);
+        if (current || calibration)
+            Retire();
+        return nullptr;
+    }
     Select(pass);
     Observe();
     Stats::Collect(pass, PeriodMs(), current ? &currentPlan : nullptr);

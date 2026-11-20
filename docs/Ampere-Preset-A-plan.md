@@ -183,3 +183,15 @@ until a reboot, and NGX would not initialise in the next game start (NR and the 
 
 Which step hung the GPU is not proven. Changes: a calibration starts only after the model's size and preset have held
 for 5 s, and a running calibration is never ended mid-run; the next one waits for it. Not yet run.
+
+## Third driver timeout: the 4K calibration itself (2026-11-20 20:15)
+
+After a reboot, with the settle-first change, the split calibrated pass 1 at 3840x2160 on the RTX 3060 alone (Ampere
+v0.4.0 runtime, full clocks; detail reuse off for the test). The worker measured kernels 0 to 46 one by one, then a
+submission did not retire within 30 s ("Split worker submission did not retire"), and Windows logged
+`LiveKernelEvent 0x141 Tdr nvlddmkm Ampere` at 20:15:03 and 20:15:26; the 3060 was lost until a reboot. At 2803x1577
+the same calibration completed twice, and 600 whole-pass handoff frames ran cleanly.
+
+Not proven: the network's tile-synchronizing kernels may need all their blocks resident at once, which at 4K may exceed
+what the 3060 (28 SMs) holds. `HelperMaxPixels` (default 4,500,000) now keeps larger models off the second GPU for the
+split and for whole passes. At 4K the frame rate was 17 to 18 fps with the 5070 Ti alone.

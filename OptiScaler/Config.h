@@ -925,6 +925,8 @@ class Config
     CustomOptional<uint32_t, NoDefault> DlssNrNetworkSplitPassMask;
     // Keep the second GPU at full clocks while it helps (a driver profile for dlssnr_worker.exe; DlssNr_HelperClocks.h).
     CustomOptional<bool> DlssNrHelperFullClocks { false };
+    // Largest model (width x height) the second GPU is given. 0 = no limit. See OptiScaler.ini.
+    CustomOptional<uint32_t> DlssNrHelperMaxPixels { 4500000 };
     // Calibrated plan file; relative paths are under OptiScaler/NR-Split/. Empty picks <width>x<height>-<preset>.txt.
     CustomOptional<std::string> DlssNrNetworkSplitPlan { std::string() };
     CustomOptional<uint32_t> DlssNrPrimaryPasses { 1 };

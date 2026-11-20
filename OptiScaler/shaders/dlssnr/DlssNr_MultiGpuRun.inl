@@ -128,6 +128,18 @@ std::shared_ptr<WorkerGeneration> Prepare(ID3D12Device* primary, ID3D12Resource*
 {
     if (!primary || !color || !motion || first >= total || total > DlssNr::MaxPassCount || g_nr.isPort)
         return nullptr;
+    // A model larger than the helper GPU has run safely stays on the game GPU (HelperMaxPixels).
+    if (const uint64_t maxPixels = cfg.DlssNrHelperMaxPixels.value_or_default();
+        maxPixels && color->GetDesc().Width * color->GetDesc().Height > maxPixels)
+    {
+        static uint64_t told = 0;
+        const uint64_t pixels = color->GetDesc().Width * color->GetDesc().Height;
+        if (told != pixels)
+            LOG_WARN("DLSS-NR multi-GPU: the {}x{} model is above HelperMaxPixels ({}); passes stay on the game GPU",
+                     color->GetDesc().Width, color->GetDesc().Height, maxPixels);
+        told = pixels;
+        return nullptr;
+    }
     const auto key = Key(primary, color, depth, motion, cfg, first, total);
     const auto base = Key(primary, color, depth, nullptr, cfg, first, total); // everything but the motion
     if (current && key != currentKey)
