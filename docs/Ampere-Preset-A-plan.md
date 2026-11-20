@@ -118,3 +118,9 @@ costs the 3060 about seven times what it costs the 5070 Ti (61 against about 8.8
 within the game's 37 ms frame is about 384 rows, which takes about 2 ms of work off the 5070 Ti per frame, before the
 cost of copying the guides and picture across PCIe 3.0 x8. The expected gain at these settings is a few percent at
 best.
+
+In game again (2026-11-20), pass 3 on the 3060 with a fixed 24% row share (rows 1161 to 1577 of 1577): 21.7 fps for the
+first 30 s, then 16.5, 16.4 and 15.3 fps, against 27.0 to 27.1 fps for the 5070 Ti alone in the same scene. No driver
+timeout in about two minutes. A quarter of one pass on the 3060 still costs the frame far more than it saves: the game
+GPU copies the picture and both guides at full size across PCIe and then waits for the strip. At these settings the
+second GPU lowers the frame rate at every share tried (whole pass and 24%).
