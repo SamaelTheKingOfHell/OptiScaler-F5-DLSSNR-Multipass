@@ -95,3 +95,26 @@ only to squeezing those, and step 5 is already possible with the v0.4.0 runtime.
   patcher changes.
 - Steps 1, 2 and 4 need a local C++ toolchain to build the test fixtures; this checkout's last validation machine
   had one, the current one does not.
+
+## Mortal Shell 2 test (2026-11-19 and 2026-11-20)
+
+Game: 3840x2160 output, NR model 2803x1577, three Preset A passes, Superior Scaling. The RTX 5070 Ti runs all three
+passes in about 26 ms (27 fps in the main menu scene).
+
+In game, pass 3 on the RTX 3060 (Ampere v0.4.0 runtime, automatic row share) ran for about 25 s at 16 fps, then the
+3060 hit a driver timeout (`LiveKernelEvent 0x141`, `Tdr`, `nvlddmkm`, Ampere) that ended the game.
+
+Outside the game, at the same size, nothing hung:
+
+| Test, 3060, Preset A, 2803x1577 | Result | 3060 time |
+|---|---|---|
+| `nr_cuda_trace`, 3060 alone, 30 evaluates | stable | 61.3 ms per pass |
+| `run_nr_cross_process_neural.ps1`, whole pass, 30 frames | stable | 97.96 ms handoff median |
+| same, `-Rgb10 -Frames 600` (the game's 10-bit picture) | stable | 97.29 ms median, 148.9 ms p95 |
+| `nr_helper_strip`, whole / 784 / 384 / 64 rows | stable, strip rows correct | 69.5 / 40.2 / 24.6 / 19.2 ms |
+
+The hang is not reproduced, so its cause is not known. What the numbers do establish: at this size one Preset A pass
+costs the 3060 about seven times what it costs the 5070 Ti (61 against about 8.8 ms). The largest share that returns
+within the game's 37 ms frame is about 384 rows, which takes about 2 ms of work off the 5070 Ti per frame, before the
+cost of copying the guides and picture across PCIe 3.0 x8. The expected gain at these settings is a few percent at
+best.

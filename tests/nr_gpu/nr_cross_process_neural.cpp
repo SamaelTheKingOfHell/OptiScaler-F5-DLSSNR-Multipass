@@ -29,6 +29,10 @@ struct OwnedHandle
     }
 };
 using Wire = DlssNr::Worker::InitialFrameWire;
+// --rgb10: a 10-bit picture (R10G10B10A2_UNORM, as some games give NR), handled byte-wise like --rgba8.
+static bool g_rgb10 = false;
+// --frames N: frames of the benchmark run (default 30).
+static uint64_t g_frames = 30;
 using DlssNr::Worker::InterpassClamp;
 struct Frame
 {
@@ -41,7 +45,8 @@ struct Frame
           guideWidth(halfGuides ? (requestedWidth + 1) / 2 : requestedWidth),
           guideHeight(halfGuides ? (requestedHeight + 1) / 2 : requestedHeight), guideX(offsetGuides ? 2u : 0u),
           guideY(offsetGuides ? 2u : 0u),
-          colorFormat(rgba8 ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT)
+          colorFormat(rgba8 ? (g_rgb10 ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM)
+                            : DXGI_FORMAT_R16G16B16A16_FLOAT)
     {
         if (!NrFixture::MakeSurface(device, colorFormat, false, color, width, height) ||
             (!noDepth && !NrFixture::MakeSurface(device, depthStencil ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS :
@@ -72,7 +77,8 @@ static void Fill(NrFixture::Surface& surface, unsigned kind)
         {
             for (unsigned x = 0; x < surface.texture->GetDesc().Width; ++x)
             {
-                if (surface.texture->GetDesc().Format == DXGI_FORMAT_R8G8B8A8_UNORM)
+                if (surface.texture->GetDesc().Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                    surface.texture->GetDesc().Format == DXGI_FORMAT_R10G10B10A2_UNORM)
                 {
                     row[4 * x] = row[4 * x + 1] = row[4 * x + 2] = kind == 0 ? 128 : 64;
                     row[4 * x + 3] = 255;
@@ -450,7 +456,7 @@ static int Parent(const wchar_t* core, const wchar_t* forwarder, const wchar_t* 
     {
         uint64_t previousChecksum = 0;
         std::vector<double> handoffTimes;
-        const uint64_t frameCount = benchmark ? 30 : 2;
+        const uint64_t frameCount = benchmark ? g_frames : 2;
         for (uint64_t frameNumber = 1; frameNumber <= frameCount; ++frameNumber)
         {
             DlssNr::Worker::FrameCommand frameCommand {};
@@ -743,7 +749,7 @@ int wmain(int argc, wchar_t** argv)
 {
     try
     {
-        if (argc >= 11 && argc <= 27)
+        if (argc >= 11 && argc <= 30)
         {
             const wchar_t* secondaryModel = argv[3];
             bool secondaryModelSet = false;
@@ -764,6 +770,10 @@ int wmain(int argc, wchar_t** argv)
                     halfGuides = true;
                 else if (std::wcscmp(argv[i], L"--rgba8") == 0 && !rgba8)
                     rgba8 = true;
+                else if (std::wcscmp(argv[i], L"--rgb10") == 0 && !rgba8)
+                    rgba8 = g_rgb10 = true;
+                else if (std::wcscmp(argv[i], L"--frames") == 0 && i + 1 < argc)
+                    g_frames = std::clamp<uint64_t>(std::wcstoull(argv[++i], nullptr, 10), 2, 100000);
                 else if (std::wcscmp(argv[i], L"--offset-guides") == 0 && !offsetGuides)
                     offsetGuides = true;
                 else if (std::wcscmp(argv[i], L"--invalid-guides") == 0 && !invalidGuides)

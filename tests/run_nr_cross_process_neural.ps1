@@ -6,7 +6,7 @@ param([string]$VcVars, [string]$CoreDll, [string]$WorkerExe, [string]$ParentWork
       [switch]$NoPrimaryPass, [switch]$FailureTest, [switch]$ResetSecondFrame, [switch]$NoDepth,
       [switch]$HalfGuides, [switch]$Rgba8, [switch]$OffsetGuides, [switch]$InvalidGuides, [switch]$DepthStencil,
       [switch]$Benchmark, [switch]$VerifyWorkerIsolation, [switch]$MainPreset, [switch]$SwapAdapters,
-      [switch]$AsyncHandoff, [switch]$BuildOnly)
+      [switch]$AsyncHandoff, [switch]$BuildOnly, [switch]$Rgb10, [ValidateRange(2,100000)][int]$Frames = 30)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 if (!$CoreDll) {
@@ -59,6 +59,8 @@ try {
     if ($NoDepth) { $probeArgs += '--no-depth' }
     if ($HalfGuides) { $probeArgs += '--half-guides' }
     if ($Rgba8) { $probeArgs += '--rgba8' }
+    if ($Rgb10) { $probeArgs += '--rgb10' }
+    if ($Frames -ne 30) { $probeArgs += @('--frames', $Frames.ToString()) }
     if ($OffsetGuides) { $probeArgs += '--offset-guides' }
     if ($InvalidGuides) { $probeArgs += '--invalid-guides' }
     if ($DepthStencil) { $probeArgs += '--depth-stencil' }
