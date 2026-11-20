@@ -446,6 +446,9 @@ inline void Calibrate(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Com
     {
         s.probeFirst = first;
         s.probeLast = (std::min)(last, first + static_cast<int>(window) - 1);
+        // Logged before the GPU work, so a run that never finishes names its kernels.
+        std::cerr << "Split calibration: measuring kernels " << first + 1 << ".." << s.probeLast << " ("
+                  << kernels[first + 1 <= last ? first + 1 : first].name << ")\n" << std::flush;
         run(false);
         if (s.probeIndex != static_cast<int>(kernels.size()))
             throw std::runtime_error("Calibration: the kernel chain changed between evaluates");

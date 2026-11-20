@@ -195,3 +195,10 @@ the same calibration completed twice, and 600 whole-pass handoff frames ran clea
 Not proven: the network's tile-synchronizing kernels may need all their blocks resident at once, which at 4K may exceed
 what the 3060 (28 SMs) holds. `HelperMaxPixels` (default 4,500,000) now keeps larger models off the second GPU for the
 split and for whole passes. At 4K the frame rate was 17 to 18 fps with the 5070 Ti alone.
+
+What the 4K calibration log rules out: its timing pass ran the whole 3840x2160 network on the 3060 three times with
+every kernel serialized (100.3 ms each) and finished, so neither the network at 4K nor breaking its kernel chains
+hangs the 3060 by itself. The snapshot runs then finished 46 times, one kernel at a time, and the 47th
+(`cc_split_swin_16h_proj_512_chained_fp8`, snapshots after kernels 47 and 48) never retired. The calibration now logs
+each step before it runs. Next: run `nr_split_calibrate` at 3840x2160 on the 3060 twice; the same stopping kernel both
+times means a defect in the calibration to find, different ones point to instability under sustained load.
