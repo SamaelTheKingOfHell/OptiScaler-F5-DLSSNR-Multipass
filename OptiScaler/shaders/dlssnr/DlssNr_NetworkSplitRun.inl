@@ -610,7 +610,15 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
         return nullptr; // the helper starts on the next frame, from the cache
     }
     if (calibration)
-        calibration.reset(); // another configuration's run
+    {
+        // Another configuration's run (the model size or preset changed). It is never killed mid-run: ending a worker
+        // while its GPU work is in flight can hang the helper GPU (an RTX 3060 needed a reboot after a 4K calibration
+        // was started two seconds after the one it replaced). It finishes, its result is dropped, then this one starts.
+        if (calibration->client.WaitForReady(0) == E_PENDING)
+            return nullptr;
+        calibration->client.Stop(5000);
+        calibration.reset();
+    }
 
     // The helper (adapter, a device on it, the files) is looked up once per configuration: creating devices on every
     // frame under the NR lock can deadlock with the present thread, and it did after a step down.
@@ -644,6 +652,17 @@ std::shared_ptr<SplitGeneration> Prepare(ID3D12Device* primary, const Config& cf
     std::error_code error;
     if (!fixed && !std::filesystem::is_regular_file(cache, error))
     {
+        // Only once the model has kept this size and preset for a few seconds: moving a slider passes through sizes.
+        static std::wstring settlingKey;
+        static std::chrono::steady_clock::time_point settlingSince {};
+        const auto now = std::chrono::steady_clock::now();
+        if (settlingKey != key)
+        {
+            settlingKey = key;
+            settlingSince = now;
+        }
+        if (now - settlingSince < std::chrono::seconds(5))
+            return nullptr;
         auto run = std::make_unique<Calibration>();
         run->key = key;
         run->fingerprint = f.fingerprint;

@@ -172,3 +172,14 @@ Share (56, 98): saved 0.61 ms, waited 0.02 ms, net +0.59 ms per frame, and the s
 10.9 ms against an 11.5 ms window). Its re-check 14 s later found 3.0 ms of waiting and dropped it, while the scene
 and settings were changing; a kept share is now judged over at least 300 frames before it can be dropped early. The
 margin is about 0.5 ms, so the gain is about 2 percent at best and depends on the scene.
+
+## Second driver timeout on the RTX 3060 (2026-11-20 15:08)
+
+In the user's session the model scale went from 0.73 to 0.89 to 1.00 within two seconds, with `SecondaryModel =
+compat-3109`. Each size started a split calibration on the 3060; the 3418x1922 one was replaced by a 3840x2160 one
+(worker ended with TerminateProcess). The 4K calibration failed at 15:08:13 and Windows logged
+`LiveKernelEvent 0x141 Tdr nvlddmkm Ampere` at 15:08:16 and 15:08:32. Afterwards `nvidia-smi` reported the 3060 lost
+until a reboot, and NGX would not initialise in the next game start (NR and the game's DLSS unavailable).
+
+Which step hung the GPU is not proven. Changes: a calibration starts only after the model's size and preset have held
+for 5 s, and a running calibration is never ended mid-run; the next one waits for it. Not yet run.
